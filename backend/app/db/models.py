@@ -63,6 +63,9 @@ class Paper(Base):
     created_at = Column(DateTime, default=_utcnow)
 
     task_papers = relationship("TaskPaper", back_populates="paper")
+    chunks = relationship("PaperChunk", back_populates="paper", cascade="all, delete-orphan")
+    citation_sources = relationship("PaperCitation", foreign_keys="PaperCitation.source_paper_id", cascade="all, delete-orphan")
+    citation_targets = relationship("PaperCitation", foreign_keys="PaperCitation.target_paper_id", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index("idx_papers_doi", "doi", unique=True, sqlite_where=text("doi IS NOT NULL")),
@@ -202,7 +205,7 @@ class PaperChunk(Base):
     paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
     chunk_index = Column(Integer, nullable=False)
     section = Column(Text, default="unknown")
-    chunk_type = Column(Text, default="text")
+    chunk_type = Column(Text, default="text")  # text / figure / table / formula
     text = Column(Text, nullable=False)
     image_paths_json = Column(Text, default="[]")
     page_number = Column(Integer, default=0)
@@ -211,11 +214,42 @@ class PaperChunk(Base):
     extraction_method = Column(Text, default="pymupdf_inline")
     created_at = Column(DateTime, default=_utcnow)
 
-    paper = relationship("Paper", backref="chunks")
+    paper = relationship("Paper", back_populates="chunks")
 
     __table_args__ = (
         Index("idx_paper_chunks_paper", "paper_id"),
         Index("idx_paper_chunks_section", "section"),
+        Index("idx_paper_chunks_type", "chunk_type"),
+    )
+
+
+class PaperCitation(Base):
+    """Paper-to-paper citation relationships.
+    
+    relation_type:
+    - 'cites': source directly cites target (from S2/OpenAlex API)
+    - 'co_cited': source and target are co-cited by a third paper
+    - 'biblio_coupled': source and target share common references
+    - 'semantic_similar': source and target have high embedding similarity
+    """
+    __tablename__ = "paper_citations"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    source_paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
+    target_paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
+    relation_type = Column(String, nullable=False)
+    weight = Column(Float, default=1.0)  # similarity score for co_cited/biblio/semantic
+    source_task_id = Column(String, ForeignKey("research_tasks.id"))  # which task discovered this
+    created_at = Column(DateTime, default=_utcnow)
+
+    source_paper = relationship("Paper", foreign_keys=[source_paper_id])
+    target_paper = relationship("Paper", foreign_keys=[target_paper_id])
+
+    __table_args__ = (
+        Index("idx_citations_source", "source_paper_id"),
+        Index("idx_citations_target", "target_paper_id"),
+        Index("idx_citations_type", "relation_type"),
+        Index("idx_citations_unique", "source_paper_id", "target_paper_id", "relation_type", unique=True),
     )
 
 

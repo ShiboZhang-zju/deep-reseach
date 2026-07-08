@@ -258,3 +258,81 @@ def get_paper_ids_with_chunks(db: Session, paper_ids: list[str]) -> set[str]:
         return set()
     results = db.query(PaperChunk.paper_id).filter(PaperChunk.paper_id.in_(paper_ids)).distinct().all()
     return {r[0] for r in results}
+
+
+# === Citation operations ===
+
+def save_citation(db: Session, source_paper_id: str, target_paper_id: str,
+                  relation_type: str, weight: float = 1.0, task_id: str = None):
+    """Insert or update a citation relationship (idempotent)."""
+    from app.db.models import PaperCitation
+    existing = db.query(PaperCitation).filter(
+        PaperCitation.source_paper_id == source_paper_id,
+        PaperCitation.target_paper_id == target_paper_id,
+        PaperCitation.relation_type == relation_type,
+    ).first()
+    if existing:
+        existing.weight = weight
+        return existing
+    citation = PaperCitation(
+        source_paper_id=source_paper_id,
+        target_paper_id=target_paper_id,
+        relation_type=relation_type,
+        weight=weight,
+        source_task_id=task_id,
+    )
+    db.add(citation)
+    db.flush()
+    return citation
+
+
+def get_citations_for_paper(db: Session, paper_id: str) -> dict:
+    """Get all citation relationships for a paper.
+    
+    Returns:
+        {
+            "cites": [paper_id, ...],           # papers this paper cites
+            "cited_by": [paper_id, ...],        # papers that cite this paper
+            "co_cited": [(paper_id, weight), ...],
+            "biblio_coupled": [(paper_id, weight), ...],
+            "semantic_similar": [(paper_id, weight), ...],
+        }
+    """
+    from app.db.models import PaperCitation
+    result = {"cites": [], "cited_by": [], "co_cited": [], "biblio_coupled": [], "semantic_similar": []}
+
+    # Outgoing: this paper cites / is similar to others
+    outgoing = db.query(PaperCitation).filter(PaperCitation.source_paper_id == paper_id).all()
+    for c in outgoing:
+        if c.relation_type == "cites":
+            result["cites"].append(c.target_paper_id)
+        elif c.relation_type == "co_cited":
+            result["co_cited"].append((c.target_paper_id, c.weight))
+        elif c.relation_type == "biblio_coupled":
+            result["biblio_coupled"].append((c.target_paper_id, c.weight))
+        elif c.relation_type == "semantic_similar":
+            result["semantic_similar"].append((c.target_paper_id, c.weight))
+
+    # Incoming: other papers cite this paper
+    incoming = db.query(PaperCitation).filter(PaperCitation.target_paper_id == paper_id, PaperCitation.relation_type == "cites").all()
+    result["cited_by"] = [c.source_paper_id for c in incoming]
+
+    return result
+
+
+def get_all_citations_for_task(db: Session, task_id: str) -> list:
+    """Get all citation edges discovered in a task context."""
+    from app.db.models import PaperCitation
+    return db.query(PaperCitation).filter(PaperCitation.source_task_id == task_id).all()
+
+
+def get_paper_chunks_with_paper_info(db: Session, paper_id: str) -> dict:
+    """Get a paper with its chunks, for full traceability.
+    
+    Returns {paper: Paper, chunks: [PaperChunk, ...]}
+    """
+    paper = db.query(Paper).filter(Paper.id == paper_id).first()
+    if not paper:
+        return None
+    chunks = db.query(PaperChunk).filter(PaperChunk.paper_id == paper_id).order_by(PaperChunk.chunk_index).all()
+    return {"paper": paper, "chunks": chunks}
