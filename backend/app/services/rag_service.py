@@ -75,10 +75,11 @@ def get_embedding_model():
 
 _chroma_client = None
 _paper_collection = None
+_paper_level_collection = None
 
 
 def get_chroma_collection():
-    """Get or create the ChromaDB paper_chunks collection."""
+    """Get or create the ChromaDB paper_chunks collection (chunk-level embeddings)."""
     global _chroma_client, _paper_collection
     if _chroma_client is None:
         import chromadb
@@ -90,6 +91,101 @@ def get_chroma_collection():
             metadata={"hnsw:space": "cosine"},
         )
     return _paper_collection
+
+
+def get_paper_level_collection():
+    """Get or create the ChromaDB paper_embeddings collection (one embedding per paper).
+    Used for literature map semantic similarity.
+    """
+    global _chroma_client, _paper_level_collection
+    if _chroma_client is None:
+        import chromadb
+        os.makedirs(CHROMA_DIR, exist_ok=True)
+        _chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+    if _paper_level_collection is None:
+        _paper_level_collection = _chroma_client.get_or_create_collection(
+            name="paper_embeddings",
+            metadata={"hnsw:space": "cosine"},
+        )
+    return _paper_level_collection
+
+
+def ensure_paper_embedding(paper_id: str, title: str, abstract: str, chunks: list = None):
+    """Compute and store a paper-level embedding if not already present.
+    
+    Uses the mean of chunk embeddings if chunks are available,
+    otherwise embeds title + abstract directly.
+    """
+    collection = get_paper_level_collection()
+
+    # Check if already exists
+    try:
+        existing = collection.get(ids=[paper_id])
+        if existing["ids"]:
+            return  # Already has paper-level embedding
+    except Exception:
+        pass
+
+    model = get_embedding_model()
+
+    if chunks:
+        # Mean of chunk embeddings (better quality)
+        chunk_texts = [c.text if hasattr(c, 'text') else c.get("text", "") for c in chunks]
+        if chunk_texts:
+            chunk_embeddings = model.encode(chunk_texts, show_progress_bar=False)
+            paper_embedding = chunk_embeddings.mean(axis=0).tolist()
+        else:
+            paper_embedding = model.encode([f"{title} {abstract}"], show_progress_bar=False).tolist()[0]
+    else:
+        # Embed title + abstract
+        text = f"{title} {abstract or ''}"
+        paper_embedding = model.encode([text], show_progress_bar=False).tolist()[0]
+
+    collection.upsert(
+        ids=[paper_id],
+        embeddings=[paper_embedding],
+        documents=[f"{title}"],
+        metadatas=[{"paper_id": paper_id, "title": title}],
+    )
+
+
+def get_paper_similarities(paper_ids: list[str], top_k_per_paper: int = 5) -> dict[str, list[dict]]:
+    """For each paper, find its most similar papers from the paper_embeddings collection.
+    
+    Returns {paper_id: [{paper_id, title, score}, ...]}
+    """
+    collection = get_paper_level_collection()
+    if not paper_ids:
+        return {}
+
+    # Fetch embeddings for the given paper_ids
+    existing = collection.get(ids=paper_ids)
+    if not existing["ids"]:
+        return {}
+
+    results = {}
+    for i, pid in enumerate(existing["ids"]):
+        emb = existing["embeddings"][i]
+        query_result = collection.query(
+            query_embeddings=[emb],
+            n_results=top_k_per_paper + 1,  # +1 because the paper itself will be included
+        )
+        similar = []
+        for j, result_id in enumerate(query_result["ids"][0]):
+            if result_id == pid:
+                continue  # Skip self
+            distance = query_result["distances"][0][j]
+            score = 1 - distance
+            if score < 0.5:
+                continue  # Filter low similarity
+            similar.append({
+                "paper_id": result_id,
+                "title": query_result["metadatas"][0][j].get("title", ""),
+                "score": score,
+            })
+        results[pid] = similar[:top_k_per_paper]
+
+    return results
 
 
 # === Phase 1: PDF Download ===
@@ -510,9 +606,13 @@ def rag_retrieve(
     if section_filter:
         where["section"] = {"$in": section_filter}
 
-    # Use ChromaDB's built-in query (it handles embedding internally if we pass text)
+    # Embed the query with the SAME model used for storage (bge-base, 768 dim)
+    # Do NOT use ChromaDB's built-in query_texts (which uses 384-dim MiniLM)
+    model = get_embedding_model()
+    query_embedding = model.encode([query], show_progress_bar=False).tolist()
+
     results = collection.query(
-        query_texts=[query],
+        query_embeddings=query_embedding,
         n_results=top_k,
         where=where if where else None,
     )
@@ -544,8 +644,122 @@ def rag_retrieve(
 
 # === Main entry point ===
 
+def _chroma_has_paper(paper_id: str) -> bool:
+    """Check if ChromaDB has embeddings for a paper."""
+    try:
+        collection = get_chroma_collection()
+        result = collection.get(where={"paper_id": paper_id})
+        return bool(result["ids"])
+    except Exception:
+        return False
+
+
+def reembed_from_sqlite(paper_id: str, title: str = "", abstract: str = "") -> bool:
+    """Re-embed a paper's chunks from SQLite (without re-downloading PDF).
+    
+    Used when SQLite has chunks but ChromaDB is empty (e.g. after ChromaDB data loss).
+    """
+    from app.db.session import SessionLocal
+    from app.db.repositories.paper_repo import get_chunks_by_paper
+
+    db = SessionLocal()
+    try:
+        chunks = get_chunks_by_paper(db, paper_id)
+        if not chunks:
+            return False
+
+        # Convert to ParsedChunk format
+        from dataclasses import dataclass
+        parsed = []
+        for c in chunks:
+            parsed.append(ParsedChunk(
+                chunk_index=c.chunk_index,
+                section=c.section or "unknown",
+                chunk_type=c.chunk_type or "text",
+                text=c.text or "",
+                image_paths=[],
+                page_number=c.page_number or 0,
+                word_count=c.word_count or 0,
+                has_pdf=c.has_pdf or False,
+                extraction_method=c.extraction_method or "pymupdf_inline",
+            ))
+
+        embed_and_store_chunks(paper_id, parsed)
+        ensure_paper_embedding(paper_id, title or paper_id, abstract or "", parsed)
+        logger.info("Re-embedded %d chunks for paper %s from SQLite", len(parsed), paper_id[:8])
+        return True
+    except Exception as e:
+        logger.error("Re-embed failed for paper %s: %s", paper_id[:8], e)
+        return False
+    finally:
+        db.close()
+
+
+def sync_chromadb_with_sqlite(paper_ids: list[str] = None) -> dict:
+    """Sync ChromaDB with SQLite — re-embed any papers that have SQLite chunks but no ChromaDB embeddings.
+    
+    Args:
+        paper_ids: If provided, only check these papers. If None, check all papers with SQLite chunks.
+    
+    Returns: {checked, reembedded, skipped, failed}
+    """
+    from app.db.session import SessionLocal
+    from app.db.models import Paper, PaperChunk
+
+    db = SessionLocal()
+    stats = {"checked": 0, "reembedded": 0, "skipped": 0, "failed": 0}
+    try:
+        if paper_ids:
+            papers = db.query(Paper).filter(Paper.id.in_(paper_ids)).all()
+        else:
+            # Get all papers that have chunks in SQLite
+            paper_ids_with_chunks = db.query(PaperChunk.paper_id).distinct().all()
+            paper_ids_set = {r[0] for r in paper_ids_with_chunks}
+            papers = db.query(Paper).filter(Paper.id.in_(list(paper_ids_set))).all()
+
+        # Also ensure paper_embeddings collection exists
+        paper_level_col = get_paper_level_collection()
+
+        for paper in papers:
+            stats["checked"] += 1
+            chroma_has_chunks = _chroma_has_paper(paper.id)
+            
+            # Check paper-level embedding
+            try:
+                existing = paper_level_col.get(ids=[paper.id])
+                chroma_has_paper_emb = bool(existing["ids"])
+            except Exception:
+                chroma_has_paper_emb = False
+            
+            if chroma_has_chunks and chroma_has_paper_emb:
+                stats["skipped"] += 1
+            elif chroma_has_chunks and not chroma_has_paper_emb:
+                # Has chunk embeddings but missing paper-level embedding
+                ensure_paper_embedding(paper.id, paper.title, paper.abstract or "")
+                stats["reembedded"] += 1
+            elif not chroma_has_chunks:
+                # Missing chunk embeddings — re-embed from SQLite
+                success = reembed_from_sqlite(paper.id, paper.title, paper.abstract or "")
+                if success:
+                    stats["reembedded"] += 1
+                else:
+                    stats["failed"] += 1
+            else:
+                stats["skipped"] += 1
+
+        logger.info("ChromaDB sync complete: %s", stats)
+        return stats
+    finally:
+        db.close()
+
+
 async def fetch_and_index_papers(papers: list, llm, task_id: str = "") -> dict:
     """Download PDFs, parse, and index papers for RAG.
+
+    Three-way check per paper:
+    1. SQLite has chunks + ChromaDB has embeddings → skip (fully indexed)
+    2. SQLite has chunks + ChromaDB empty → re-embed from SQLite (no PDF download)
+    3. Neither has data → full pipeline (download PDF, parse, embed)
 
     Returns summary dict with counts.
     """
@@ -554,23 +768,58 @@ async def fetch_and_index_papers(papers: list, llm, task_id: str = "") -> dict:
     from app.services.event_service import emit_event
 
     if not papers:
-        return {"total": 0, "pdf_success": 0, "fallback": 0, "failed": 0}
+        return {"total": 0, "pdf_success": 0, "fallback": 0, "failed": 0, "skipped": 0, "reembedded": 0}
 
-    total = len(papers)
-    logger.info("RAG: Processing %d papers for PDF download and indexing", total)
+    papers_to_index = []    # Need full pipeline (download PDF + parse + embed)
+    papers_to_reembed = []  # Have SQLite chunks but missing ChromaDB embeddings
+    skipped = 0
+
+    for paper in papers:
+        db_check = SessionLocal()
+        try:
+            sqlite_has = has_chunks(db_check, paper.id)
+        finally:
+            db_check.close()
+
+        chroma_has = _chroma_has_paper(paper.id)
+
+        if sqlite_has and chroma_has:
+            skipped += 1  # Fully indexed, skip
+        elif sqlite_has and not chroma_has:
+            papers_to_reembed.append(paper)  # Need re-embed only
+        else:
+            papers_to_index.append(paper)  # Need full pipeline
+
+    if skipped > 0:
+        logger.info("RAG: %d fully indexed (skip), %d need re-embed, %d need full pipeline",
+                    skipped, len(papers_to_reembed), len(papers_to_index))
+
+    # Re-embed papers that have SQLite chunks but no ChromaDB embeddings
+    reembedded = 0
+    for paper in papers_to_reembed:
+        if reembed_from_sqlite(paper.id, paper.title, paper.abstract or ""):
+            reembedded += 1
+
+    if not papers_to_index:
+        return {"total": len(papers), "pdf_success": 0, "fallback": 0, "failed": 0,
+                "skipped": skipped, "reembedded": reembedded}
+
+    total = len(papers_to_index)
+    logger.info("RAG: Processing %d new papers for PDF download and indexing", total)
 
     if task_id:
-        emit_event(task_id, "status", {"status": "indexing_pdfs", "total": total})
+        emit_event(task_id, "status", {"status": "indexing_pdfs", "total": total,
+                                       "skipped": skipped, "reembedded": reembedded})
 
-    # 1. Download PDFs
-    pdf_results = await download_papers_pdfs(papers)
+    # 1. Download PDFs (only for new papers)
+    pdf_results = await download_papers_pdfs(papers_to_index)
 
     pdf_success = 0
     fallback = 0
     failed = 0
 
     # 2. Parse and index each paper
-    for paper in papers:
+    for paper in papers_to_index:
         pdf_bytes = pdf_results.get(paper.id)
 
         if pdf_bytes:
@@ -621,10 +870,13 @@ async def fetch_and_index_papers(papers: list, llm, task_id: str = "") -> dict:
         # 4. Embed and store in ChromaDB
         try:
             embed_and_store_chunks(paper.id, chunks)
+            # Also compute and store paper-level embedding (for literature map)
+            ensure_paper_embedding(paper.id, paper.title, paper.abstract or "", chunks)
         except Exception as e:
             logger.error("Embedding failed for paper %s: %s", paper.id[:8], e)
 
-    summary = {"total": total, "pdf_success": pdf_success, "fallback": fallback, "failed": failed}
+    summary = {"total": len(papers), "pdf_success": pdf_success, "fallback": fallback,
+               "failed": failed, "skipped": skipped, "reembedded": reembedded}
     logger.info("RAG indexing complete: %s", summary)
 
     if task_id:
