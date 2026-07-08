@@ -76,21 +76,26 @@ Previous knowledge gaps:
 REPORT_SYSTEM = """You are a senior research analyst. Write a comprehensive research report in Markdown format based on all collected papers and round summaries.
 
 The report should include:
-1. **Overview** - Research topic and scope
-2. **Key Trends** - Major themes and developments
-3. **Important Papers** - Highlights of high-priority papers with brief analysis
-4. **Methods & Approaches** - Common methodologies in the field
-5. **Open Challenges** - Unresolved problems and gaps
-6. **Future Directions** - Emerging areas worth exploring
-7. **References** - Full reference list with DOIs
+1. **概述** - 研究主题、范围与检索统计（论文数、来源等）
+2. **研究现状与趋势** - 主要主题和发展趋势，按方法流派组织
+3. **核心论文分析** - 至少分析10篇高优先级论文（不只是罗列，要分析其方法、贡献、局限）
+4. **方法与技术路线** - 领域内常见方法论的对比分析（引用具体论文的方法细节）
+5. **研究空白与挑战** - 未解决的问题和 gap（基于论文局限性分析）
+6. **未来方向** - 值得探索的新兴领域（基于跨方法组合机会）
+7. **参考文献** - 完整引用列表，含 DOI
 
 Write in clear, academic Chinese. Use proper Markdown formatting.
 
-IMPORTANT: 
+CRITICAL RULES:
+- You MUST analyze AT LEAST 10 papers in section 3 (核心论文分析). Each analysis should include: method, contribution, limitations, and experimental results if available.
 - When referencing a paper, use the [P1], [P2] etc. numbering from the provided paper list.
 - Only reference papers from the provided list. Do not invent or reference any paper not in the list.
-- If you mention a method or finding not covered by the listed papers, clearly state it as "general knowledge" without attributing it to a specific paper.
-- Include a References section at the end listing all cited papers with their [Px] number, title, year, and DOI."""
+- ANALYZE papers based on their ABSTRACTS provided in the paper list. Do not fabricate findings not supported by the abstract.
+- Include a References section at the end listing all cited papers with their [Px] number, title, year, and DOI.
+- Each section should be substantive (at least 2-3 paragraphs), not just bullet points.
+- You MUST write COMPLETE content for every section. Do NOT use placeholder text, meta-instructions, or annotations like "（保持不变）" or "（此部分...）". Every section must have full, actual content.
+- Output the COMPLETE report in one go, not an outline.
+- Do NOT invent framework/method names that are not mentioned in the paper abstracts. If a paper mentions a specific system name (e.g., "MemGPT", "MemoryBank"), use that exact name. Do not create new names."""
 
 REPORT_USER = """Research topic: {topic}
 Keywords: {keywords}
@@ -126,7 +131,12 @@ CRITICAL RULES:
 2. Do NOT invent datasets, models, or concepts that don't exist. Only use well-known, real datasets and models.
 3. Each idea MUST be grounded in specific cluster methods — do not generate generic ideas
 4. method_sketch must be specific enough that a grad student could implement it
-5. Baselines must be REAL methods from the papers or well-known methods (e.g., "MemGPT", "RAG", "fine-tuned LLM")
+5. Baselines must be REAL, VERIFIABLE methods. Only use:
+   - Methods explicitly mentioned in the provided paper list (use exact names from paper titles/abstracts)
+   - Well-known methods (e.g., "MemGPT", "RAG", "fine-tuned LLM", "GPT-4", "BERT", "T5")
+   - Do NOT invent framework names like "DARA", "TAMOS", "MBSE-Graph-RAG" that sound plausible but don't exist
+6. Datasets must be REAL, well-known datasets (e.g., "MultiWOZ", "MMLU", "GLUE", "MS COCO", "WikiText-103")
+7. If you reference a method from a paper, use the EXACT name as it appears in the paper title or abstract
 
 Write all text fields (title, description, motivation, method_sketch, expected_contribution) IN CHINESE."""
 
@@ -162,7 +172,9 @@ Scoring calibration:
 
 PENALIZE: Ideas with vague method_sketch (e.g., "优化检索策略" without specific algorithm) should score ≤0.5.
 PENALIZE: Ideas that invent non-existent datasets or concepts should score ≤0.3.
+PENALIZE: Ideas where evaluation metrics don't match the hypothesis (e.g., using BLEU to measure memory efficiency) should have evidence_support ≤0.4 and experimentability ≤0.5.
 REWARD: Ideas with specific, implementable technical plans should score ≥0.7.
+REWARD: Ideas whose baselines are real, well-known methods (verifiable in literature) should score ≥0.7.
 
 Note: Research ideas inherently carry risk. Do not over-penalize risk — a novel idea with moderate risk can still score 0.7+.
 
@@ -232,7 +244,15 @@ Requirements:
 - Address each feedback point
 - Add missing content using the provided papers
 - Do not remove existing content unless it is factually wrong
-- Write in clear, academic Chinese."""
+- Write in clear, academic Chinese.
+
+CRITICAL RULES:
+- You MUST write COMPLETE, FULL content for every section. 
+- Do NOT use placeholder text like "（保持不变）" or "（此部分...）" or "（新增内容：...）".
+- Do NOT write meta-instructions or annotations about what should be added — actually write the content.
+- Every section must have substantive paragraphs, not just headings with notes.
+- If a section needs improvement, rewrite it completely with full content.
+- Output the COMPLETE report, not just the changed parts."""
 
 REPORT_REFINE_USER = """Original report:
 {report}
@@ -350,3 +370,67 @@ Focus on:
 2. Key components, methods, or data shown
 3. Main takeaways
 Keep under 100 words. Output in Chinese."""
+
+
+# === Idea method enrichment (two-step generation) ===
+
+IDEA_METHOD_ENRICH_SYSTEM = """You are a research method designer. Based on the idea outline and the provided full-text passages from related papers, write a DETAILED and CONCRETE method_sketch for this idea.
+
+The method_sketch MUST include ALL of:
+- 具体模型架构: e.g., "基于Llama-3-8B，在attention层增加dual memory gate" (NOT "使用大语言模型")
+- 具体算法: e.g., "top-k sparse retrieval + relevance scoring + decay-based forgetting" (NOT "优化检索策略")
+- 具体数据集: e.g., "MultiWOZ + bAbI + 自定义多轮对话数据" (NOT "对话数据集")
+- 具体评估指标: e.g., "BLEU-4 + task completion rate + memory retrieval latency" (NOT "准确性")
+- 具体基线: e.g., "MemGPT, A-Mem, 标准LLM无记忆" (NOT "现有方法")
+
+CRITICAL RULES:
+1. Ground your method in the PROVIDED full-text passages. Use specific techniques mentioned in those papers.
+2. Do NOT invent datasets, models, or concepts that don't exist in the passages or well-known literature.
+3. The method must be specific enough that a grad student could implement it.
+4. Write IN CHINESE. Output only the method_sketch text, no JSON wrapping."""
+
+IDEA_METHOD_ENRICH_USER = """Research topic: {topic}
+
+Idea title: {title}
+Idea description: {description}
+Idea motivation: {motivation}
+
+Related paper full-text passages (RAG retrieved):
+{rag_passages}
+
+Related papers summary:
+{papers_summary}
+
+Write a detailed, concrete method_sketch for this idea, grounded in the provided passages."""
+
+
+# === Idea validation: dedup + baseline check + metric-hypothesis check ===
+
+IDEA_VALIDATION_SYSTEM = """You are a rigorous research idea validator. Review ALL ideas together and identify problems.
+
+For each idea, check:
+
+1. **Duplicate detection**: Are any two ideas essentially the same? (same core method, same problem, same approach — even if worded differently). Mark the later one as duplicate.
+
+2. **Baseline validation**: Check every baseline name mentioned in method_sketch. Is it a REAL, well-known method? 
+   - Real baselines: BERT, GPT-4, T5, MemGPT, RAG, DPO, RLHF, chain-of-thought, few-shot, fine-tuned LLM, LoRA, etc.
+   - Suspicious: methods that sound plausible but don't exist (e.g., "AdaptiveMemoryNet", "DynamicContext-RAG", "HierarchicalRetrieval-AugmentedGeneration")
+   - Also check: are the baselines mentioned in the provided paper list? If not, are they well-known enough to be real?
+
+3. **Metric-hypothesis correspondence**: Does each metric actually measure what the idea's hypothesis claims?
+   - Example of MISMATCH: hypothesis is "improves memory efficiency" but metric is "BLEU-4" (BLEU measures text quality, not memory efficiency)
+   - Example of MATCH: hypothesis is "improves memory efficiency" and metric is "memory retrieval latency" or "context window utilization"
+
+Return one validation entry per idea. Be strict — false positives are better than false negatives.
+
+Output IN CHINESE for issue descriptions."""
+
+IDEA_VALIDATION_USER = """Research topic: {topic}
+
+Papers in our database (titles only):
+{paper_titles}
+
+Ideas to validate:
+{ideas_text}
+
+Validate all ideas for duplicates, fake baselines, and metric-hypothesis mismatches."""

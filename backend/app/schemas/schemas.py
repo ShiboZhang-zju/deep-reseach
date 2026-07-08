@@ -250,3 +250,20 @@ class RetrievedChunk(BaseModel):
 
 class MethodExtract(BaseModel):
     method_extract: str = Field(..., description="从论文段落中提取的具体方法/模型/算法/数据集（中文）")
+
+
+# === Idea validation schemas ===
+
+class IdeaValidation(BaseModel):
+    """Validation result for a single idea."""
+    is_duplicate: bool = Field(False, description="是否与其他idea重复")
+    duplicate_of: str = Field("", description="重复的idea标题")
+    baseline_issues: list[str] = Field(default_factory=list, description="基线问题列表（编造/不存在的基线名）")
+    metric_issues: list[str] = Field(default_factory=list, description="指标问题列表（指标与假设不匹配）")
+    has_issues: bool = Field(False, description="是否存在任何问题")
+    severity: float = Field(0.0, ge=0, le=1, description="问题严重程度 0-1")
+
+
+class IdeaValidationList(BaseModel):
+    """Validation results for all ideas."""
+    validations: list[IdeaValidation] = Field(default_factory=list)
