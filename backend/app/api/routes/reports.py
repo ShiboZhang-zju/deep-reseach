@@ -17,7 +17,13 @@ def get_report(task_id: str, db: Session = Depends(get_db_session)):
     ).order_by(Report.created_at.desc()).first()
 
     if not report:
-        raise HTTPException(404, "Report not found")
+        return ReportOut(
+            id="",
+            task_id=task_id,
+            content_markdown="",
+            content_json=None,
+            created_at="",
+        )
 
     return ReportOut(
         id=report.id,
