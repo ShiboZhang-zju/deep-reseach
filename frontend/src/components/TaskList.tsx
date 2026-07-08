@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api } from '../api/client';
 import type { Task } from '../types';
 import { StatusBadge } from './StatusBadge';
+import { formatDateTime } from '../utils/time';
 
 interface Props {
   tasks: Task[];
@@ -88,7 +89,7 @@ export function TaskList({ tasks, onSelect, onCreated }: Props) {
               <div className="flex flex-col items-end gap-1.5 shrink-0">
                 <StatusBadge status={task.status} />
                 <span className="text-xs text-gray-400">
-                  {new Date(task.created_at).toLocaleString('zh-CN')}
+                  {formatDateTime(task.created_at)}
                 </span>
               </div>
             </div>

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api/client';
 import type { Report } from '../types';
 import ReactMarkdown from 'react-markdown';
+import { formatDateTime } from '../utils/time';
 
 interface Props {
   taskId: string;
@@ -70,7 +71,7 @@ export function ReportView({ taskId, status }: Props) {
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold text-gray-900">研究报告</h2>
         <span className="text-xs text-gray-400">
-          {new Date(report.created_at).toLocaleString('zh-CN')}
+          {formatDateTime(report.created_at)}
         </span>
       </div>
       <div className="markdown-body text-sm">

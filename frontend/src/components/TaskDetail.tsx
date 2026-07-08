@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api/client';
 import type { Task, Round } from '../types';
 import { StatusBadge } from './StatusBadge';
+import { formatDateTime } from '../utils/time';
 import { EventLog } from './EventLog';
 import { ReportView } from './ReportView';
 import { PapersView } from './PapersView';
@@ -244,7 +245,7 @@ export function TaskDetail({ taskId, onBack }: Props) {
                       <div className="flex items-center justify-between mb-1">
                         <span className="text-sm font-medium text-gray-700">第 {r.round_number} 轮</span>
                         <span className="text-xs text-gray-400">
-                          {new Date(r.created_at).toLocaleString('zh-CN')}
+                          {formatDateTime(r.created_at)}
                         </span>
                       </div>
                       <div className="flex gap-4 text-xs text-gray-500">

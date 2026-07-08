@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { SSEEvent } from '../hooks/useTaskEvents';
+import { formatTime } from '../utils/time';
 
 interface Props {
   events: SSEEvent[];
@@ -59,7 +60,7 @@ export function EventLog({ events, connected }: Props) {
         {events.map((evt, i) => {
           const color = EVENT_COLORS[evt.event] || 'text-gray-400';
           const label = EVENT_LABELS[evt.event] || evt.event;
-          const time = new Date(evt.timestamp).toLocaleTimeString('zh-CN');
+          const time = formatTime(evt.timestamp);
           let detail = '';
           if (evt.event === 'status') detail = evt.data.status;
           else if (evt.event === 'round_start' || evt.event === 'round_done')

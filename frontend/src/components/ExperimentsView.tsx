@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { api } from '../api/client';
 import type { Experiment, Idea } from '../types';
 import ReactMarkdown from 'react-markdown';
+import { formatDateTime } from '../utils/time';
 
 interface Props {
   taskId: string;
@@ -62,7 +63,7 @@ export function ExperimentsView({ taskId, status }: Props) {
                 {idea?.title && <span className="text-sm font-normal text-gray-500 ml-2">— {idea.title}</span>}
               </h3>
               <span className="text-xs text-gray-400">
-                {new Date(exp.created_at).toLocaleString('zh-CN')}
+                {formatDateTime(exp.created_at)}
               </span>
             </div>
 
