@@ -36,6 +36,7 @@ yarn-debug.log*
 yarn-error.log*
 
 # ===== Paper assets (downloaded PDFs / images) =====
+paper_assets/
 backend/paper_assets/
 
 # ===== ChromaDB / vector store =====
