@@ -228,18 +228,49 @@ async def run_task(task_id: str):
         except Exception as e:
             logger.warning("Task %s: RAG indexing failed (non-fatal, continuing with abstracts): %s", task_id[:8], e)
 
-        # 3-4. Report + Ideas generation loop (retry if no qualified ideas)
+        # 2.6. LLM Wiki: Ingest papers into wiki knowledge base (replaces GraphRAG)
+        try:
+            from app.services.wiki_service import ingest_papers_to_wiki
+            from app.db.models import Paper as _WikiPaper, TaskPaper as _WikiTP
+
+            wiki_papers = db.query(_WikiPaper).join(_WikiTP).filter(
+                _WikiTP.task_id == task_id,
+                _WikiTP.priority.in_(["high", "medium"]),
+            ).all()
+
+            if wiki_papers:
+                logger.info("Task %s: LLM Wiki ingesting %d papers...", task_id[:8], len(wiki_papers))
+                emit_event(task_id, "status", {"status": "building_wiki", "total_papers": len(wiki_papers)})
+                wiki_summary = await ingest_papers_to_wiki(db, wiki_papers, llm, task_id)
+                logger.info("Task %s: LLM Wiki done: %s", task_id[:8], wiki_summary)
+
+                # P0-4: Run wiki lint after ingest to detect contradictions
+                try:
+                    from app.services.wiki_service import lint_wiki
+                    lint_result = await lint_wiki(db, task_id, llm)
+                    logger.info("Task %s: wiki lint found %d issues", task_id[:8], lint_result.get("total", 0))
+                except Exception as lint_e:
+                    logger.warning("Task %s: wiki lint failed (non-fatal): %s", task_id[:8], lint_e)
+        except Exception as e:
+            logger.warning("Task %s: LLM Wiki ingest failed (non-fatal, falling back to LLM clustering): %s", task_id[:8], e)
+
+        # 3. Build clusters once (used by both report and ideas)
+        logger.info("Task %s: building clusters...", task_id[:8])
+        cluster_list = await _build_paper_clusters(db, state, llm, task_id)
+
+        # 4. Generate report ONCE (not in retry loop)
+        logger.info("Task %s: generating report...", task_id[:8])
+        task_repo.update_status(db, task_id, "reporting")
+        db.commit()
+        emit_event(task_id, "status", {"status": "reporting"})
+        report_markdown = await _generate_report(db, state, llm, cluster_list)
+        logger.info("Task %s: report generated (%d chars)", task_id[:8], len(report_markdown))
+
+        # 5. Ideas generation loop (retry if no qualified ideas — report is NOT regenerated)
         from app.db.models import ResearchIdea
         max_idea_rounds = 3  # Max attempts to generate qualified ideas
 
         for idea_round in range(max_idea_rounds):
-            logger.info("Task %s: generating report (idea round %d)...", task_id[:8], idea_round + 1)
-            task_repo.update_status(db, task_id, "reporting")
-            db.commit()
-            emit_event(task_id, "status", {"status": "reporting"})
-            report_markdown = await _generate_report(db, state, llm)
-            logger.info("Task %s: report generated (%d chars)", task_id[:8], len(report_markdown))
-
             # Collect previous ideas as feedback for retry
             prev_ideas_feedback = ""
             if idea_round > 0:
@@ -266,7 +297,7 @@ async def run_task(task_id: str):
             task_repo.update_status(db, task_id, "generating_ideas")
             db.commit()
             emit_event(task_id, "status", {"status": "generating_ideas"})
-            await _generate_and_score_ideas(db, state, llm, task_id, prev_ideas_feedback)
+            await _generate_and_score_ideas(db, state, llm, task_id, prev_ideas_feedback, cluster_list)
 
             # Check if any "go" ideas exist
             go_count = db.query(ResearchIdea).filter(
@@ -325,6 +356,32 @@ async def run_task(task_id: str):
                 task_repo.save_state(db, task_id, state)
                 db.commit()
                 emit_event(task_id, "round_done", {"round": round_num, "new_papers": len(new_paper_ids)})
+
+                # Idea retry: RAG index + Wiki ingest newly found high-priority papers
+                if new_paper_ids:
+                    try:
+                        from app.services.rag_service import fetch_and_index_papers
+                        from app.db.models import Paper as _RetryPaper, TaskPaper as _RetryTP
+
+                        new_high_papers = db.query(_RetryPaper).join(_RetryTP).filter(
+                            _RetryTP.task_id == task_id,
+                            _RetryTP.paper_id.in_(new_paper_ids),
+                            _RetryTP.priority.in_(["high", "medium"]),
+                        ).all()
+
+                        if new_high_papers:
+                            logger.info("Task %s: idea retry — RAG+Wiki indexing %d new papers...",
+                                       task_id[:8], len(new_high_papers))
+                            emit_event(task_id, "status", {"status": "indexing_pdfs", "total": len(new_high_papers)})
+                            await fetch_and_index_papers(new_high_papers, llm, task_id)
+
+                            # Wiki ingest new papers (incremental update)
+                            from app.services.wiki_service import ingest_papers_to_wiki
+                            await ingest_papers_to_wiki(db, new_high_papers, llm, task_id)
+                            logger.info("Task %s: idea retry — wiki updated with new papers", task_id[:8])
+                    except Exception as retry_e:
+                        logger.warning("Task %s: idea retry RAG/Wiki failed (non-fatal): %s",
+                                      task_id[:8], retry_e)
             else:
                 # Last attempt, still no go ideas — auto-promote top ideas
                 logger.info("Task %s: max idea rounds reached, auto-promoting top ideas", task_id[:8])
@@ -416,6 +473,16 @@ async def run_experiment_generation(task_id: str, idea_ids: list[str]):
         from app.agent.prompts import EXPERIMENT_SYSTEM, EXPERIMENT_USER
         from app.schemas.schemas import ExperimentPlanSchema
 
+        # Get wiki context for experiment generation (verified methods/datasets)
+        wiki_ctx = ""
+        try:
+            from app.services.wiki_service import get_wiki_context
+            wiki_ctx = get_wiki_context(db, task_id, page_types=["method", "dataset", "model"], max_chars=8000)
+            if wiki_ctx:
+                logger.info("Task %s: wiki context loaded for experiments (%d chars)", task_id[:8], len(wiki_ctx))
+        except Exception as e:
+            logger.warning("Task %s: wiki context for experiments failed (non-fatal): %s", task_id[:8], e)
+
         for idea in good_ideas:
             messages = [
                 {"role": "system", "content": EXPERIMENT_SYSTEM},
@@ -426,6 +493,7 @@ async def run_experiment_generation(task_id: str, idea_ids: list[str]):
                     method=idea.method_sketch or "",
                     contribution=idea.expected_contribution or "",
                     related_papers=idea.related_paper_ids_json or "",
+                    wiki_context=wiki_ctx or "(no wiki available)",
                 )},
             ]
             try:
@@ -622,8 +690,17 @@ async def _summarize_round(db, state: ResearchState, llm, round_num: int, scored
     return result.summary, result.knowledge_gaps
 
 
-async def _generate_report(db, state: ResearchState, llm) -> str:
+async def _generate_report(db, state: ResearchState, llm, cluster_list=None) -> str:
+    """Two-step report generation (STORM-style: outline → fill section by section).
+
+    Step 1: Generate a structured outline based on clusters + papers.
+    Step 2: For each section, select relevant papers + RAG evidence, generate content.
+    Step 3: Assemble all sections + references.
+    """
     from app.db.models import Paper, TaskPaper
+    from app.schemas.schemas import ReportOutline
+    from app.agent.prompts import (REPORT_OUTLINE_SYSTEM, REPORT_OUTLINE_USER,
+                                   REPORT_SECTION_SYSTEM, REPORT_SECTION_USER)
 
     # Gather high + medium priority papers for comprehensive coverage
     all_papers = db.query(Paper).join(TaskPaper).filter(
@@ -631,124 +708,260 @@ async def _generate_report(db, state: ResearchState, llm) -> str:
         TaskPaper.priority.in_(["high", "medium"]),
     ).order_by(TaskPaper.final_score.desc().nullslast()).limit(50).all()
 
-    high_papers_text = "\n".join(
+    if not all_papers:
+        logger.warning("Task %s: no papers for report", state.task_id[:8])
+        paper_repo.save_report(db, state.task_id, "无可用论文，无法生成报告。")
+        db.commit()
+        return "无可用论文，无法生成报告。"
+
+    # Build papers text with [P1], [P2] numbering
+    papers_text = "\n".join(
         f"[P{i+1}] {p.title} ({p.year}) [{p.venue or 'N/A'}] [citations: {p.citation_count}] DOI: {p.doi or 'N/A'}\n"
         f"  摘要: {(p.abstract or 'N/A')[:600]}"
         for i, p in enumerate(all_papers)
     )
+    paper_id_by_index = {i + 1: p.id for i, p in enumerate(all_papers)}
+    paper_by_index = {i + 1: p for i, p in enumerate(all_papers)}
 
-    # RAG: Retrieve full-text passages as evidence for report
-    rag_evidence_text = ""
+    # Build clusters text from in-memory cluster_list (passed from caller)
+    clusters_text = ""
+    if cluster_list and cluster_list.clusters:
+        cluster_lines = []
+        for i, c in enumerate(cluster_list.clusters):
+            # Match representative_papers (titles) to [Px] numbering
+            paper_nums = []
+            for title in c.representative_papers:
+                for idx, p in enumerate(all_papers):
+                    if title and p.title and title.lower() in p.title.lower():
+                        paper_nums.append(f"[P{idx+1}]")
+                        break
+            cluster_lines.append(
+                f"聚类{i+1}: {c.cluster_name or '未命名'}\n"
+                f"  核心方法: {c.core_method or 'N/A'}\n"
+                f"  论文: {', '.join(paper_nums) if paper_nums else '(未分配)'}\n"
+                f"  局限: {c.limitations or 'N/A'}"
+            )
+        clusters_text = "\n".join(cluster_lines)
+
+    # Get wiki context (pre-compiled knowledge from LLM Wiki)
+    wiki_context_text = ""
     try:
-        from app.services.rag_service import rag_retrieve
-        high_paper_ids = [p.id for p in high_papers]
-        rag_results = rag_retrieve(
-            query=state.normalized_topic,
-            top_k=30,
-            paper_ids=high_paper_ids,
-        )
-        if rag_results:
-            evidence_lines = []
-            for r in rag_results[:30]:
-                clean = re.sub(r'\[FIGURE:.*?\]|\[TABLE\]|\[/TABLE\]', '', r["text"])[:500].strip()
-                evidence_lines.append(f"[{r['paper_id'][:8]}] ({r['section']}) {clean}")
-            rag_evidence_text = "\n\n## 论文全文证据段落（RAG检索）\n" + "\n".join(evidence_lines)
-            logger.info("Task %s: RAG retrieved %d passages for report", state.task_id[:8], len(rag_results))
+        from app.services.wiki_service import get_wiki_context
+        wiki_context_text = get_wiki_context(db, state.task_id)
+        if wiki_context_text:
+            logger.info("Task %s: wiki context loaded for report (%d chars)",
+                       state.task_id[:8], len(wiki_context_text))
     except Exception as e:
-        logger.warning("Task %s: RAG retrieval for report failed (non-fatal): %s", state.task_id[:8], e)
+        logger.warning("Task %s: wiki context retrieval failed (non-fatal): %s", state.task_id[:8], e)
 
-    messages = [
-        {"role": "system", "content": REPORT_SYSTEM},
-        {"role": "user", "content": REPORT_USER.format(
-            topic=state.normalized_topic,
-            keywords=", ".join(state.keywords),
-            round_summaries="\n\n".join(state.round_summaries),
-            high_papers=high_papers_text or "(none)",
-            gaps="\n".join(state.knowledge_gaps) if state.knowledge_gaps else "(none)",
-        ) + (rag_evidence_text or "")},
-    ]
-    report_text = await llm.chat(messages, temperature=0.5)
+    # === Step 1: Generate outline ===
+    logger.info("Task %s: generating report outline (step 1/2)...", state.task_id[:8])
+    try:
+        outline = await llm.chat_json([
+            {"role": "system", "content": REPORT_OUTLINE_SYSTEM},
+            {"role": "user", "content": REPORT_OUTLINE_USER.format(
+                topic=state.normalized_topic,
+                clusters_text=clusters_text or "(无聚类信息)",
+                papers_text=papers_text,
+                round_summaries="\n\n".join(state.round_summaries[-3:]),
+                gaps="\n".join(state.knowledge_gaps) if state.knowledge_gaps else "(none)",
+            ) + ("\n\n## 知识库 Wiki（预编译论文合成）\n" + wiki_context_text if wiki_context_text else "")},
+        ], ReportOutline)
+        logger.info("Task %s: outline generated with %d sections", state.task_id[:8], len(outline.sections))
+    except Exception as e:
+        logger.warning("Task %s: outline generation failed, falling back to one-shot: %s", state.task_id[:8], e)
+        # Fallback: one-shot generation
+        outline = None
 
-    # P0-A: Self-feedback iteration (max 2 rounds — reduced from 3 to avoid over-refinement)
-    from app.schemas.schemas import ReportFeedback
-    from app.agent.prompts import REPORT_FEEDBACK_SYSTEM, REPORT_FEEDBACK_USER, REPORT_REFINE_SYSTEM, REPORT_REFINE_USER
+    if outline and outline.sections:
+        # === Step 2: Fill each section ===
+        logger.info("Task %s: filling %d sections (step 2/2)...", state.task_id[:8], len(outline.sections))
 
-    for refine_round in range(2):
-        logger.info("Task %s: report self-feedback round %d", state.task_id[:8], refine_round + 1)
+        # RAG: Pre-retrieve evidence for all papers (one call, reused per section)
+        all_paper_ids = [p.id for p in all_papers]
+        rag_evidence_global = ""
         try:
-            feedback = await llm.chat_json([
-                {"role": "system", "content": REPORT_FEEDBACK_SYSTEM},
-                {"role": "user", "content": REPORT_FEEDBACK_USER.format(
-                    topic=state.normalized_topic,
-                    report=report_text[:12000],
-                    papers=high_papers_text or "(none)",
-                )},
-            ], ReportFeedback)
+            from app.services.rag_service import rag_retrieve
+            rag_results = rag_retrieve(
+                query=state.normalized_topic,
+                top_k=50,
+                paper_ids=all_paper_ids,
+            )
+            if rag_results:
+                evidence_lines = []
+                for r in rag_results[:50]:
+                    clean = re.sub(r'\[FIGURE:.*?\]|\[TABLE\]|\[/TABLE\]', '', r["text"])[:400].strip()
+                    evidence_lines.append(f"[{r['paper_id'][:8]}] ({r['section']}) {clean}")
+                rag_evidence_global = "\n".join(evidence_lines)
+                logger.info("Task %s: RAG retrieved %d passages for report", state.task_id[:8], len(rag_results))
         except Exception as e:
-            logger.warning("Report feedback failed: %s", e)
-            break
+            logger.warning("Task %s: RAG retrieval for report failed (non-fatal): %s", state.task_id[:8], e)
 
-        if not feedback.needs_improvement:
-            logger.info("Task %s: report passed self-review", state.task_id[:8])
-            break
+        # Generate each section (with concurrency limit)
+        semaphore = asyncio.Semaphore(3)
 
-        logger.info("Task %s: report needs improvement: %s", state.task_id[:8], feedback.suggestions[:2])
+        async def generate_one_section(section, section_idx):
+            async with semaphore:
+                # Select papers for this section
+                section_paper_indices = section.paper_indices or []
+                # If no indices specified, use all papers (fallback)
+                if not section_paper_indices:
+                    section_paper_indices = list(range(1, len(all_papers) + 1))
+
+                # Build section-specific paper text
+                section_papers = []
+                section_paper_ids = []
+                for idx in section_paper_indices:
+                    p = paper_by_index.get(idx)
+                    if p:
+                        section_papers.append(
+                            f"[P{idx}] {p.title} ({p.year}) [{p.venue or 'N/A'}] [citations: {p.citation_count}]\n"
+                            f"  摘要: {(p.abstract or 'N/A')[:600]}"
+                        )
+                        section_paper_ids.append(p.id)
+
+                # RAG evidence specific to this section's papers
+                section_rag = ""
+                try:
+                    from app.services.rag_service import rag_retrieve
+                    if section_paper_ids:
+                        section_rag_results = rag_retrieve(
+                            query=f"{state.normalized_topic} {section.title}",
+                            top_k=15,
+                            paper_ids=section_paper_ids,
+                        )
+                        if section_rag_results:
+                            _fig_pat = re.compile(r'\[FIGURE:.*?\]|\[TABLE\]|\[/TABLE\]')
+                            section_rag = "\n".join(
+                                f"[{r['paper_id'][:8]}] ({r['section']}) "
+                                f"{_fig_pat.sub('', r['text'])[:400].strip()}"
+                                for r in section_rag_results[:15]
+                            )
+                except Exception:
+                    pass  # Non-fatal, use global evidence
+
+                try:
+                    content = await llm.chat([
+                        {"role": "system", "content": REPORT_SECTION_SYSTEM},
+                        {"role": "user", "content": REPORT_SECTION_USER.format(
+                            topic=state.normalized_topic,
+                            section_title=section.title,
+                            section_description=section.description or "",
+                            section_papers="\n".join(section_papers) or "(none)",
+                            rag_evidence=section_rag or rag_evidence_global or "(none)",
+                            round_summaries="\n\n".join(state.round_summaries[-2:]),
+                        ) + ("\n\n## 知识库 Wiki（预编译论文合成）\n" + wiki_context_text if wiki_context_text else "")},
+                    ], temperature=0.4)
+                    logger.info("Task %s: section %d/%d '%s' generated (%d chars)",
+                               state.task_id[:8], section_idx + 1, len(outline.sections),
+                               section.title[:30], len(content))
+                    return content
+                except Exception as e:
+                    logger.warning("Task %s: section '%s' generation failed: %s",
+                                  state.task_id[:8], section.title[:30], e)
+                    return f"## {section.title}\n\n(本节生成失败)"
+
+        # Run sections in parallel
+        section_tasks = [
+            generate_one_section(section, i)
+            for i, section in enumerate(outline.sections)
+        ]
+        section_contents = await asyncio.gather(*section_tasks)
+
+        # === Step 3: Assemble + add references ===
+        report_text = "\n\n".join(section_contents)
+
+        # Add references section
+        ref_lines = ["## 参考文献\n"]
+        for i, p in enumerate(all_papers):
+            ref_lines.append(f"[P{i+1}] {p.title} ({p.year}). DOI: {p.doi or 'N/A'}")
+        report_text += "\n\n" + "\n".join(ref_lines)
+
+    else:
+        # Fallback: one-shot generation (old approach)
+        logger.info("Task %s: using one-shot report generation (fallback)", state.task_id[:8])
+        from app.agent.prompts import REPORT_SYSTEM, REPORT_USER
+        rag_evidence_text = ""
         try:
-            report_text = await llm.chat([
-                {"role": "system", "content": REPORT_REFINE_SYSTEM},
-                {"role": "user", "content": REPORT_REFINE_USER.format(
-                    report=report_text[:12000],
-                    feedback="\n".join(feedback.suggestions),
-                    papers=high_papers_text or "(none)",
-                )},
-            ], temperature=0.3)
+            from app.services.rag_service import rag_retrieve
+            rag_results = rag_retrieve(
+                query=state.normalized_topic,
+                top_k=30,
+                paper_ids=[p.id for p in all_papers],
+            )
+            if rag_results:
+                evidence_lines = []
+                for r in rag_results[:30]:
+                    clean = re.sub(r'\[FIGURE:.*?\]|\[TABLE\]|\[/TABLE\]', '', r["text"])[:500].strip()
+                    evidence_lines.append(f"[{r['paper_id'][:8]}] ({r['section']}) {clean}")
+                rag_evidence_text = "\n\n## 论文全文证据段落（RAG检索）\n" + "\n".join(evidence_lines)
         except Exception as e:
-            logger.warning("Report refine failed: %s", e)
-            break
+            logger.warning("Task %s: RAG retrieval for report failed: %s", state.task_id[:8], e)
 
-    # Post-check: detect placeholder text (LLM sometimes writes meta-instructions instead of content)
+        messages = [
+            {"role": "system", "content": REPORT_SYSTEM},
+            {"role": "user", "content": REPORT_USER.format(
+                topic=state.normalized_topic,
+                keywords=", ".join(state.keywords),
+                round_summaries="\n\n".join(state.round_summaries),
+                high_papers=papers_text or "(none)",
+                gaps="\n".join(state.knowledge_gaps) if state.knowledge_gaps else "(none)",
+            ) + (rag_evidence_text or "") + ("\n\n## 知识库 Wiki（预编译论文合成）\n" + wiki_context_text if wiki_context_text else "")},
+        ]
+        report_text = await llm.chat(messages, temperature=0.5)
+
+    # Post-check: detect placeholder text
     import re as _re
     placeholder_patterns = [
-        r'（.*?保持不变.*?）',
-        r'（.*?保持原.*?）',          # "保持原有参考文献内容"
-        r'（.*?新增内容.*?）',
-        r'（.*?此部分.*?）',
-        r'（.*?其余.*?不变.*?）',
-        r'（.*?省略.*?）',            # "（省略...）"
-        r'（.*?详见.*?）',            # "（详见上文）"
-        r'（.*?同上.*?）',            # "（同上）"
-        r'（.*?参见.*?）',            # "（参见...）"
-        r'（.*?不?变.*?）',           # "（不变）""（保持不变）"
-        r'（.*?未变.*?）',
-        r'\(.*?remain.*?unchanged.*?\)',
-        r'\(.*?see above.*?\)',
-        r'\(.*?omitted.*?\)',
-        # Also detect lines that are ONLY a parenthetical instruction
-        r'^（.*?补充.*?）$',
-        r'^（.*?完善.*?）$',
+        r'（.*?保持不变.*?）', r'（.*?保持原.*?）', r'（.*?新增内容.*?）',
+        r'（.*?此部分.*?）', r'（.*?其余.*?不变.*?）', r'（.*?省略.*?）',
+        r'（.*?详见.*?）', r'（.*?同上.*?）', r'（.*?参见.*?）',
+        r'（.*?不?变.*?）', r'（.*?未变.*?）',
+        r'\(.*?remain.*?unchanged.*?\)', r'\(.*?see above.*?\)', r'\(.*?omitted.*?\)',
+        r'^（.*?补充.*?）$', r'^（.*?完善.*?）$',
     ]
     has_placeholders = any(_re.search(p, report_text) for p in placeholder_patterns)
     if has_placeholders:
-        logger.warning("Task %s: report contains placeholder text, regenerating without self-feedback", state.task_id[:8])
-        # Regenerate from scratch without self-feedback
-        report_text = await llm.chat(messages, temperature=0.5)
+        logger.warning("Task %s: report contains placeholder text", state.task_id[:8])
 
     paper_repo.save_report(db, state.task_id, report_text)
     paper_repo.save_trace(db, state.task_id, "generate_report", "action",
-                          output_data={"length": len(report_text)})
+                          output_data={"length": len(report_text),
+                                       "method": "two_step" if outline else "one_shot",
+                                       "sections": len(outline.sections) if outline else 0})
     db.commit()
     emit_event(state.task_id, "report_ready", {"length": len(report_text)})
     return report_text
 
 
 async def _build_paper_clusters(db, state: ResearchState, llm, task_id: str):
-    """Cluster ALL papers (not just high-priority) into thematic groups.
-    Reference: Idea2Paper's knowledge graph approach."""
+    """Cluster ALL papers into thematic groups.
+    
+    Primary: Use pre-compiled LLM Wiki concept pages (replaces GraphRAG community detection).
+    Fallback: LLM-based clustering if wiki is not yet built.
+    """
     from app.db.models import Paper, TaskPaper
     from app.schemas.schemas import ClusterList
+
+    # === Primary: Get clusters from wiki ===
+    try:
+        from app.services.wiki_service import get_wiki_clusters
+        wiki_clusters = get_wiki_clusters(db, task_id)
+        if wiki_clusters and wiki_clusters.clusters:
+            logger.info("Task %s: using wiki clusters (%d concept pages, %d cross-gaps)",
+                       task_id[:8], len(wiki_clusters.clusters), len(wiki_clusters.cross_cluster_gaps))
+            paper_repo.save_trace(db, task_id, "build_clusters", "action",
+                                  output_data={"source": "wiki",
+                                               "cluster_count": len(wiki_clusters.clusters),
+                                               "cross_gaps": len(wiki_clusters.cross_cluster_gaps)})
+            db.commit()
+            return wiki_clusters
+    except Exception as e:
+        logger.warning("Task %s: wiki cluster retrieval failed, falling back to LLM: %s", task_id[:8], e)
+
+    # === Fallback: LLM-based clustering ===
     from app.agent.prompts import CLUSTER_SYSTEM, CLUSTER_USER
 
-    # Get ALL papers (high + medium), not just high — with method extracts
     all_tps = db.query(TaskPaper).filter(
         TaskPaper.task_id == task_id,
         TaskPaper.priority.in_(["high", "medium"]),
@@ -764,7 +977,6 @@ async def _build_paper_clusters(db, state: ResearchState, llm, task_id: str):
         logger.info("Task %s: too few papers (%d) for clustering, skipping", task_id[:8], len(all_papers))
         return None
 
-    # Build paper list with title + abstract + method extract
     papers_text = "\n".join(
         f"- [{p.id}] {p.title} ({p.year}) [{p.venue or 'N/A'}]: {(p.abstract or '')[:300]}\n  方法: {tp.summary or 'N/A'}"
         for p, tp in all_papers
@@ -781,10 +993,11 @@ async def _build_paper_clusters(db, state: ResearchState, llm, task_id: str):
     try:
         cluster_list = await llm.chat_json(messages, ClusterList)
         paper_repo.save_trace(db, task_id, "build_clusters", "action",
-                              output_data={"cluster_count": len(cluster_list.clusters),
+                              output_data={"source": "llm_fallback",
+                                           "cluster_count": len(cluster_list.clusters),
                                            "cross_gaps": len(cluster_list.cross_cluster_gaps)})
         db.commit()
-        logger.info("Task %s: built %d clusters, %d cross-cluster gaps",
+        logger.info("Task %s: built %d clusters (LLM fallback), %d cross-cluster gaps",
                     task_id[:8], len(cluster_list.clusters), len(cluster_list.cross_cluster_gaps))
         return cluster_list
     except Exception as e:
@@ -792,12 +1005,13 @@ async def _build_paper_clusters(db, state: ResearchState, llm, task_id: str):
         return None
 
 
-async def _generate_and_score_ideas(db, state: ResearchState, llm, task_id: str, prev_feedback: str = ""):
+async def _generate_and_score_ideas(db, state: ResearchState, llm, task_id: str, prev_feedback: str = "", cluster_list=None):
     from app.db.models import Paper, TaskPaper
     from app.schemas.schemas import IdeaList, IdeaScore
 
     # P1: Build paper clusters first — use ALL papers, not just high-priority
-    cluster_list = await _build_paper_clusters(db, state, llm, task_id)
+    if cluster_list is None:
+        cluster_list = await _build_paper_clusters(db, state, llm, task_id)
 
     # Get high + medium priority papers for idea generation (not just high)
     all_tps = db.query(TaskPaper).filter(
@@ -878,6 +1092,22 @@ async def _generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
         user_content += "\n\n" + cluster_context
     if rag_evidence:
         user_content += rag_evidence
+    # Add wiki context (pre-compiled knowledge: methods, datasets, concepts, synthesis)
+    # P1-3: For idea generation, prioritize method/dataset/synthesis pages (anti-hallucination)
+    #       while still including concept pages for theme awareness
+    try:
+        from app.services.wiki_service import get_wiki_context
+        wiki_ctx = get_wiki_context(
+            db, task_id,
+            page_types=["method", "dataset", "model", "synthesis", "concept"],
+            max_chars=12000,
+        )
+        if wiki_ctx:
+            user_content += "\n\n" + wiki_ctx
+            logger.info("Task %s: wiki context added to idea generation (%d chars)",
+                       task_id[:8], len(wiki_ctx))
+    except Exception as e:
+        logger.warning("Task %s: wiki context for ideas failed (non-fatal): %s", task_id[:8], e)
     if prev_feedback:
         user_content += "\n\n--- 之前创意反馈 ---\n" + prev_feedback
 
@@ -970,10 +1200,12 @@ async def _generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
                 raw_names = re.split(r'[、,，;；和与]\s*', baseline_text)
                 for name in raw_names:
                     name = name.strip().rstrip('。.')
-                    # Remove leading comparison phrases (比较/对比)
+                    # Remove leading comparison phrases
                     name = re.sub(r'^(比较|对比|与|和)\s*', '', name).strip()
-                    # Remove trailing performance phrases
-                    name = re.sub(r'(的性能|等|框架|系统)$', '', name).strip()
+                    # Remove trailing phrases: 进行对比/对比/的性能/等/框架/系统/基线/等基线
+                    name = re.sub(r'(进行对比|对比|的性能|等基线|等|基线|框架|系统)$', '', name).strip()
+                    # Remove trailing parenthetical descriptions: "EMA2（基于...）" → "EMA2"
+                    name = re.sub(r'[（(].*?[)）]\s*$', '', name).strip()
                     # Skip generic terms and known real baselines
                     if len(name) > 2 and name.lower() not in KNOWN_REAL_BASELINES:
                         # Also skip Chinese generic terms starting with 标准/普通/基础/传统
@@ -1006,27 +1238,40 @@ async def _generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
         # Collect names that need search verification
         names_to_search = {name for name, _ in baselines_to_check if name not in verified_baselines}
 
-        # Second check: search S2 for unverified baselines
+        # Second check: search for unverified baselines (S2 + Crossref fallback)
         semaphore = asyncio.Semaphore(3)
         async def verify_one_baseline(name: str) -> tuple[str, bool]:
             if name in verified_baselines:
                 return name, True
             async with semaphore:
+                name_lower = name.lower()
                 try:
                     results = await search_service.search_all_sources(name, limit=5)
                     if not results or len(results) == 0:
+                        # S2 may be rate-limited — try Crossref directly
+                        try:
+                            from app.paper_sources.crossref_source import CrossrefSource
+                            cr = CrossrefSource()
+                            cr_results = await cr.search(name, limit=5)
+                            if cr_results:
+                                for r in cr_results[:5]:
+                                    if name_lower in (r.title or "").lower():
+                                        return name, True
+                        except Exception:
+                            pass
                         return name, False  # No results at all → likely fabricated
                     # STRICT check: baseline name must appear in at least one result title
-                    for r in results[:5]:
+                    check_limit = 3 if len(name) < 5 else 5
+                    for r in results[:check_limit]:
                         title_lower = (r.title or "").lower()
-                        # Check exact name match or name as substring in title
-                        if name.lower() in title_lower:
+                        if name_lower in title_lower:
                             return name, True
                     # Results exist but name NOT in any title → suspicious
-                    # This means the search found loosely related papers but not the exact method
                     return name, False
                 except Exception:
-                    return name, True  # If search API fails, don't penalize (give benefit of doubt)
+                    # Search API failed (rate limit, timeout, etc.) — mark as unverified
+                    # Do NOT give benefit of doubt (previous bug: returned True)
+                    return name, False
 
         if names_to_search:
             tasks_verify = [verify_one_baseline(name) for name in names_to_search]
@@ -1059,6 +1304,57 @@ async def _generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
                                            "fabricated": len(fabricated_baselines),
                                            "fabricated_names": [n for n, _ in fabricated_baselines]})
         db.commit()
+
+        # === P1-2: Dataset verification ===
+        KNOWN_DATASETS = {
+            "multwoz", "mmlu", "glue", "ms coco", "mscoco", "wikitext-103", "wikitext",
+            "clevrer", "squad", "squad 2.0", "natural questions", "trivia qa", "triviaqa",
+            "hotpotqa", "wikipedia", "cnn/dailymail", "cnn dailymail", "xsum", "wmt",
+            "multiwoz", "babi", "dialogue", "persona-chat", "personachat",
+            "imagenet", "cifar", "cifar-10", "cifar-100", "mnist", "fashion-mnist",
+            "openbookqa", "arc", "hellaswag", "winogrande", "gsm8k", "math",
+            "human eval", "humaneval", "mbpp", "codecontests",
+        }
+        datasets_to_check: list[tuple[str, int]] = []
+        for idx, item in enumerate(idea_list.ideas):
+            if idx in ideas_to_skip:
+                continue
+            method = item.method_sketch or ""
+            ds_match = re.search(r'数据集[：:]\s*(.+?)(?:\n|$)', method)
+            if ds_match:
+                ds_text = ds_match.group(1)
+                raw_names = re.split(r'[、,，;；和与]\s*', ds_text)
+                for name in raw_names:
+                    name = name.strip().rstrip('。.（）()')
+                    # Remove descriptors like "格式的发票数据集"
+                    name = re.sub(r'格式的.*$', '', name).strip()
+                    if len(name) > 2:
+                        datasets_to_check.append((name, idx))
+
+        fabricated_datasets: list[tuple[str, int]] = []
+        for ds_name, idea_idx in datasets_to_check:
+            ds_lower = ds_name.lower()
+            # Check if in known datasets
+            if ds_lower in KNOWN_DATASETS:
+                continue
+            # Check if mentioned in our paper database
+            found_in_db = any(
+                ds_lower in title or ds_lower in abstract
+                for title, abstract in all_paper_abstracts_lower
+            )
+            if not found_in_db:
+                fabricated_datasets.append((ds_name, idea_idx))
+
+        for ds_name, idea_idx in fabricated_datasets:
+            penalty = 0.05  # Smaller penalty than baselines
+            validation_penalties[idea_idx] = validation_penalties.get(idea_idx, 0) + penalty
+            logger.warning("Task %s: idea %d has SUSPICIOUS dataset: %s (penalty: +%.2f)",
+                          task_id[:8], idea_idx+1, ds_name, penalty)
+
+        if fabricated_datasets:
+            paper_repo.save_trace(db, task_id, "idea_dataset_verification", "observation",
+                                  output_data={"suspicious_datasets": [n for n, _ in fabricated_datasets]})
+            db.commit()
 
     except Exception as e:
         logger.warning("Task %s: baseline search verification failed (non-fatal): %s", task_id[:8], e)
@@ -1136,7 +1432,8 @@ async def _generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
                 new_fabricated = []
                 for bname in enriched_baselines:
                     bname = re.sub(r'^(比较|对比|与|和)\s*', '', bname.strip().rstrip('。.'))
-                    bname = re.sub(r'(的性能|等|框架|系统)$', '', bname).strip()
+                    bname = re.sub(r'(进行对比|对比|的性能|等基线|等|基线|框架|系统)$', '', bname).strip()
+                    bname = re.sub(r'[（(].*?[)）]\s*$', '', bname).strip()
                     if len(bname) > 2 and bname.lower() not in KNOWN_REAL_BASELINES and bname not in verified_baselines:
                         if not re.match(r'^(标准|普通|基础|传统|常规|一般)', bname):
                             new_fabricated.append(bname)
