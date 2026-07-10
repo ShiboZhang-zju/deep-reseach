@@ -10,7 +10,26 @@ from app.db.session import Base
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    """Return current time in UTC. SQLite strips tzinfo on storage,
+    so we return naive UTC to keep storage consistent.
+    API layer re-appends +00:00 via isoformat_utc().
+    """
+    return datetime.utcnow()
+
+
+def isoformat_utc(dt: datetime | None) -> str:
+    """Format datetime as ISO 8601 with explicit UTC timezone marker.
+    
+    SQLite stores naive datetimes (strips tzinfo), so we re-append +00:00
+    to ensure the frontend can correctly convert to local time.
+    """
+    if not dt:
+        return ""
+    # If already has tzinfo, use it as-is
+    if dt.tzinfo is not None:
+        return dt.isoformat()
+    # Naive datetime — assume UTC and append +00:00
+    return dt.isoformat() + "+00:00"
 
 
 def _uuid() -> str:
@@ -265,3 +284,36 @@ class UserFeedback(Base):
     created_at = Column(DateTime, default=_utcnow)
 
     task = relationship("ResearchTask", back_populates="feedbacks")
+
+
+class WikiPage(Base):
+    """LLM Wiki pages — incrementally compiled knowledge from papers.
+
+    Replaces GraphRAG's entity/relation/community approach with
+    pre-compiled, human-readable markdown pages.
+
+    page_type:
+    - concept: Research theme/direction (replaces clustering)
+    - method: Specific technique/algorithm
+    - dataset: Specific dataset
+    - model: Specific model
+    - synthesis: Cross-cutting analysis
+    - index: Auto-maintained wiki index
+    """
+    __tablename__ = "wiki_pages"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    page_type = Column(String, nullable=False)
+    title = Column(Text, nullable=False)
+    content_markdown = Column(Text, default="")
+    paper_ids_json = Column(Text, default="[]")
+    links_json = Column(Text, default="[]")
+    contradictions_json = Column(Text, default="[]")
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        Index("idx_wiki_task_type", "task_id", "page_type"),
+        Index("idx_wiki_task_title", "task_id", "title"),
+    )

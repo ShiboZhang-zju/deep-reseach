@@ -214,6 +214,18 @@ class ReportFeedback(BaseModel):
     missing_content: str = Field("", description="缺失的内容描述")
 
 
+class ReportOutlineSection(BaseModel):
+    """One section of the report outline."""
+    title: str = Field(..., description="章节标题（中文）")
+    description: str = Field("", description="章节内容描述")
+    paper_indices: list[int] = Field(default_factory=list, description="相关论文编号 [P1]=1")
+
+
+class ReportOutline(BaseModel):
+    """Full report outline for two-step generation."""
+    sections: list[ReportOutlineSection] = Field(default_factory=list)
+
+
 class NoveltyCheck(BaseModel):
     is_novel: bool = Field(..., description="创意是否新颖")
     similar_papers: list[str] = Field(default_factory=list, description="已有类似工作的论文标题")
@@ -267,3 +279,33 @@ class IdeaValidation(BaseModel):
 class IdeaValidationList(BaseModel):
     """Validation results for all ideas."""
     validations: list[IdeaValidation] = Field(default_factory=list)
+
+
+# === LLM Wiki schemas ===
+
+class WikiAction(BaseModel):
+    """A single wiki action: create or update a page."""
+    op: str = Field(..., description="create or update")
+    page_type: str = Field(..., description="concept, method, dataset, model, synthesis")
+    title: str = Field(..., description="Page title (concise)")
+    content: str = Field(..., description="Full markdown content for this page")
+    paper_ids: list[str] = Field(default_factory=list, description="Paper ID prefixes referenced")
+    links: list[str] = Field(default_factory=list, description="Outbound wikilink targets")
+    contradictions: list[str] = Field(default_factory=list, description="Contradictions found")
+
+
+class WikiActionList(BaseModel):
+    """List of wiki actions from LLM."""
+    actions: list[WikiAction] = Field(default_factory=list)
+
+
+class WikiLintIssue(BaseModel):
+    """A single issue found during wiki lint."""
+    issue_type: str = Field(..., description="contradiction, orphan, stale, missing_link")
+    page_title: str = Field("", description="Affected page title")
+    description: str = Field("", description="Issue description")
+
+
+class WikiLintResult(BaseModel):
+    """Result of wiki health check."""
+    issues: list[WikiLintIssue] = Field(default_factory=list)

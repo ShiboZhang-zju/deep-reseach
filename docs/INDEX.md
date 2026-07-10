@@ -15,8 +15,8 @@
 | 07 | [元数据补充](07-metadata-enrichment.md) | P2 | 待实现 | `paper_sources/*.py`, `scoring_service.py` |
 | 08 | [PostgreSQL 迁移](08-postgres-migration.md) | P3 | 待实现 | `session.py`, `config.py`, `.env` |
 | 09 | [架构升级](09-architecture-upgrade.md) | — | **P0已实现**，P1-A 详见 10 | `runner.py`, `prompts.py`, `schemas.py` |
-| **10** | [**RAG 全文检索管线**](10-rag-fulltext-pipeline.md) | **P1** | **待实现** | `rag_service.py`(新建), `runner.py`, `models.py`, `prompts.py` |
-| **11** | [**GraphRAG 知识图谱检索**](11-graphrag-planning.md) | **P2** | **规划中** | `graphrag_service.py`(新建), `runner.py`, `models.py` |
+| **10** | [**RAG 全文检索管线**](10-rag-fulltext-pipeline.md) | **P1** | **已实现** | `rag_service.py`, `runner.py`, `models.py`, `prompts.py` |
+| **11** | [**LLM Wiki 知识编译**](11-llm-wiki.md) | **P2** | **已实现** | `wiki_service.py`(新建), `runner.py`, `models.py`, `schemas.py`, `prompts.py` |
 | **12** | [**文献地图**](12-literature-map.md) | **P1** | **设计文档** | `literature_map_service.py`(新建), `maps.py`(新建), `runner.py`, `models.py`, 前端 `LiteratureMapView.tsx` |
 
 ## 实现顺序
@@ -28,9 +28,9 @@
   09-P0: 自反馈迭代 + 新颖性检查 + idea质量5层改进
 
 下一步:
-  P1: 10（RAG全文检索 — 幻觉根因修复，ChromaDB向量数据库，为GraphRAG预留扩展）
+  P1: 10（RAG全文检索 — 幻觉根因修复，ChromaDB向量数据库，为LLM Wiki提供素材）✅
   P1: 12（文献地图 — 引文网络+语义聚类双层可视化，复用doc 10 embedding，用户可见价值高）
-  P2: 11（GraphRAG知识图谱 — 实体/关系抽取→社区检测→跨论文推理，依赖doc 10，文献地图聚类层可升级）
+  P2: 11（LLM Wiki知识编译 — 增量编译wiki页面替代GraphRAG，预编译交叉引用+矛盾检测）✅
   P2: 06 → 07                    （gap + 元数据，体验优化）
   P2: 09-P1B（多视角提问搜索，参考STORM）
   P2: 09-P2A（交叉编码器重排序）
@@ -68,12 +68,13 @@
 - **embedding模型**：BAAI/bge-base-en-v1.5（768维，质量最佳，GraphRAG兼容）
 - **详见**：[10-rag-fulltext-pipeline.md](10-rag-fulltext-pipeline.md)
 
-### 2026-07-07: GraphRAG 路线规划
-- **目标**：从语义检索升级到知识图谱推理，发现跨论文方法组合
-- **方案**：实体/关系抽取（参考KGGen两步法）→ 社区检测（Leiden）→ Local/Global/Hybrid Search
-- **核心价值**：idea生成能发现"论文A的方法 + 论文B的数据集"组合；聚类从LLM猜测改为数据驱动社区检测
-- **依赖**：必须在doc 10完成后实施
-- **详见**：[11-graphrag-planning.md](11-graphrag-planning.md)
+### 2026-07-07: GraphRAG → LLM Wiki 路线变更
+- **原方案**：GraphRAG（实体/关系抽取→社区检测→Local/Global/Hybrid Search）
+- **问题**：~220次LLM调用、社区检测不可解释、矛盾检测困难、知识不累积
+- **新方案**：LLM Wiki（Karpathy 范式）— LLM 作为 wiki 编辑器，增量编译结构化 Markdown 页面
+- **核心优势**：知识累积（越用越丰富）、交叉引用预编译、矛盾自动检测、人类可读、LLM调用仅4-7次
+- **页面类型**：concept（替代聚类）、method、dataset、model、synthesis（跨主题分析）
+- **详见**：[11-llm-wiki.md](11-llm-wiki.md)
 
 ### 2026-07-08: 文献地图设计
 - **问题**：论文列表平铺，无关系视图；LLM聚类不持久化；用户无法全局把握领域结构

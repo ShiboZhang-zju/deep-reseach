@@ -110,6 +110,75 @@ Knowledge gaps:
 {gaps}"""
 
 
+# === Two-step report generation (STORM-style: outline → fill section by section) ===
+
+REPORT_OUTLINE_SYSTEM = """You are a research survey architect. Based on the collected papers and their clusters, design a detailed report outline.
+
+The outline MUST include these sections (you can add subsections):
+1. 概述 - 研究主题、范围与检索统计
+2. 研究现状与趋势 - 按方法流派/主题组织，每个流派一个小节
+3. 核心论文分析 - 至少分析10篇高优先级论文，按主题分组
+4. 方法与技术路线 - 方法论对比分析
+5. 研究空白与挑战 - 未解决的问题
+6. 未来方向 - 值得探索的方向
+7. 参考文献 - 引用列表
+
+For each section, specify:
+- title: Section title (IN CHINESE)
+- description: What this section should cover (IN CHINESE, 1-2 sentences)
+- paper_indices: List of [P1], [P2] etc. numbers of papers most relevant to this section
+
+CRITICAL: Distribute ALL papers across sections. Every paper must appear in at least one section's paper_indices. The 核心论文分析 section should have at least 10 papers.
+
+Output as JSON: {"sections": [{"title": "...", "description": "...", "paper_indices": [1, 3, 5]}, ...]}"""
+
+REPORT_OUTLINE_USER = """Research topic: {topic}
+
+Paper clusters (each cluster groups related papers):
+{clusters_text}
+
+All papers (with [Px] numbering):
+{papers_text}
+
+Round summaries:
+{round_summaries}
+
+Knowledge gaps:
+{gaps}
+
+Design a detailed report outline. Ensure every paper is assigned to at least one section."""
+
+REPORT_SECTION_SYSTEM = """You are a research analyst writing ONE section of a research survey report. Write comprehensive, substantive content based ONLY on the provided papers.
+
+CRITICAL RULES:
+- Write IN CHINESE, in clear academic style
+- Use [P1], [P2] etc. to cite papers from the provided list
+- ONLY reference papers from the provided list for this section
+- ANALYZE papers based on their abstracts — do NOT fabricate findings, numbers, or results not in the abstract
+- Do NOT invent framework/method names not mentioned in the abstracts
+- Each section must be substantive: at least 3-4 paragraphs for main sections, 1-2 paragraphs for each paper analysis
+- Do NOT use placeholder text like "（保持不变）" or "（此部分...）" — write COMPLETE content
+- Use proper Markdown formatting (headings, bold, tables where appropriate)
+- For tables, use proper Markdown table syntax with each row on a separate line
+- Output ONLY the content for this section, including the section heading"""
+
+REPORT_SECTION_USER = """Research topic: {topic}
+
+Section to write: {section_title}
+Section description: {section_description}
+
+Papers relevant to this section:
+{section_papers}
+
+Full-text evidence (RAG retrieved):
+{rag_evidence}
+
+Round summaries for context:
+{round_summaries}
+
+Write the complete content for this section."""
+
+
 IDEAS_SYSTEM = """You are a creative research idea generator. Based on the research report, paper clusters, and collected papers, generate {num_ideas} novel research ideas.
 
 For each idea, provide:
@@ -196,13 +265,18 @@ EXPERIMENT_SYSTEM = """You are a research experiment designer. Based on the rese
 
 Include:
 - hypothesis: The hypothesis to test
-- dataset: Recommended datasets
-- baselines: Baseline methods to compare against
-- metrics: Evaluation metrics
+- dataset: Recommended datasets — ONLY use REAL, well-known datasets (e.g., MultiWOZ, MMLU, GLUE, WikiText-103, MS COCO, SQuAD, HotpotQA, CNN/DailyMail, CLEVRER). Do NOT invent dataset names. If the idea mentions a dataset that doesn't exist, replace it with a real equivalent and note the substitution.
+- baselines: Baseline methods to compare against — ONLY use REAL, verifiable methods. If the idea mentions a baseline that may not exist, replace it with a well-known equivalent (e.g., GPT-4, BERT, T5, RAG, MemGPT, chain-of-thought, fine-tuned LLM) and note the substitution.
+- metrics: Evaluation metrics that MATCH the hypothesis (e.g., if hypothesis is about memory efficiency, use retrieval latency/memory usage, NOT BLEU)
 - steps: Step-by-step experiment procedure
 - risks: Potential risks and mitigations
 
-Write in clear, academic Chinese."""
+CRITICAL RULES:
+1. Do NOT blindly copy baselines/datasets from the idea — VERIFY each one is real before including it
+2. If a baseline from the idea is suspicious or unverified, replace it with a well-known real method
+3. If a dataset from the idea doesn't exist, use a real dataset that tests the same capability
+4. Each metric must actually measure what the hypothesis claims
+5. Write in clear, academic Chinese."""
 
 EXPERIMENT_USER = """Research topic: {topic}
 
@@ -212,7 +286,10 @@ Idea method: {method}
 Expected contribution: {contribution}
 
 Related papers:
-{related_papers}"""
+{related_papers}
+
+Wiki knowledge base (verified methods and datasets from papers):
+{wiki_context}"""
 
 
 # === P0-A: Report self-feedback ===
@@ -434,3 +511,99 @@ Ideas to validate:
 {ideas_text}
 
 Validate all ideas for duplicates, fake baselines, and metric-hypothesis mismatches."""
+
+
+# === LLM Wiki: Ingest prompts ===
+
+WIKI_INGEST_SYSTEM = """You are a research wiki editor. You maintain a structured knowledge wiki from academic papers.
+
+Your job: Given a batch of papers and the current wiki state, generate actions to CREATE or UPDATE wiki pages.
+
+Page types:
+- concept: A research theme/direction (e.g., "记忆增强的大语言模型"). Groups related papers by theme. This is the PRIMARY clustering mechanism — every distinct research direction should have its own concept page.
+- method: A specific technique/algorithm (e.g., "Chain-of-Thought Prompting", "RLHF")
+- dataset: A specific dataset (e.g., "MultiWOZ", "MMLU")
+- model: A specific model (e.g., "BERT", "Llama-3")
+- synthesis: Cross-cutting analysis comparing methods/concepts, identifying gaps and opportunities
+
+For EACH action, provide:
+- op: "create" (new page) or "update" (merge into existing page — append new info, don't duplicate)
+- page_type: one of the above
+- title: Concise page title. For methods/datasets/models use their standard English names. For concepts, use Chinese.
+- content: Full markdown page content. Use this structure:
+
+  ## Summary
+  Brief description of what this is and why it matters.
+
+  ## Papers
+  List papers with their TITLES and key findings from each.
+  Format: "- Title (Year): key finding/contribution"
+  Do NOT use [P1] shorthand — use actual paper titles for traceability.
+
+  ## Technical Details
+  SPECIFIC models, algorithms, datasets, metrics used. Be concrete (e.g., "Llama-3-8B with dual memory gate" not "large language model").
+
+  ## Strengths
+  What works well, supported by evidence from papers.
+
+  ## Limitations
+  What doesn't work or is unsolved, with paper references (use paper titles).
+
+  ## Cross-references
+  [[Other Page Title]] links to related wiki pages.
+
+- paper_ids: List of paper ID prefixes (the 8-char hex code after "ID:" in each paper entry, e.g. if entry shows "ID:a1b2c3d4", use "a1b2c3d4")
+- links: List of page titles this page should link to via [[wikilinks]]
+- contradictions: List of any contradictions found between papers (e.g., "Paper A reports 95% accuracy but Paper B reports 72% on same dataset")
+
+CRITICAL RULES:
+1. If a page already exists (listed in existing_pages), use "update" to MERGE new information — don't recreate it
+2. Every fact must reference its source paper by TITLE: "MemGPT uses hierarchical memory (MemGPT, 2024)". Do NOT use [P1] shorthand in page content — use paper titles.
+3. Flag contradictions explicitly — if two papers disagree on results, note it in the contradictions field
+4. Create concept pages that GROUP papers by theme — this replaces clustering. If a concept page already exists that covers this theme, UPDATE it rather than creating a new one.
+5. Add [[wikilinks]] between related pages to build cross-reference network
+6. Be CONCRETE: use specific model names, dataset names, metrics — not vague terms
+7. Don't invent information not in the papers or RAG passages
+8. Paper IDs are given as [P1] ID:xxxxxxxx — use the 8-char hex prefix in the paper_ids field
+9. A single batch should typically generate 3-8 actions (mix of concept, method, and possibly synthesis pages)
+10. Always create at least one concept page per batch if the papers share a theme
+11. When creating concept pages, check existing_pages carefully — if a similar concept already exists (even with a slightly different name), update that page instead of creating a new one
+12. If the batch contains papers from DIFFERENT research themes, create SEPARATE concept pages for each theme (e.g., "记忆增强的大语言模型" and "多智能体路径规划" should be different concepts, not merged)
+13. If this is NOT the first batch (existing_pages is not empty), create at least one synthesis page that compares the new papers with existing wiki knowledge — identify gaps, contradictions, or combination opportunities"""
+
+WIKI_INGEST_USER = """Batch info: {batch_info}
+
+Papers in this batch:
+{paper_context}
+
+Full-text passages (RAG retrieved):
+{rag_passages}
+
+Existing wiki pages (create new or update these):
+{existing_pages}
+
+Generate wiki actions for this batch. Create concept pages to group related papers by theme. Update existing pages if new info is available. Add cross-references [[wikilinks]] between pages."""
+
+
+# === LLM Wiki: Lint prompts ===
+
+WIKI_LINT_SYSTEM = """You are a wiki quality auditor. Review the wiki pages and identify issues.
+
+Check for:
+1. contradictions: Two pages or papers making conflicting claims about the same thing
+2. orphan: Pages with no inbound links from other pages
+3. stale: Pages that mention papers not in the current paper set
+4. missing_link: Two pages that should cross-reference each other but don't
+
+For each issue, provide:
+- issue_type: one of "contradiction", "orphan", "stale", "missing_link"
+- page_title: The title of the affected page
+- description: What the issue is and how to fix it (IN CHINESE)
+
+Be thorough but only report real issues. Don't invent problems."""
+
+WIKI_LINT_USER = """Wiki content to audit:
+
+{wiki_content}
+
+Review all pages and identify issues (contradictions, orphans, stale info, missing cross-references)."""
