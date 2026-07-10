@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.api.deps import get_db_session
-from app.db.models import Paper, TaskPaper, ResearchRound
+from app.db.models import Paper, TaskPaper, ResearchRound, WikiPage, isoformat_utc
 from app.schemas.schemas import PaperOut, RoundOut
 
 router = APIRouter()
@@ -69,7 +69,45 @@ def get_rounds(task_id: str, db: Session = Depends(get_db_session)):
             duplicate_rate=r.duplicate_rate,
             summary=r.summary,
             knowledge_gaps_json=r.knowledge_gaps_json,
-            created_at=r.created_at.isoformat() if r.created_at else "",
+            created_at=isoformat_utc(r.created_at),
         )
         for r in rounds
     ]
+
+
+@router.get("/tasks/{task_id}/wiki")
+def get_wiki_pages(
+    task_id: str,
+    page_type: str | None = Query(None, description="Filter by: concept/method/dataset/model/synthesis"),
+    db: Session = Depends(get_db_session),
+):
+    """Get wiki pages for a task (LLM Wiki knowledge base)."""
+    query = db.query(WikiPage).filter(WikiPage.task_id == task_id)
+    if page_type:
+        query = query.filter(WikiPage.page_type == page_type)
+    else:
+        query = query.filter(WikiPage.page_type != "index")
+
+    pages = query.order_by(WikiPage.page_type, WikiPage.title).all()
+
+    return [
+        {
+            "id": p.id,
+            "page_type": p.page_type,
+            "title": p.title,
+            "content_markdown": p.content_markdown,
+            "paper_ids": json.loads(p.paper_ids_json or "[]"),
+            "links": json.loads(p.links_json or "[]"),
+            "contradictions": json.loads(p.contradictions_json or "[]"),
+            "created_at": isoformat_utc(p.created_at),
+            "updated_at": isoformat_utc(p.updated_at),
+        }
+        for p in pages
+    ]
+
+
+@router.get("/tasks/{task_id}/wiki/stats")
+def get_wiki_stats_api(task_id: str, db: Session = Depends(get_db_session)):
+    """Get wiki statistics for a task."""
+    from app.services.wiki_service import get_wiki_stats
+    return get_wiki_stats(db, task_id)

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_session
-from app.db.models import AgentTrace
+from app.db.models import AgentTrace, isoformat_utc
 from app.schemas.schemas import TraceOut
 
 router = APIRouter()
@@ -26,7 +26,7 @@ def get_traces(task_id: str, db: Session = Depends(get_db_session)):
             output_json=t.output_json,
             llm_tokens_used=t.llm_tokens_used,
             duration_ms=t.duration_ms,
-            created_at=t.created_at.isoformat() if t.created_at else "",
+            created_at=isoformat_utc(t.created_at),
         )
         for t in traces
     ]

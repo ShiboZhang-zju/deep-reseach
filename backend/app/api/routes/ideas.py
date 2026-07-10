@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_session
-from app.db.models import ResearchIdea
+from app.db.models import ResearchIdea, isoformat_utc
 from app.schemas.schemas import IdeaOut
 
 router = APIRouter()
@@ -40,5 +40,5 @@ def _to_idea_out(idea: ResearchIdea) -> IdeaOut:
         decision=idea.decision,
         related_paper_ids_json=idea.related_paper_ids_json,
         user_selected=idea.user_selected,
-        created_at=idea.created_at.isoformat() if idea.created_at else "",
+        created_at=isoformat_utc(idea.created_at),
     )

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_session
-from app.db.models import ExperimentPlan
+from app.db.models import ExperimentPlan, isoformat_utc
 from app.schemas.schemas import ExperimentOut
 
 router = APIRouter()
@@ -73,5 +73,5 @@ def _to_out(plan: ExperimentPlan) -> ExperimentOut:
         steps_markdown=plan.steps_markdown,
         steps_json=plan.steps_json,
         risks=plan.risks,
-        created_at=plan.created_at.isoformat() if plan.created_at else "",
+        created_at=isoformat_utc(plan.created_at),
     )

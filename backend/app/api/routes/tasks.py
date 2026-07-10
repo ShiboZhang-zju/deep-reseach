@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_session
 from app.db.repositories import task_repo
+from app.db.models import isoformat_utc
 from app.agent.runner import start_agent, stop_agent, run_experiment_generation
 from app.schemas.schemas import TaskCreate, TaskOut, ClarifyRequest, FeedbackRequest, IdeaSelectRequest
 
@@ -154,6 +155,6 @@ def _to_task_out(task) -> TaskOut:
         max_rounds=task.max_rounds,
         stop_reason=task.stop_reason,
         state_json=task.state_json,
-        created_at=task.created_at.isoformat() if task.created_at else "",
-        updated_at=task.updated_at.isoformat() if task.updated_at else "",
+        created_at=isoformat_utc(task.created_at),
+        updated_at=isoformat_utc(task.updated_at),
     )

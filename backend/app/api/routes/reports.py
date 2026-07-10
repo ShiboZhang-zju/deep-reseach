@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_session
-from app.db.models import Report
+from app.db.models import Report, isoformat_utc
 from app.schemas.schemas import ReportOut
 
 router = APIRouter()
@@ -30,5 +30,5 @@ def get_report(task_id: str, db: Session = Depends(get_db_session)):
         task_id=report.task_id,
         content_markdown=report.content_markdown or "",
         content_json=report.content_json,
-        created_at=report.created_at.isoformat() if report.created_at else "",
+        created_at=isoformat_utc(report.created_at),
     )
