@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "paper_assets")
 CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "chroma_db")
+PDF_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "pdf_cache")
 CHUNK_WORD_LIMIT = 250
 PDF_DOWNLOAD_TIMEOUT = 60
 MAX_CONCURRENT_DOWNLOADS = 3
@@ -190,32 +191,328 @@ def get_paper_similarities(paper_ids: list[str], top_k_per_paper: int = 5) -> di
 
 # === Phase 1: PDF Download ===
 
-async def download_pdf(pdf_url: str) -> bytes | None:
-    """Download a PDF from URL. Returns None on failure."""
+async def _try_download(url: str, timeout: int = PDF_DOWNLOAD_TIMEOUT) -> bytes | None:
+    """Download a URL and verify it's a PDF. Returns None on failure."""
     try:
-        async with httpx.AsyncClient(timeout=PDF_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(pdf_url, headers={"User-Agent": "Mozilla/5.0"})
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
                 content_type = resp.headers.get("content-type", "")
                 if "pdf" in content_type or resp.content[:4] == b"%PDF":
                     return resp.content
-                logger.warning("PDF download: unexpected content-type %s for %s", content_type, pdf_url[:80])
+                logger.warning("Download: unexpected content-type %s for %s", content_type, url[:80])
             else:
-                logger.warning("PDF download failed %d for %s", resp.status_code, pdf_url[:80])
+                logger.warning("Download failed %d for %s", resp.status_code, url[:80])
     except Exception as e:
-        logger.warning("PDF download error for %s: %s", pdf_url[:80], e)
+        logger.warning("Download error for %s: %s", url[:80], e)
     return None
 
 
+async def _fetch_arxiv_pdf(arxiv_id: str) -> bytes | None:
+    """Download PDF from arXiv by arxiv_id."""
+    # Clean arxiv_id (remove version suffix for URL, arXiv handles both)
+    clean_id = arxiv_id.split("v")[0] if "v" in arxiv_id[-2:] else arxiv_id
+    url = f"https://arxiv.org/pdf/{clean_id}"
+    pdf = await _try_download(url)
+    if pdf:
+        logger.info("arXiv PDF downloaded for %s", arxiv_id)
+    return pdf
+
+
+async def _fetch_unpaywall_pdf(doi: str, email: str = "research@example.com") -> bytes | None:
+    """Try Unpaywall API to find an open-access PDF for a DOI."""
+    url = f"https://api.unpaywall.org/v2/{doi}?email={email}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            
+            # Try best_oa_location first
+            best_loc = data.get("best_oa_location")
+            if best_loc and best_loc.get("url_for_pdf"):
+                pdf = await _try_download(best_loc["url_for_pdf"])
+                if pdf:
+                    logger.info("Unpaywall PDF downloaded for DOI %s", doi)
+                    return pdf
+            
+            # Try all OA locations
+            for loc in data.get("oa_locations", []):
+                if loc.get("url_for_pdf"):
+                    pdf = await _try_download(loc["url_for_pdf"])
+                    if pdf:
+                        logger.info("Unpaywall (alt) PDF downloaded for DOI %s", doi)
+                        return pdf
+    except Exception as e:
+        logger.warning("Unpaywall lookup failed for %s: %s", doi, e)
+    return None
+
+
+async def _fetch_scihub_pdf(doi: str) -> bytes | None:
+    """Try Sci-Hub as last resort. Note: may be unreliable."""
+    if not doi:
+        return None
+    # Try multiple Sci-Hub mirrors
+    mirrors = ["sci-hub.se", "sci-hub.st", "sci-hub.ru"]
+    for mirror in mirrors:
+        url = f"https://{mirror}/{doi}"
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code != 200:
+                    continue
+                # Sci-Hub returns HTML with embedded PDF iframe or download link
+                text = resp.text
+                # Look for PDF iframe src
+                import re
+                pdf_url_match = re.search(r'<iframe[^>]+src="([^"]+\.pdf[^"]*)"', text)
+                if pdf_url_match:
+                    pdf_url = pdf_url_match.group(1)
+                    if pdf_url.startswith("//"):
+                        pdf_url = "https:" + pdf_url
+                    elif pdf_url.startswith("/"):
+                        pdf_url = f"https://{mirror}" + pdf_url
+                    pdf = await _try_download(pdf_url)
+                    if pdf:
+                        logger.info("Sci-Hub (%s) PDF downloaded for DOI %s", mirror, doi)
+                        return pdf
+                
+                # Try direct download button
+                download_match = re.search(r'<a[^>]+href="([^"]+\.pdf[^"]*)"[^>]*>download', text, re.I)
+                if download_match:
+                    pdf_url = download_match.group(1)
+                    if pdf_url.startswith("//"):
+                        pdf_url = "https:" + pdf_url
+                    pdf = await _try_download(pdf_url)
+                    if pdf:
+                        logger.info("Sci-Hub (%s, button) PDF downloaded for DOI %s", mirror, doi)
+                        return pdf
+        except Exception as e:
+            logger.warning("Sci-Hub (%s) download failed for %s: %s", mirror, doi, e)
+            continue
+    return None
+
+
+async def _fetch_s2_pdf(s2_id: str) -> bytes | None:
+    """Try Semantic Scholar API to get PDF link."""
+    if not s2_id:
+        return None
+    url = f"https://api.semanticscholar.org/graph/v1/paper/{s2_id}?fields=openAccessPdf"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            oa_pdf = data.get("openAccessPdf")
+            if oa_pdf and oa_pdf.get("url"):
+                pdf = await _try_download(oa_pdf["url"])
+                if pdf:
+                    logger.info("S2 PDF downloaded for paper %s", s2_id[:12])
+                    return pdf
+    except Exception as e:
+        logger.warning("S2 PDF lookup failed for %s: %s", s2_id[:12], e)
+    return None
+
+
+async def _fetch_openalex_pdf(openalex_id: str) -> bytes | None:
+    """Try OpenAlex API to get PDF link."""
+    if not openalex_id:
+        return None
+    # Ensure it has the full ID format
+    if not openalex_id.startswith("https"):
+        openalex_id = f"https://openalex.org/{openalex_id}"
+    url = f"https://api.openalex.org/works/{openalex_id.split('/')[-1]}?select=best_oa_location,open_access,primary_location"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            # Try best_oa_location
+            best_oa = data.get("best_oa_location")
+            if best_oa and best_oa.get("pdf_url"):
+                pdf = await _try_download(best_oa["pdf_url"])
+                if pdf:
+                    logger.info("OpenAlex PDF downloaded for %s", openalex_id[-12:])
+                    return pdf
+            # Try primary_location
+            primary = data.get("primary_location")
+            if primary and primary.get("pdf_url"):
+                pdf = await _try_download(primary["pdf_url"])
+                if pdf:
+                    logger.info("OpenAlex (primary) PDF downloaded for %s", openalex_id[-12:])
+                    return pdf
+            # Try open_access field
+            oa = data.get("open_access")
+            if oa and oa.get("oa_url"):
+                pdf = await _try_download(oa["oa_url"])
+                if pdf:
+                    logger.info("OpenAlex (OA) PDF downloaded for %s", openalex_id[-12:])
+                    return pdf
+    except Exception as e:
+        logger.warning("OpenAlex PDF lookup failed for %s: %s", openalex_id[-12:], e)
+    return None
+
+
+async def _fetch_crossref_pdf(doi: str) -> bytes | None:
+    """Try Crossref API to get PDF link from links field."""
+    if not doi:
+        return None
+    url = f"https://api.crossref.org/works/{doi}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers={"User-Agent": "DeepResearch/1.0 (mailto:research@example.com)"})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            message = data.get("message", {})
+            links = message.get("link", [])
+            for link in links:
+                url_field = link.get("URL", "")
+                content_type = link.get("content-type", "")
+                if "pdf" in content_type or url_field.endswith(".pdf"):
+                    pdf = await _try_download(url_field)
+                    if pdf:
+                        logger.info("Crossref PDF downloaded for DOI %s", doi)
+                        return pdf
+    except Exception as e:
+        logger.warning("Crossref PDF lookup failed for %s: %s", doi, e)
+    return None
+
+
+async def download_pdf_multi_source(paper) -> bytes | None:
+    """Try multiple sources to download a paper's PDF.
+    
+    Order of attempts:
+    0. Disk cache (if previously downloaded)
+    1. Existing pdf_url (if any)
+    2. arXiv (if arxiv_id available)
+    3. DOI → arXiv extraction (DOI like 10.48550/arXiv.XXXX)
+    4. Semantic Scholar (if s2_id available)
+    5. OpenAlex (if openalex_id available)
+    6. Unpaywall (if DOI available)
+    7. Sci-Hub (if DOI available, last resort)
+    
+    Successfully downloaded PDFs are cached to disk for reuse.
+    """
+    # 0. Check disk cache first
+    cached = _load_pdf_from_cache(paper.id)
+    if cached:
+        logger.info("PDF loaded from cache for paper %s", paper.id[:8])
+        return cached
+    
+    pdf_bytes = None
+    
+    # 1. Try existing pdf_url
+    if paper.pdf_url:
+        pdf_bytes = await _try_download(paper.pdf_url)
+    
+    # 2. Try arXiv
+    if not pdf_bytes and paper.arxiv_id:
+        pdf_bytes = await _fetch_arxiv_pdf(paper.arxiv_id)
+    
+    # 3. Extract arXiv ID from DOI (e.g., 10.48550/arXiv.2602.21394)
+    if not pdf_bytes and paper.doi:
+        arxiv_id_from_doi = _extract_arxiv_from_doi(paper.doi)
+        if arxiv_id_from_doi:
+            pdf_bytes = await _fetch_arxiv_pdf(arxiv_id_from_doi)
+            # Also save the arxiv_id to the paper for future use
+            if pdf_bytes and not paper.arxiv_id:
+                paper.arxiv_id = arxiv_id_from_doi
+    
+    # 4. Try Semantic Scholar
+    if not pdf_bytes and paper.semantic_scholar_id:
+        pdf_bytes = await _fetch_s2_pdf(paper.semantic_scholar_id)
+    
+    # 5. Try OpenAlex
+    if not pdf_bytes and paper.openalex_id:
+        pdf_bytes = await _fetch_openalex_pdf(paper.openalex_id)
+    
+    # 6. Try Unpaywall (open access)
+    if not pdf_bytes and paper.doi:
+        pdf_bytes = await _fetch_unpaywall_pdf(paper.doi)
+    
+    # 7. Try Crossref links
+    if not pdf_bytes and paper.doi:
+        pdf_bytes = await _fetch_crossref_pdf(paper.doi)
+    
+    # 8. Try Sci-Hub (last resort)
+    if not pdf_bytes and paper.doi:
+        pdf_bytes = await _fetch_scihub_pdf(paper.doi)
+    
+    # Cache to disk if successful
+    if pdf_bytes:
+        _save_pdf_to_cache(paper.id, pdf_bytes)
+    
+    return pdf_bytes
+
+
+def _extract_arxiv_from_doi(doi: str) -> str | None:
+    """Extract arXiv ID from a DOI like '10.48550/arXiv.2602.21394'."""
+    if not doi:
+        return None
+    # Match patterns like 10.48550/arXiv.XXXX.XXXXX
+    import re
+    match = re.match(r'10\.48550/arXiv\.([\d.]+)', doi, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    # Also try 10.48550/arxiv.XXXX.XXXXX
+    match = re.match(r'10\.48550/arxiv\.([\d.]+)', doi, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _get_pdf_cache_path(paper_id: str) -> str:
+    """Get the disk cache path for a paper's PDF."""
+    return os.path.join(PDF_CACHE_DIR, f"{paper_id}.pdf")
+
+
+def _save_pdf_to_cache(paper_id: str, pdf_bytes: bytes) -> None:
+    """Save PDF bytes to disk cache."""
+    try:
+        os.makedirs(PDF_CACHE_DIR, exist_ok=True)
+        cache_path = _get_pdf_cache_path(paper_id)
+        with open(cache_path, "wb") as f:
+            f.write(pdf_bytes)
+        logger.info("PDF cached to disk: %s (%d KB)", paper_id[:8], len(pdf_bytes) // 1024)
+    except Exception as e:
+        logger.warning("Failed to cache PDF for paper %s: %s", paper_id[:8], e)
+
+
+def _load_pdf_from_cache(paper_id: str) -> bytes | None:
+    """Load PDF from disk cache if available."""
+    try:
+        cache_path = _get_pdf_cache_path(paper_id)
+        if os.path.exists(cache_path):
+            with open(cache_path, "rb") as f:
+                return f.read()
+    except Exception:
+        pass
+    return None
+
+
+async def download_pdf(pdf_url: str) -> bytes | None:
+    """Download a PDF from URL. Returns None on failure."""
+    return await _try_download(pdf_url)
+
+
 async def download_papers_pdfs(papers: list, max_concurrent: int = MAX_CONCURRENT_DOWNLOADS) -> dict[str, bytes | None]:
-    """Download PDFs for multiple papers concurrently. Returns {paper_id: pdf_bytes_or_None}."""
+    """Download PDFs for multiple papers concurrently using multi-source fallback.
+    
+    Tries: pdf_url → arXiv → Unpaywall → Sci-Hub
+    """
     semaphore = asyncio.Semaphore(max_concurrent)
 
     async def download_one(paper) -> tuple[str, bytes | None]:
-        if not paper.pdf_url:
-            return paper.id, None
         async with semaphore:
-            pdf_bytes = await download_pdf(paper.pdf_url)
+            pdf_bytes = await download_pdf_multi_source(paper)
+            if pdf_bytes:
+                logger.info("PDF downloaded for paper %s (%d KB)", paper.id[:8], len(pdf_bytes) // 1024)
+            else:
+                logger.warning("No PDF found for paper %s: %s", paper.id[:8], paper.title[:50])
             return paper.id, pdf_bytes
 
     results = await asyncio.gather(*[download_one(p) for p in papers])
@@ -316,10 +613,30 @@ async def _pymupdf_page_to_stream(doc, page, paper_id: str, paper_dir: str, page
     elements.sort(key=lambda e: (int(e["bbox"][1] / 10), e["bbox"][0]))
 
     # 5. Build text stream with inline figure markers
+    # Detect section headings: short text, larger font, or bold
+    avg_font_size = sum(e.get("font_size", 10) for e in elements if e["type"] == "text") / max(1, sum(1 for e in elements if e["type"] == "text"))
+    
     stream = ""
     for elem in elements:
         if elem["type"] == "text":
-            stream += elem["text"] + " "
+            text = elem["text"]
+            font_size = elem.get("font_size", 10)
+            is_bold = elem.get("is_bold", False)
+            word_count = len(text.split())
+            
+            # Check if this looks like a section heading:
+            # - Short text (≤ 10 words) AND (larger font OR bold)
+            is_heading = word_count <= 10 and (font_size > avg_font_size * 1.1 or is_bold)
+            
+            if is_heading:
+                # Try to classify as section heading
+                section = _classify_section(text)
+                if section:
+                    stream += f"\n## {text.strip()}\n"  # Add as markdown heading
+                else:
+                    stream += text + " "
+            else:
+                stream += text + " "
         elif elem["type"] in ("image_embedded", "vector_figure"):
             img_path = _save_figure(doc, page, elem, paper_dir, page_num)
             if img_path:
@@ -470,6 +787,8 @@ async def _paddleocr_page_to_stream(page, paper_id: str, paper_dir: str, page_nu
 def _classify_section(header_text: str) -> str | None:
     """Classify a header text into a section name."""
     text_lower = header_text.lower().strip()
+    # Remove markdown heading markers
+    text_lower = text_lower.lstrip("#").strip()
     if len(text_lower) > 80:
         return None
     for section, keywords in SECTION_KEYWORDS.items():
@@ -599,12 +918,17 @@ def rag_retrieve(
     """
     collection = get_chroma_collection()
 
-    # Build metadata filter
-    where = {}
-    if paper_ids:
-        where["paper_id"] = {"$in": paper_ids}
-    if section_filter:
-        where["section"] = {"$in": section_filter}
+    # Build metadata filter — ChromaDB requires $and when combining multiple filters
+    where = None
+    if paper_ids and section_filter:
+        where = {"$and": [
+            {"paper_id": {"$in": paper_ids}},
+            {"section": {"$in": section_filter}},
+        ]}
+    elif paper_ids:
+        where = {"paper_id": {"$in": paper_ids}}
+    elif section_filter:
+        where = {"section": {"$in": section_filter}}
 
     # Embed the query with the SAME model used for storage (bge-base, 768 dim)
     # Do NOT use ChromaDB's built-in query_texts (which uses 384-dim MiniLM)
