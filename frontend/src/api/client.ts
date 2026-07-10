@@ -86,6 +86,13 @@ export const api = {
   getTraces: (taskId: string) =>
     fetchJSON<Trace[]>(`${BASE}/tasks/${taskId}/traces`),
 
+  // Wiki
+  getWikiPages: (taskId: string, pageType?: string) =>
+    fetchJSON<any[]>(`${BASE}/tasks/${taskId}/wiki${pageType ? `?page_type=${pageType}` : ''}`),
+
+  getWikiStats: (taskId: string) =>
+    fetchJSON<any>(`${BASE}/tasks/${taskId}/wiki/stats`),
+
   // SSE URL
   sseUrl: (taskId: string) => `${BASE}/tasks/${taskId}/events`,
 };
