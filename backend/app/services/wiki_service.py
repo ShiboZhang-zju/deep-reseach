@@ -82,7 +82,7 @@ async def ingest_papers_to_wiki(db: Session, papers: list, llm, task_id: str) ->
         paper_context = _build_paper_context(batch, task_id, db)
 
         # Get RAG passages for batch papers
-        rag_passages = _get_batch_rag(batch)
+        rag_passages = await _get_batch_rag(batch)
 
         # List existing wiki pages (titles + types + brief summary)
         existing_pages = _list_wiki_pages(db, task_id)
@@ -165,7 +165,7 @@ def _build_paper_context(papers: list, task_id: str, db: Session) -> str:
     return "\n\n".join(lines)
 
 
-def _get_batch_rag(papers: list) -> str:
+async def _get_batch_rag(papers: list) -> str:
     """Get RAG passages for batch papers.
 
     P1-1: Use abstract-based semantic query instead of just title concatenation.
@@ -183,7 +183,7 @@ def _get_batch_rag(papers: list) -> str:
                 query_parts.append(p.title)
         query = " ".join(query_parts)
 
-        results = rag_retrieve(
+        results = await rag_retrieve(
             query=query,
             top_k=20,
             paper_ids=paper_ids,

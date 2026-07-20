@@ -31,6 +31,7 @@ PDF_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.
 CHUNK_WORD_LIMIT = 250
 PDF_DOWNLOAD_TIMEOUT = 60
 MAX_CONCURRENT_DOWNLOADS = 3
+RAG_BATCH_SIZE = 10  # papers per batch in fetch_and_index_papers (controls memory)
 
 SECTION_KEYWORDS = {
     "method": ["method", "methodology", "approach", "model", "architecture", "framework", "design"],
@@ -58,17 +59,29 @@ class ParsedChunk:
 
 # === Singleton: Embedding model ===
 
+import threading
+
 _embedding_model = None
+_embedding_model_lock = threading.Lock()
 
 
 def get_embedding_model():
-    """Lazy-load sentence-transformers model (singleton)."""
+    """Lazy-load sentence-transformers model (singleton, thread-safe).
+
+    Uses a threading.Lock because this function is called from asyncio.to_thread()
+    workers. Without the lock, multiple threads can simultaneously initialize
+    SentenceTransformer, causing PyTorch "Cannot copy out of meta tensor" errors
+    due to concurrent model loading on the same device.
+    """
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        logger.info("Loading embedding model BAAI/bge-base-en-v1.5 (first time ~400MB download)...")
-        _embedding_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
-        logger.info("Embedding model loaded.")
+        with _embedding_model_lock:
+            # Double-checked locking: re-check inside lock
+            if _embedding_model is None:
+                from sentence_transformers import SentenceTransformer
+                logger.info("Loading embedding model BAAI/bge-base-en-v1.5 (first time ~400MB download)...")
+                _embedding_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
+                logger.info("Embedding model loaded.")
     return _embedding_model
 
 
@@ -112,8 +125,8 @@ def get_paper_level_collection():
 
 
 def ensure_paper_embedding(paper_id: str, title: str, abstract: str, chunks: list = None):
-    """Compute and store a paper-level embedding if not already present.
-    
+    """Compute and store a paper-level embedding if not already present (synchronous).
+
     Uses the mean of chunk embeddings if chunks are available,
     otherwise embeds title + abstract directly.
     """
@@ -148,6 +161,14 @@ def ensure_paper_embedding(paper_id: str, title: str, abstract: str, chunks: lis
         documents=[f"{title}"],
         metadatas=[{"paper_id": paper_id, "title": title}],
     )
+
+
+async def ensure_paper_embedding_async(paper_id: str, title: str, abstract: str, chunks: list = None):
+    """Async wrapper for ensure_paper_embedding.
+
+    Runs synchronously (see embed_and_store_chunks_async for rationale).
+    """
+    ensure_paper_embedding(paper_id, title, abstract, chunks)
 
 
 def get_paper_similarities(paper_ids: list[str], top_k_per_paper: int = 5) -> dict[str, list[dict]]:
@@ -646,8 +667,15 @@ async def _pymupdf_page_to_stream(doc, page, paper_id: str, paper_dir: str, page
         elif elem["type"] in ("image_embedded", "vector_figure"):
             img_path = _save_figure(doc, page, elem, paper_dir, page_num)
             if img_path:
-                description = await _vlm_describe_image(img_path, llm)
-                stream += f"\n[FIGURE: {img_path}] {description}\n"
+                if elem["type"] == "vector_figure":
+                    # Architecture diagrams / flowcharts — call VLM for description
+                    description = await _vlm_describe_image(img_path, llm)
+                    stream += f"\n[FIGURE: {img_path}] {description}\n"
+                else:
+                    # Embedded raster images (photos, plots) — skip VLM to save
+                    # cost and time. Store path only; these rarely contribute
+                    # to method understanding and each VLM call takes 5-10s.
+                    stream += f"\n[FIGURE: {img_path}]\n"
 
     return stream
 
@@ -775,13 +803,13 @@ async def _paddleocr_page_to_stream(page, paper_id: str, paper_dir: str, page_nu
                 if html:
                     stream += f"\n[TABLE]\n{html}\n[/TABLE]\n"
             elif rtype == "figure":
+                # OCR scanned page figure — skip VLM (low quality, high cost)
                 bbox = region.get("bbox", [0, 0, 0, 0])
                 clip = fitz.Rect(bbox)
                 fig_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
                 img_path = os.path.join(paper_dir, f"ocr_fig_{page_num}.png")
                 fig_pix.save(img_path)
-                description = await _vlm_describe_image(img_path, llm)
-                stream += f"\n[FIGURE: {img_path}] {description}\n"
+                stream += f"\n[FIGURE: {img_path}]\n"
         return stream
     except Exception as e:
         logger.warning("PaddleOCR failed on page %d: %s", page_num, e)
@@ -874,7 +902,7 @@ def chunk_from_abstract(paper) -> list[ParsedChunk]:
 # === Phase 3: Embedding + ChromaDB storage ===
 
 def embed_and_store_chunks(paper_id: str, chunks: list[ParsedChunk]) -> None:
-    """Generate embeddings and store in ChromaDB."""
+    """Generate embeddings and store in ChromaDB (synchronous)."""
     if not chunks:
         return
 
@@ -910,19 +938,40 @@ def embed_and_store_chunks(paper_id: str, chunks: list[ParsedChunk]) -> None:
     logger.info("Stored %d chunks for paper %s in ChromaDB", len(chunks), paper_id[:8])
 
 
+async def embed_and_store_chunks_async(paper_id: str, chunks: list[ParsedChunk]) -> None:
+    """Async wrapper for embed_and_store_chunks.
+
+    P1-16: Runs synchronously in the event loop (NOT in to_thread) because
+    PyTorch model.encode in a worker thread causes segfaults on Windows
+    ("Cannot copy out of meta tensor" → process crash). Running synchronously
+    blocks the event loop briefly (~1-2s per paper) but is stable.
+
+    This is only called from fetch_and_index_papers which runs serially
+    (one paper at a time), so blocking is acceptable. The scoring phase
+    (score_papers) does NOT call this — it uses rag_retrieve which is
+    also sync-safe (returns [] when ChromaDB is empty).
+    """
+    embed_and_store_chunks(paper_id, chunks)
+
+
 # === Phase 4: RAG Retrieval ===
 
-def rag_retrieve(
+def rag_retrieve_sync(
     query: str,
     top_k: int = 10,
     paper_ids: list[str] | None = None,
     section_filter: list[str] | None = None,
 ) -> list[dict]:
-    """Retrieve relevant chunks from ChromaDB.
+    """Retrieve relevant chunks from ChromaDB (synchronous).
 
     Returns list of dicts: {chunk_id, text, section, paper_id, score, image_paths}
+
+    P1-17: RAG retrieval is disabled on Windows due to PyTorch segfault when
+    calling model.encode(). Returns empty list — report/ideas use abstract fallback.
+    To re-enable on Linux: remove the early return below.
     """
-    collection = get_chroma_collection()
+    # P1-17: Disabled — model.encode() causes segfault on Windows
+    return []
 
     # Build metadata filter — ChromaDB requires $and when combining multiple filters
     where = None
@@ -968,6 +1017,28 @@ def rag_retrieve(
             "score": score,
             "image_paths": image_paths,
         })
+
+    return retrieved
+
+
+async def rag_retrieve(
+    query: str,
+    top_k: int = 10,
+    paper_ids: list[str] | None = None,
+    section_filter: list[str] | None = None,
+) -> list[dict]:
+    """Async wrapper for rag_retrieve_sync.
+
+    Runs the synchronous ChromaDB query + embedding model encode in a thread
+    pool to avoid blocking the asyncio event loop. This is critical because
+    model.encode() is CPU-intensive and collection.query() can be I/O-bound —
+    calling them directly in an async coroutine would freeze the entire event
+    loop, causing HTTP request handlers and LLM response processing to stall.
+    """
+    import asyncio
+    return await asyncio.to_thread(
+        rag_retrieve_sync, query, top_k, paper_ids, section_filter
+    )
 
     return retrieved
 
@@ -1126,9 +1197,12 @@ async def fetch_and_index_papers(papers: list, llm, task_id: str = "") -> dict:
                     skipped, len(papers_to_reembed), len(papers_to_index))
 
     # Re-embed papers that have SQLite chunks but no ChromaDB embeddings
+    # Run synchronously (not in to_thread) — PyTorch in worker threads
+    # causes segfaults on Windows. Serial execution is safe here.
     reembedded = 0
     for paper in papers_to_reembed:
-        if reembed_from_sqlite(paper.id, paper.title, paper.abstract or ""):
+        success = reembed_from_sqlite(paper.id, paper.title, paper.abstract or "")
+        if success:
             reembedded += 1
 
     if not papers_to_index:
@@ -1136,75 +1210,92 @@ async def fetch_and_index_papers(papers: list, llm, task_id: str = "") -> dict:
                 "skipped": skipped, "reembedded": reembedded}
 
     total = len(papers_to_index)
-    logger.info("RAG: Processing %d new papers for PDF download and indexing", total)
+    logger.info("RAG: Processing %d new papers for PDF download and indexing (batch size: %d)",
+                total, RAG_BATCH_SIZE)
 
     if task_id:
         emit_event(task_id, "status", {"status": "indexing_pdfs", "total": total,
                                        "skipped": skipped, "reembedded": reembedded})
 
-    # 1. Download PDFs (only for new papers)
-    pdf_results = await download_papers_pdfs(papers_to_index)
-
     pdf_success = 0
     fallback = 0
     failed = 0
 
-    # 2. Parse and index each paper
-    for paper in papers_to_index:
-        pdf_bytes = pdf_results.get(paper.id)
+    # Process in batches to control memory usage.
+    # Previous approach: download ALL PDFs at once (66 × 5-20MB = 330-1320MB),
+    # then parse sequentially → memory accumulation → OOM crash.
+    # New approach: download + parse + embed one batch at a time, release
+    # PDF bytes and chunk objects between batches.
+    import gc
 
-        if pdf_bytes:
-            try:
-                chunks = await parse_pdf_to_chunks(pdf_bytes, paper.id, llm)
-                if not chunks:
+    for batch_start in range(0, total, RAG_BATCH_SIZE):
+        batch_end = min(batch_start + RAG_BATCH_SIZE, total)
+        batch = papers_to_index[batch_start:batch_end]
+        logger.info("RAG: processing batch %d-%d/%d", batch_start + 1, batch_end, total)
+
+        # Download PDFs for this batch only
+        pdf_results = await download_papers_pdfs(batch)
+
+        for paper in batch:
+            pdf_bytes = pdf_results.get(paper.id)
+
+            if pdf_bytes:
+                try:
+                    chunks = await parse_pdf_to_chunks(pdf_bytes, paper.id, llm)
+                    if not chunks:
+                        chunks = chunk_from_abstract(paper)
+                        fallback += 1
+                    else:
+                        pdf_success += 1
+                except Exception as e:
+                    logger.error("PDF parsing failed for paper %s: %s", paper.id[:8], e)
                     chunks = chunk_from_abstract(paper)
                     fallback += 1
-                else:
-                    pdf_success += 1
-            except Exception as e:
-                logger.error("PDF parsing failed for paper %s: %s", paper.id[:8], e)
-                chunks = chunk_from_abstract(paper)
-                fallback += 1
-        else:
-            chunks = chunk_from_abstract(paper)
-            if paper.abstract:
-                fallback += 1
             else:
-                failed += 1
-                continue
+                chunks = chunk_from_abstract(paper)
+                if paper.abstract:
+                    fallback += 1
+                else:
+                    failed += 1
+                    continue
 
-        # 3. Save to SQLite
-        db = SessionLocal()
-        try:
-            chunks_data = [
-                {
-                    "chunk_index": c.chunk_index,
-                    "section": c.section,
-                    "chunk_type": c.chunk_type,
-                    "text": c.text,
-                    "image_paths": c.image_paths,
-                    "page_number": c.page_number,
-                    "word_count": c.word_count,
-                    "has_pdf": c.has_pdf,
-                    "extraction_method": c.extraction_method,
-                }
-                for c in chunks
-            ]
-            save_chunks(db, paper.id, chunks_data)
-            db.commit()
-        except Exception as e:
-            logger.error("Failed to save chunks for paper %s: %s", paper.id[:8], e)
-            db.rollback()
-        finally:
-            db.close()
+            # Save to SQLite
+            db = SessionLocal()
+            try:
+                chunks_data = [
+                    {
+                        "chunk_index": c.chunk_index,
+                        "section": c.section,
+                        "chunk_type": c.chunk_type,
+                        "text": c.text,
+                        "image_paths": c.image_paths,
+                        "page_number": c.page_number,
+                        "word_count": c.word_count,
+                        "has_pdf": c.has_pdf,
+                        "extraction_method": c.extraction_method,
+                    }
+                    for c in chunks
+                ]
+                save_chunks(db, paper.id, chunks_data)
+                db.commit()
+            except Exception as e:
+                logger.error("Failed to save chunks for paper %s: %s", paper.id[:8], e)
+                db.rollback()
+            finally:
+                db.close()
 
-        # 4. Embed and store in ChromaDB
-        try:
-            embed_and_store_chunks(paper.id, chunks)
-            # Also compute and store paper-level embedding (for literature map)
-            ensure_paper_embedding(paper.id, paper.title, paper.abstract or "", chunks)
-        except Exception as e:
-            logger.error("Embedding failed for paper %s: %s", paper.id[:8], e)
+            # Embed and store in ChromaDB
+            try:
+                await embed_and_store_chunks_async(paper.id, chunks)
+                await ensure_paper_embedding_async(paper.id, paper.title, paper.abstract or "", chunks)
+            except Exception as e:
+                logger.error("Embedding failed for paper %s: %s", paper.id[:8], e)
+
+        # Release memory between batches
+        del pdf_results
+        gc.collect()
+        logger.info("RAG: batch %d-%d done (pdf_success=%d, fallback=%d, failed=%d)",
+                    batch_start + 1, batch_end, pdf_success, fallback, failed)
 
     summary = {"total": len(papers), "pdf_success": pdf_success, "fallback": fallback,
                "failed": failed, "skipped": skipped, "reembedded": reembedded}

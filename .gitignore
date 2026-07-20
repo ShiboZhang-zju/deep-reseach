@@ -26,6 +26,10 @@ env/
 
 # ===== Logs =====
 *.log
+*.err
+
+# ===== Test artifacts =====
+backend/tests/audit_report.txt
 
 # ===== Node.js / Frontend =====
 node_modules/

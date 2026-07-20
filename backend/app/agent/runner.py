@@ -64,17 +64,32 @@ _INTERRUPTED_STATUSES = {
 }
 
 
-def start_agent(task_id: str):
+def start_agent(task_id: str) -> bool:
     """Start the agent loop as an asyncio background task with timeout protection.
 
-    P0-1: Uses a lock to protect _task_registry and a global semaphore
-    to limit concurrent agents (prevents SQLite write contention).
+    Returns True if the agent was started (or already running), False if
+    rejected due to capacity limit.
+
+    P0-1 / P1-11: Capacity check + registration are done atomically in a single
+    synchronous block (no await between check and register), so concurrent
+    start_agent() calls cannot both pass the capacity check. This works because
+    we're in a single-threaded event loop — synchronous code runs to completion
+    without yielding.
+
+    Uses a global semaphore to limit concurrent agents (prevents SQLite write
+    contention).
     """
-    # Check if already running — need a running event loop for the lock,
-    # so we do a quick non-locked check first (false negative is harmless:
-    # the task will just no-op if it's already done).
+    # Atomic check-and-register: no await between checking capacity and
+    # inserting into the registry, so concurrent callers see consistent state.
     if task_id in _task_registry and not _task_registry[task_id].done():
-        return
+        return True  # already running
+
+    # Check capacity synchronously (no await → no interleaving)
+    running = sum(1 for t in _task_registry.values() if not t.done())
+    if running >= settings.max_concurrent_agents:
+        logger.warning("Task %s: max concurrent agents (%d) reached, rejecting start",
+                       task_id[:8], settings.max_concurrent_agents)
+        return False  # rejected — caller should return 429
 
     AGENT_TIMEOUT = 1800  # 30 minutes max
 
@@ -97,7 +112,8 @@ def start_agent(task_id: str):
                 async with _registry_lock:
                     _task_registry.pop(task_id, None)
 
-    # Create the task and register it atomically
+    # Create the task and register it SYNCHRONOUSLY (before any await)
+    # so that subsequent start_agent() calls see this task in the registry.
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -105,12 +121,12 @@ def start_agent(task_id: str):
         asyncio.set_event_loop(loop)
 
     task = loop.create_task(_run())
-
-    async def _register():
-        async with _registry_lock:
-            _task_registry[task_id] = task
-
-    loop.create_task(_register())
+    # Synchronous registration — no await, no race window.
+    # _registry_lock is only needed for async cleanup in _run()'s finally block;
+    # here we're in sync context and won't be preempted by another start_agent()
+    # call (single-threaded event loop, no await between create_task and assign).
+    _task_registry[task_id] = task
+    return True
 
 
 async def _safe_mark_failed(task_id: str, reason: str, event_message: str, cleanup: bool = False):
@@ -161,10 +177,16 @@ def recover_interrupted_tasks():
 
     State is preserved in state_json + research_rounds + papers, so a restart
     will skip already-completed rounds via should_stop() checks.
+
+    P1-10: Calibrate state.current_round against research_rounds table to prevent
+    inconsistency — e.g., if state_json says current_round=5 but only 2 rounds
+    were actually saved to research_rounds, a restart would immediately hit
+    max_rounds and stop without doing any work. We sync state.current_round to
+    the actual max(round_number) from research_rounds.
     """
     db = SessionLocal()
     try:
-        from app.db.models import ResearchTask
+        from app.db.models import ResearchTask, ResearchRound
         tasks = db.query(ResearchTask).filter(
             ResearchTask.status.in_(list(_INTERRUPTED_STATUSES))
         ).all()
@@ -173,6 +195,32 @@ def recover_interrupted_tasks():
                           task.id[:8], task.status)
             task.status = "pending"
             task.stop_reason = "interrupted_by_restart"
+
+            # Calibrate state.current_round against actually-completed rounds.
+            # research_rounds table is the source of truth for what was persisted;
+            # state_json.current_round may be ahead (incremented but round failed
+            # before save_round committed) or behind (rare, but possible if
+            # state save failed). Sync to max(round_number) to ensure should_stop
+            # doesn't prematurely trigger max_rounds on resume.
+            if task.state_json:
+                try:
+                    state = ResearchState.from_json(task.state_json)
+                    max_completed = db.query(ResearchRound.round_number).filter(
+                        ResearchRound.task_id == task.id
+                    ).order_by(ResearchRound.round_number.desc()).first()
+                    actual_rounds = max_completed[0] if max_completed else 0
+
+                    if state.current_round != actual_rounds:
+                        logger.info(
+                            "Task %s: calibrating current_round %d -> %d (from research_rounds table)",
+                            task.id[:8], state.current_round, actual_rounds,
+                        )
+                        state.current_round = actual_rounds
+                        task.state_json = state.to_json()
+                except Exception as state_err:
+                    logger.warning("Task %s: state calibration failed (non-fatal): %s",
+                                  task.id[:8], state_err)
+
         db.commit()
         if tasks:
             logger.info("Recovered %d interrupted tasks (reset to pending for resume)", len(tasks))
@@ -221,7 +269,11 @@ async def run_task(task_id: str):
         state = task_repo.get_state(db, task_id)  # reload after search loop
 
         # === 2.5. RAG: Download PDFs and index high-priority papers ===
-        await _run_rag_indexing(db, task_id, llm)
+        # P1-17: RAG indexing disabled on Windows due to PyTorch segfault.
+        # Report/ideas generation uses abstract-only fallback.
+        # To re-enable: await _run_rag_indexing(db, task_id, llm)
+        logger.info("Task %s: skipping RAG indexing (disabled on Windows, using abstract fallback)", task_id[:8])
+        emit_event(task_id, "status", {"status": "indexing_skipped", "reason": "RAG disabled on Windows"})
 
         # === 2.6. LLM Wiki: Ingest papers into wiki knowledge base ===
         await _run_wiki_ingest(db, task_id, llm)
@@ -414,15 +466,24 @@ def _check_early_termination(db, task_id, state, no_new_high_count, duplicate_ra
 
 
 async def _run_rag_indexing(db, task_id: str, llm):
-    """Phase 2.5: RAG indexing for high-priority papers."""
+    """Phase 2.5: RAG indexing for high-priority papers.
+
+    P1-15: Only index top-20 high-priority papers (by score) to control memory
+    and processing time. Medium-priority papers use abstract-only fallback.
+    Previously indexed ALL high+medium (up to 125 papers) → OOM crash on Windows.
+    20 papers × ~10 chunks = 200 chunks, manageable memory footprint.
+
+    P1-17: If RAG indexing crashes (PyTorch segfault on Windows), skip it
+    entirely — report/ideas generation will use abstract-only fallback.
+    """
     try:
         from app.services.rag_service import fetch_and_index_papers
         from app.db.models import Paper, TaskPaper as _TP
 
         high_papers_for_rag = db.query(Paper).join(_TP).filter(
             _TP.task_id == task_id,
-            _TP.priority.in_(["high", "medium"]),
-        ).all()
+            _TP.priority == "high",
+        ).order_by(_TP.final_score.desc().nullslast()).limit(20).all()
 
         if high_papers_for_rag:
             logger.info("Task %s: RAG indexing %d high-priority papers...",
@@ -433,6 +494,7 @@ async def _run_rag_indexing(db, task_id: str, llm):
     except Exception as e:
         logger.warning("Task %s: RAG indexing failed (non-fatal, continuing with abstracts): %s",
                       task_id[:8], e)
+        emit_event(task_id, "status", {"status": "indexing_skipped", "reason": str(e)[:200]})
 
 
 async def _run_wiki_ingest(db, task_id: str, llm):
@@ -444,7 +506,7 @@ async def _run_wiki_ingest(db, task_id: str, llm):
         wiki_papers = db.query(_WikiPaper).join(_WikiTP).filter(
             _WikiTP.task_id == task_id,
             _WikiTP.priority.in_(["high", "medium"]),
-        ).all()
+        ).order_by(_WikiTP.final_score.desc().nullslast()).limit(30).all()
 
         if wiki_papers:
             logger.info("Task %s: LLM Wiki ingesting %d papers...", task_id[:8], len(wiki_papers))
@@ -592,24 +654,51 @@ async def _idea_retry_rag_wiki(db, task_id: str, llm, new_paper_ids: list[str]):
 
 
 def _auto_promote_ideas(db, task_id: str):
-    """Last resort: auto-promote top ideas to 'go' status."""
+    """Last resort: when max idea rounds reached and no idea passed validation (>=0.70),
+    promote the top-scoring candidates as 'conditional_go' so the user can still review them.
+
+    IMPORTANT: 'conditional_go' is NOT the same as 'go'. 'go' means the idea passed
+    the 5-layer validation (novelty/baseline/dataset/metric/evidence). 'conditional_go'
+    means the system could not produce a validated idea after max retries and is
+    surfacing the best-available candidates for the user to decide manually.
+
+    This preserves the semantic integrity of 'go' while still returning a result.
+    """
     from app.db.models import ResearchIdea
 
-    logger.info("Task %s: max idea rounds reached, auto-promoting top ideas", task_id[:8])
+    logger.info("Task %s: max idea rounds reached, auto-promoting top ideas as conditional_go",
+                task_id[:8])
     # P1-5: only consider active ideas (not superseded)
     all_ideas = db.query(ResearchIdea).filter(
         ResearchIdea.task_id == task_id,
         ResearchIdea.idea_status == "active",
     ).order_by(ResearchIdea.final_score.desc().nullslast()).all()
     promoted = 0
+    promoted_titles = []
     for idea in all_ideas:
         if idea.final_score and idea.final_score >= 0.55:
-            idea.decision = "go"
+            # Use 'conditional_go' instead of 'go' to preserve validation semantics.
+            # Frontend treats both as selectable, but badge clearly distinguishes them.
+            idea.decision = "conditional_go"
             promoted += 1
+            promoted_titles.append(idea.title[:40] if idea.title else "")
         if promoted >= 3:
             break
     db.commit()
-    logger.info("Task %s: promoted %d ideas to go", task_id[:8], promoted)
+
+    # Record trace for auditability (previously this silent state change was unlogged)
+    paper_repo.save_trace(
+        db, task_id, "auto_promote_ideas", "decision",
+        output_data={
+            "promoted_count": promoted,
+            "decision_used": "conditional_go",
+            "promoted_titles": promoted_titles,
+            "note": "ideas did not pass validation; surfaced as conditional_go for user review",
+        },
+    )
+    db.commit()
+
+    logger.info("Task %s: promoted %d ideas as conditional_go", task_id[:8], promoted)
     task_repo.update_status(db, task_id, "waiting_for_user_review")
-    emit_event(task_id, "status", {"status": "waiting_for_user_review", "reason": "auto_promoted"})
+    emit_event(task_id, "status", {"status": "waiting_for_user_review", "reason": "auto_promoted_conditional"})
     db.commit()

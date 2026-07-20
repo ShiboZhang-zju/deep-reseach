@@ -132,7 +132,7 @@ async def _fill_sections(db, state, llm, outline, all_papers, paper_by_index, wi
     rag_evidence_global = ""
     try:
         from app.services.rag_service import rag_retrieve
-        rag_results = rag_retrieve(
+        rag_results = await rag_retrieve(
             query=state.normalized_topic,
             top_k=50,
             paper_ids=all_paper_ids,
@@ -172,7 +172,7 @@ async def _fill_sections(db, state, llm, outline, all_papers, paper_by_index, wi
             try:
                 from app.services.rag_service import rag_retrieve
                 if section_paper_ids:
-                    section_rag_results = rag_retrieve(
+                    section_rag_results = await rag_retrieve(
                         query=f"{state.normalized_topic} {section.title}",
                         top_k=15,
                         paper_ids=section_paper_ids,
@@ -230,7 +230,7 @@ async def _one_shot_report(db, state, llm, all_papers, papers_text, wiki_context
     rag_evidence_text = ""
     try:
         from app.services.rag_service import rag_retrieve
-        rag_results = rag_retrieve(
+        rag_results = await rag_retrieve(
             query=state.normalized_topic,
             top_k=30,
             paper_ids=[p.id for p in all_papers],
@@ -275,13 +275,20 @@ def _check_placeholders(report_text: str, task_id: str):
 
 
 def _validate_and_clean_citations(db, report_text: str, all_papers: list, task_id: str) -> str:
-    """P1-6: Validate [Px] citations reference real papers.
+    """Validate [Px] citations and clean fabricated ones.
 
-    - Collects all [P1], [P2], ... references from the report body.
-    - Compares against the actual paper list (1-indexed).
-    - Logs warnings for fabricated citations.
-    - Does NOT delete fabricated citations from text (would break readability),
-      but logs them for visibility and emits a trace.
+    Flow (per user spec):
+    1. Collect all [P1], [P2], ... references from the report body.
+    2. Compare against the actual paper list (1-indexed).
+    3. Fabricated citations (out-of-range [P99]) are replaced with [unsupported]
+       — NOT deleted (preserves sentence readability) and NOT rebound to another
+       paper (would cause misattribution). The [unsupported] marker makes it
+       explicit to the reader that the claim lacks literature backing.
+    4. Record a trace with before/after stats for auditability.
+
+    Note: We cannot auto-detect "has evidence but wrong ID" vs "no evidence at all"
+    without re-running LLM verification per sentence (cost-prohibitive). Both cases
+    are marked [unsupported] — the user can manually review flagged sentences.
     """
     from app.db.repositories import paper_repo
 
@@ -296,18 +303,37 @@ def _validate_and_clean_citations(db, report_text: str, all_papers: list, task_i
     valid_indices = set(range(1, len(all_papers) + 1))
     fabricated = cited_indices - valid_indices
 
+    cleaned_text = report_text
+    fabricated_replaced = 0
+
     if fabricated:
         logger.warning(
             "Task %s: report contains %d FABRICATED citations: %s (valid range: 1-%d)",
             task_id[:8], len(fabricated),
             sorted(fabricated)[:10], len(all_papers),
         )
+        # Replace each fabricated [P<num>] with [unsupported]
+        # Process in descending order to avoid offset shift if we did substring replacement
+        # (regex sub handles this correctly in one pass)
+        def _replace_fabricated(m: re.Match) -> str:
+            nonlocal fabricated_replaced
+            num = int(m.group(1))
+            if num in fabricated:
+                fabricated_replaced += 1
+                return "[unsupported]"
+            return m.group(0)
+
+        cleaned_text = re.sub(r'\[P(\d+)\]', _replace_fabricated, report_text)
+
         try:
             paper_repo.save_trace(db, task_id, "report_citation_check", "observation",
                                   output_data={
                                       "fabricated_citations": sorted(fabricated),
+                                      "fabricated_count": len(fabricated),
+                                      "replaced_with_unsupported": fabricated_replaced,
                                       "valid_range": f"1-{len(all_papers)}",
                                       "total_cited": len(cited_indices),
+                                      "action": "replaced fabricated [Px] with [unsupported]",
                                   })
             db.commit()
         except Exception as e:
@@ -322,4 +348,4 @@ def _validate_and_clean_citations(db, report_text: str, all_papers: list, task_i
         logger.warning("Task %s: low citation coverage %.1f%% (%d/%d papers cited)",
                       task_id[:8], coverage * 100, len(cited_from_valid), len(all_papers))
 
-    return report_text
+    return cleaned_text

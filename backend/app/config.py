@@ -24,11 +24,13 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o"
 
-    # Paper source API keys
-    semantic_scholar_api_key: str = ""
-    openalex_email: str = ""
-    ieee_api_key: str = ""
-    core_api_key: str = ""
+    # Paper source API keys / polite-pool emails
+    semantic_scholar_api_key: str = ""  # 可选，免费申请: https://www.semanticscholar.org/product/api#api-key-form
+    openalex_email: str = ""            # 进 OpenAlex polite pool
+    openalex_api_key: str = ""          # 可选，免费注册: https://openalex.org （$1/天预算 vs 无 key $0.10/天）
+    crossref_email: str = ""            # 进 Crossref polite pool (50 req/s)
+    ieee_api_key: str = ""              # 需 IEEE 订购，可留空跳过
+    core_api_key: str = ""              # 可留空跳过
 
     # Agent params
     max_rounds: int = 5
@@ -50,9 +52,15 @@ class Settings(BaseSettings):
     score_weight_idea_potential: float = 0.15
 
     # Rate limiting (P1-9: per-source request budget)
-    rate_limit_s2_per_min: int = 100
-    rate_limit_openalex_per_min: int = 100
+    # S2 无 key 限速 100 req/5min ≈ 20/min；OpenAlex 无 key $0.10/天预算，请求不宜过密
+    # 有 key 时可在 .env 覆盖为更高值
+    rate_limit_s2_per_min: int = 20       # 无 key 保守值；有 key 可设 5000
+    rate_limit_openalex_per_min: int = 10 # 无 key 保守值；有 key 可设 100
     rate_limit_default_per_min: int = 60
+    # 429 后冷却秒数：期间跳过该源不发请求
+    rate_limit_cooldown_s: int = 60
+    # 多 query 检索时并发数（避免瞬间打爆限速源）
+    search_query_concurrency: int = 2
 
     # Database
     database_url: str = "sqlite:///./deep_research.db"

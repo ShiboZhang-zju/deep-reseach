@@ -20,15 +20,17 @@ class OpenAlexSource(PaperSource):
             "per_page": min(limit, 200),
             "sort": "relevance_score:desc",
         }
+        # API key gives $1/day budget (vs $0.10 without); free at openalex.org
+        if settings.openalex_api_key:
+            params["api_key"] = settings.openalex_api_key
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(self.base_url, params=params, headers=headers)
             resp.raise_for_status()
             return resp.json()
 
     async def search(self, query: str, limit: int = 15) -> list[RawPaper]:
-        headers = {"User-Agent": "DeepResearch/1.0"}
-        if settings.openalex_email:
-            headers["User-Agent"] = f"DeepResearch/1.0 (mailto:{settings.openalex_email})"
+        mailto = settings.openalex_email or "research@example.com"
+        headers = {"User-Agent": f"DeepResearch/1.0 (mailto:{mailto})"}
 
         try:
             data = await retry_with_backoff(
@@ -38,8 +40,8 @@ class OpenAlexSource(PaperSource):
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 logger.warning("OpenAlex rate limited after retries")
-            else:
-                logger.error("OpenAlex error %d", e.response.status_code)
+                raise  # let search_service handle cooldown
+            logger.error("OpenAlex error %d", e.response.status_code)
             return []
         except Exception as e:
             logger.error("OpenAlex request failed: %s", e)

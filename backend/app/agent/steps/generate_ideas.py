@@ -77,7 +77,7 @@ async def generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
     )
 
     # RAG: Retrieve full-text passages for idea grounding
-    rag_evidence = _retrieve_idea_rag(state, valid_paper_ids, task_id)
+    rag_evidence = await _retrieve_idea_rag(state, valid_paper_ids, task_id)
 
     # Build cluster context
     cluster_context = _build_cluster_context(cluster_list)
@@ -140,11 +140,11 @@ async def generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
     db.commit()
 
 
-def _retrieve_idea_rag(state, valid_paper_ids, task_id) -> str:
+async def _retrieve_idea_rag(state, valid_paper_ids, task_id) -> str:
     """Retrieve RAG passages for idea grounding."""
     try:
         from app.services.rag_service import rag_retrieve
-        rag_results = rag_retrieve(
+        rag_results = await rag_retrieve(
             query=state.normalized_topic,
             top_k=25,
             paper_ids=list(valid_paper_ids),
@@ -474,7 +474,7 @@ async def _enrich_method_sketch(db, state, llm, item, valid_ids, high_papers, va
         from app.services.rag_service import rag_retrieve
 
         idea_query = f"{item.title} {item.description[:200]}"
-        idea_rag_results = rag_retrieve(
+        idea_rag_results = await rag_retrieve(
             query=idea_query,
             top_k=10,
             paper_ids=list(valid_paper_ids),

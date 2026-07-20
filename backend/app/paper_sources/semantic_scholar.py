@@ -39,8 +39,8 @@ class SemanticScholarSource(PaperSource):
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 logger.warning("Semantic Scholar rate limited after retries")
-            else:
-                logger.error("Semantic Scholar error %d: %s", e.response.status_code, e.response.text[:200])
+                raise  # let search_service handle cooldown
+            logger.error("Semantic Scholar error %d: %s", e.response.status_code, e.response.text[:200])
             return []
         except Exception as e:
             logger.error("Semantic Scholar request failed: %s", e)

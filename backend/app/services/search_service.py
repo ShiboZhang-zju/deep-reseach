@@ -6,6 +6,9 @@ import logging
 import time
 from collections import OrderedDict
 
+import httpx
+
+from app.config import settings
 from app.paper_sources.base import PaperSource, RawPaper
 from app.paper_sources.semantic_scholar import SemanticScholarSource
 from app.paper_sources.arxiv import ArxivSource
@@ -13,6 +16,7 @@ from app.paper_sources.openalex import OpenAlexSource
 from app.paper_sources.crossref import CrossrefSource
 from app.paper_sources.ieee import IeeeSource
 from app.paper_sources.core import CoreSource
+from app.paper_sources.unpaywall import UnpaywallSource
 from app.services.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -66,22 +70,59 @@ class SearchService:
             IeeeSource(),
             CoreSource(),
         ]
+        self._unpaywall = UnpaywallSource()
+        # 429 cooldown: source_name -> cooldown_until timestamp
+        # When a source returns 429 (rate limited), skip it for cooldown_s
+        self._cooldowns: dict[str, float] = {}
+        self._cooldown_s = settings.rate_limit_cooldown_s
 
-    async def search_all_sources(self, query: str, limit: int = 15) -> list[RawPaper]:
-        """Search all sources concurrently for a single query."""
-        async def _search_with_cache(src: PaperSource) -> list[RawPaper]:
-            key = _cache_key(src.name, query, limit)
-            cached = _cache_get(key)
-            if cached:
-                logger.debug("Cache hit for %s query '%s'", src.name, query[:30])
-                return cached[0]
-            # P1-9: acquire rate-limit token before hitting the API
-            await rate_limiter.acquire(src.name)
+    def _is_cooled_down(self, source_name: str) -> bool:
+        """Check if source is in 429 cooldown period."""
+        until = self._cooldowns.get(source_name)
+        if until and time.time() < until:
+            return True
+        if until:
+            # Cooldown expired, clear it
+            del self._cooldowns[source_name]
+        return False
+
+    def _mark_cooldown(self, source_name: str):
+        """Mark a source as rate-limited; skip for cooldown_s."""
+        self._cooldowns[source_name] = time.time() + self._cooldown_s
+        logger.info("Source '%s' entered %ds cooldown (429)", source_name, self._cooldown_s)
+
+    async def _search_with_cache(self, src: PaperSource, query: str, limit: int) -> list[RawPaper]:
+        """Search one source with cache + rate limit + 429 cooldown."""
+        # Skip if in cooldown
+        if self._is_cooled_down(src.name):
+            logger.debug("Skipping %s (in cooldown)", src.name)
+            return []
+
+        key = _cache_key(src.name, query, limit)
+        cached = _cache_get(key)
+        if cached:
+            logger.debug("Cache hit for %s query '%s'", src.name, query[:30])
+            return cached[0]
+
+        # Acquire rate-limit token before hitting the API
+        await rate_limiter.acquire(src.name)
+        try:
             result = await src.search(query, limit)
             _cache_put(key, result)
             return result
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                self._mark_cooldown(src.name)
+            else:
+                logger.warning("Source %s HTTP %d", src.name, e.response.status_code)
+            return []
+        except Exception as e:
+            logger.warning("Source %s failed: %s", src.name, e)
+            return []
 
-        tasks = [_search_with_cache(src) for src in self.sources]
+    async def search_all_sources(self, query: str, limit: int = 15) -> list[RawPaper]:
+        """Search all sources concurrently for a single query."""
+        tasks = [self._search_with_cache(src, query, limit) for src in self.sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_papers: list[RawPaper] = []
@@ -91,11 +132,27 @@ class SearchService:
                 continue
             all_papers.extend(result)
 
+        # Supplement empty pdf_url fields via Unpaywall (free, no key)
+        try:
+            await self._unpaywall.enrich(all_papers)
+        except Exception as e:
+            logger.warning("Unpaywall enrichment failed: %s", e)
+
         return all_papers
 
     async def search_multiple_queries(self, queries: list[str], limit: int = 15) -> list[RawPaper]:
-        """Search all sources for multiple queries concurrently."""
-        tasks = [self.search_all_sources(q, limit) for q in queries]
+        """Search all sources for multiple queries with bounded concurrency.
+
+        Limits concurrent queries to search_query_concurrency to avoid
+        overwhelming rate-limited sources (S2/OpenAlex).
+        """
+        sem = asyncio.Semaphore(settings.search_query_concurrency)
+
+        async def _one(q: str) -> list[RawPaper]:
+            async with sem:
+                return await self.search_all_sources(q, limit)
+
+        tasks = [_one(q) for q in queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_papers: list[RawPaper] = []

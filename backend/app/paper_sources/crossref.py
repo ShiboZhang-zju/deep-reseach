@@ -4,6 +4,7 @@ import logging
 
 import httpx
 
+from app.config import settings
 from app.paper_sources.base import PaperSource, RawPaper, retry_with_backoff
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,8 @@ class CrossrefSource(PaperSource):
             return resp.json()
 
     async def search(self, query: str, limit: int = 15) -> list[RawPaper]:
-        headers = {"User-Agent": "DeepResearch/1.0 (mailto:research@example.com)"}
+        mailto = settings.crossref_email or settings.openalex_email or "research@example.com"
+        headers = {"User-Agent": f"DeepResearch/1.0 (mailto:{mailto})"}
 
         try:
             data = await retry_with_backoff(

@@ -70,12 +70,13 @@ export function IdeasView({ taskId, status }: Props) {
 
   const decisionBadge = (decision: string | null): { label: string; class: string } => {
     if (decision === 'go') return { label: '推荐', class: 'bg-green-100 text-green-700' };
+    if (decision === 'conditional_go') return { label: '条件推荐', class: 'bg-teal-100 text-teal-700' };
     if (decision === 'revise') return { label: '需改进', class: 'bg-amber-100 text-amber-700' };
     if (decision === 'no_go') return { label: '不推荐', class: 'bg-red-100 text-red-700' };
     return { label: '待评估', class: 'bg-gray-100 text-gray-500' };
   };
 
-  const selectableIdeas = ideas.filter((i) => i.decision === 'go');
+  const selectableIdeas = ideas.filter((i) => i.decision === 'go' || i.decision === 'conditional_go');
   const hasGoIdeas = selectableIdeas.length > 0;
   const showSelectUI = ['waiting_for_user_review'].includes(status);
   const showJudgeUI = ideas.some((i) => i.final_score !== null) && ideas.some((i) => i.final_score === null);
@@ -155,14 +156,14 @@ export function IdeasView({ taskId, status }: Props) {
               <div className="p-4">
                 <div className="flex items-start gap-3">
                   {showSelectUI && (() => {
-                    const isGo = idea.decision === 'go';
-                    return isGo ? (
+                    const isSelectable = idea.decision === 'go' || idea.decision === 'conditional_go';
+                    return isSelectable ? (
                       <input
                         type="checkbox"
                         checked={selected.has(idea.id)}
                         onChange={() => toggleSelect(idea.id)}
                         className="mt-1 w-4 h-4 rounded accent-amber-600"
-                        title="推荐创意"
+                        title={idea.decision === 'go' ? '推荐创意' : '条件推荐创意（未通过完整验证）'}
                       />
                     ) : (
                       <span className="mt-1 w-4 h-4 flex items-center justify-center text-gray-300 text-xs" title="分数不足0.70，不可选择">

@@ -51,21 +51,30 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
         tp, paper = paper_map[tp_id]
 
         # P1-7: Retrieve RAG passages to ground method_extract (avoids hallucination)
+        # NOTE: RAG retrieval only makes sense AFTER PDF indexing (Phase 2.5).
+        # During the search loop (Phase 2), ChromaDB is empty, so retrieval always
+        # returns []. Skip it entirely to avoid 220 wasted to_thread calls that
+        # exhaust the thread pool and cause process crashes.
+        # We check SQLite (has_chunks) instead of ChromaDB to avoid triggering
+        # embedding model loading on every paper.
         rag_context = ""
         try:
-            from app.services.rag_service import rag_retrieve
-            rag_results = rag_retrieve(
-                query=paper.title or state.normalized_topic,
-                top_k=3,
-                paper_ids=[paper.id],
-                section_filter=["method", "experiment"],
-            )
-            if rag_results:
-                _fig_pat = re.compile(r'\[FIGURE:.*?\]|\[TABLE\]|\[/TABLE\]')
-                rag_context = "\n".join(
-                    f"({r['section']}) {_fig_pat.sub('', r['text'])[:400].strip()}"
-                    for r in rag_results[:3]
+            from app.db.repositories.paper_repo import has_chunks
+            if has_chunks(db, paper.id):
+                # Paper has indexed chunks — retrieve from ChromaDB
+                from app.services.rag_service import rag_retrieve
+                rag_results = await rag_retrieve(
+                    query=paper.title or state.normalized_topic,
+                    top_k=3,
+                    paper_ids=[paper.id],
+                    section_filter=["method", "experiment"],
                 )
+                if rag_results:
+                    _fig_pat = re.compile(r'\[FIGURE:.*?\]|\[TABLE\]|\[/TABLE\]')
+                    rag_context = "\n".join(
+                        f"({r['section']}) {_fig_pat.sub('', r['text'])[:400].strip()}"
+                        for r in rag_results[:3]
+                    )
         except Exception as e:
             logger.debug("RAG retrieve for scoring paper %s failed (non-fatal): %s",
                         paper.id[:8], e)

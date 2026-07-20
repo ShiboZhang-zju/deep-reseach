@@ -15,9 +15,19 @@ router = APIRouter()
 
 
 async def _deferred_start_agent(task_id: str):
-    """Start agent after yielding control so HTTP response is sent first."""
+    """Start agent after yielding control so HTTP response is sent first.
+
+    If start_agent rejects (capacity full), emit an error event so the
+    frontend can surface it instead of waiting indefinitely.
+    """
     await asyncio.sleep(0.05)
-    start_agent(task_id)
+    started = start_agent(task_id)
+    if not started:
+        from app.services.event_service import emit_event
+        from app.config import settings
+        emit_event(task_id, "error", {
+            "message": f"已达最大并发任务数 ({settings.max_concurrent_agents})，请等待已有任务完成后再启动",
+        })
 
 
 @router.post("/tasks", response_model=TaskOut)
@@ -46,16 +56,8 @@ async def start_task(task_id: str, db: Session = Depends(get_db_session)):
     task = task_repo.get_task(db, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    # P0-1: reject if max concurrent agents already running
-    from app.agent.runner import _task_registry, _registry_lock
-    async with _registry_lock:
-        running = sum(1 for t in _task_registry.values() if not t.done())
-    from app.config import settings
-    if running >= settings.max_concurrent_agents:
-        raise HTTPException(
-            429,
-            f"已达最大并发任务数 ({settings.max_concurrent_agents})，请等待已有任务完成后再启动",
-        )
+    # P1-11: start_agent now does atomic capacity-check-and-register internally,
+    # closing the race window. The route just needs to handle the reject case.
     asyncio.create_task(_deferred_start_agent(task_id))
     return {"status": "started"}
 
