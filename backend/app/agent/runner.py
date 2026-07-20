@@ -139,7 +139,11 @@ def recover_interrupted_tasks():
 
 
 async def run_task(task_id: str):
-    """Main agent loop."""
+    """Main agent loop.
+
+    DB Session strategy: main session for search/ideas loop (needs state continuity),
+    but separate sessions for RAG/Wiki phases (long-running, don't need main state).
+    """
     db = SessionLocal()
     try:
         state = task_repo.get_state(db, task_id)
@@ -150,6 +154,12 @@ async def run_task(task_id: str):
 
         # === 2. Search loop ===
         await _run_search_loop(db, state, llm, task_id)
+
+        # Close main session before long-running RAG/Wiki phases
+        # (they don't need 'state' and can take 5-10 minutes each)
+        db.close()
+        db = SessionLocal()
+        state = task_repo.get_state(db, task_id)  # reload after search loop
 
         # === 2.5. RAG: Download PDFs and index high-priority papers ===
         await _run_rag_indexing(db, task_id, llm)
@@ -260,54 +270,67 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str):
         logger.info("=== Task %s: Round %d ===", task_id[:8], round_num)
         emit_event(task_id, "round_start", {"round": round_num})
 
-        # Generate queries
-        queries = await generate_queries(db, state, llm)
-        state.used_queries.extend(queries)
-        emit_event(task_id, "queries_generated", {"round": round_num, "queries": queries})
+        try:
+            # Generate queries
+            queries = await generate_queries(db, state, llm)
+            state.used_queries.extend(queries)
+            emit_event(task_id, "queries_generated", {"round": round_num, "queries": queries})
 
-        # Search + dedup + save
-        papers_found, deduped_count, new_paper_ids = await search_and_save_papers(
-            db, state, queries, task_id, round_num
-        )
+            # Search + dedup + save
+            papers_found, deduped_count, new_paper_ids = await search_and_save_papers(
+                db, state, queries, task_id, round_num
+            )
 
-        # Score papers
-        high_priority_before = len(state.high_priority_paper_ids)
-        scored_papers = await score_papers(db, state, llm, task_id, round_num)
+            # Score papers
+            high_priority_before = len(state.high_priority_paper_ids)
+            scored_papers = await score_papers(db, state, llm, task_id, round_num)
 
-        # Count new high-priority
-        new_high = len(state.high_priority_paper_ids) - high_priority_before
-        logger.info("Round %d: %d high-priority (%d new), total high=%d",
-                    round_num, new_high, new_high, len(state.high_priority_paper_ids))
-        if new_high == 0:
-            no_new_high_priority_count += 1
-        else:
-            no_new_high_priority_count = 0
+            # Count new high-priority
+            new_high = len(state.high_priority_paper_ids) - high_priority_before
+            logger.info("Round %d: %d high-priority (%d new), total high=%d",
+                        round_num, new_high, new_high, len(state.high_priority_paper_ids))
+            if new_high == 0:
+                no_new_high_priority_count += 1
+            else:
+                no_new_high_priority_count = 0
 
-        # Round summary
-        task_repo.update_status(db, task_id, "summarizing")
-        db.commit()
-        round_summary, gaps = await summarize_round(db, state, llm, round_num, scored_papers)
-        state.knowledge_gaps = gaps
-        state.round_summaries.append(round_summary)
+            # Round summary
+            task_repo.update_status(db, task_id, "summarizing")
+            db.commit()
+            round_summary, gaps = await summarize_round(db, state, llm, round_num, scored_papers)
+            state.knowledge_gaps = gaps
+            state.round_summaries.append(round_summary)
 
-        duplicate_rate = 1.0 - (len(new_paper_ids) / max(papers_found, 1))
+            duplicate_rate = 1.0 - (len(new_paper_ids) / max(papers_found, 1))
 
-        # Save round record
-        paper_repo.save_round(
-            db, task_id, round_num, queries,
-            papers_found, len(new_paper_ids), duplicate_rate,
-            round_summary, gaps
-        )
+            # Save round record
+            paper_repo.save_round(
+                db, task_id, round_num, queries,
+                papers_found, len(new_paper_ids), duplicate_rate,
+                round_summary, gaps
+            )
 
-        # Check early termination
-        if _check_early_termination(db, task_id, state, no_new_high_priority_count, duplicate_rate):
-            break
+            # Check early termination
+            if _check_early_termination(db, task_id, state, no_new_high_priority_count, duplicate_rate):
+                break
 
-        task_repo.save_state(db, task_id, state)
-        db.commit()
-        emit_event(task_id, "round_done", {"round": round_num, "new_papers": len(new_paper_ids)})
-        logger.info("Round %d complete. Total papers: %d, high-priority: %d",
-                    round_num, len(state.collected_paper_ids), len(state.high_priority_paper_ids))
+            task_repo.save_state(db, task_id, state)
+            db.commit()
+            emit_event(task_id, "round_done", {"round": round_num, "new_papers": len(new_paper_ids)})
+            logger.info("Round %d complete. Total papers: %d, high-priority: %d",
+                        round_num, len(state.collected_paper_ids), len(state.high_priority_paper_ids))
+
+        except Exception as round_err:
+            # Single round failure should NOT terminate the entire task.
+            # Roll back uncommitted changes, log, and continue to next round.
+            logger.error("Task %s: Round %d failed: %s — continuing to next round",
+                         task_id[:8], round_num, round_err, exc_info=True)
+            db.rollback()
+            state.current_round -= 1  # don't consume a round on failure
+            task_repo.save_state(db, task_id, state)
+            db.commit()
+            emit_event(task_id, "round_error", {"round": round_num, "error": str(round_err)[:200]})
+            await asyncio.sleep(5)  # cooldown before retry
 
 
 def _check_early_termination(db, task_id, state, no_new_high_count, duplicate_rate) -> bool:

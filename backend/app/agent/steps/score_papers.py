@@ -97,11 +97,14 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
         )
 
         if priority == "high":
-            state.high_priority_paper_ids.append(paper.id)
+            if paper.id not in state.high_priority_paper_ids:
+                state.high_priority_paper_ids.append(paper.id)
         elif priority == "medium":
-            state.medium_priority_paper_ids.append(paper.id)
+            if paper.id not in state.medium_priority_paper_ids:
+                state.medium_priority_paper_ids.append(paper.id)
         else:
-            state.low_priority_paper_ids.append(paper.id)
+            if paper.id not in state.low_priority_paper_ids:
+                state.low_priority_paper_ids.append(paper.id)
 
         scored.append({
             "title": paper.title,

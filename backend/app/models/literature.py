@@ -1,5 +1,10 @@
 """Literature graph data models.
 
+NOTE: This module is a DESIGN STUB for doc 12 (文献地图).
+It is NOT yet used by any code. The service layer (literature_map_service.py)
+and frontend component (LiteratureMapView.tsx) have not been implemented.
+See docs/12-literature-map.md for the design document.
+
 Defines in-memory representations of papers, chunks, and their relationships,
 with clear traceability and typed relations for the literature map.
 

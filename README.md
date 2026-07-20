@@ -433,7 +433,7 @@ paper_score = 0.30 × relevance + 0.25 × authority + 0.15 × recency + 0.15 × 
 ### Idea 评分
 
 ```
-idea_score = 0.20 × novelty + 0.20 × feasibility + 0.20 × significance + 0.20 × evidence_support + 0.10 × differentiation + 0.10 × experimentability
+idea_score = 0.20 × novelty + 0.20 × feasibility + 0.20 × significance + 0.20 × evidence_support + 0.10 × differentiation + 0.05 × experimentability + 0.05 × potential_impact
 final_score = idea_score - 0.08 × risk
 ```
 

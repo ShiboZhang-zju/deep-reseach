@@ -106,37 +106,37 @@ class TestIdeaScoringFormula:
     """Test idea scoring: 0.20*(nov+feas+sig+evid) + 0.10*(diff+exp) - 0.08*risk."""
 
     def compute_idea_score(self, novelty, feasibility, significance, evidence_support,
-                           differentiation, experimentability, risk):
+                           differentiation, experimentability, potential_impact, risk):
         idea_score = (
             0.20 * novelty + 0.20 * feasibility + 0.20 * significance +
             0.20 * evidence_support + 0.10 * differentiation +
-            0.10 * experimentability
+            0.05 * experimentability + 0.05 * potential_impact
         )
         return idea_score - 0.08 * risk
 
     def test_idea_weights_sum(self):
         """Idea score weights (excluding risk) sum to 1.0."""
-        weights = 0.20 + 0.20 + 0.20 + 0.20 + 0.10 + 0.10
+        weights = 0.20 + 0.20 + 0.20 + 0.20 + 0.10 + 0.05 + 0.05
         assert weights == pytest.approx(1.0)
 
     def test_risk_reduces_score(self):
-        score_no_risk = self.compute_idea_score(0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.0)
-        score_high_risk = self.compute_idea_score(0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.0)
+        score_no_risk = self.compute_idea_score(0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.0)
+        score_high_risk = self.compute_idea_score(0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.0)
         assert score_high_risk < score_no_risk
         assert score_no_risk - score_high_risk == pytest.approx(0.08)
 
     def test_go_threshold(self):
         """Score >= 0.70 → go."""
-        score = self.compute_idea_score(0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.0)
+        score = self.compute_idea_score(0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.0)
         assert score == pytest.approx(0.8)
         assert score >= 0.70
 
     def test_revise_threshold(self):
         """Score 0.50-0.69 → revise."""
-        score = self.compute_idea_score(0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.0)
+        score = self.compute_idea_score(0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.0)
         assert 0.50 <= score < 0.70
 
     def test_reject_threshold(self):
         """Score < 0.50 → reject."""
-        score = self.compute_idea_score(0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.0)
+        score = self.compute_idea_score(0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.0)
         assert score < 0.50

@@ -37,7 +37,7 @@ async def generate_experiments(db, state: ResearchState, llm, task_id: str, idea
         idea_score = (
             0.20 * scores.novelty + 0.20 * scores.feasibility + 0.20 * scores.significance +
             0.20 * scores.evidence_support + 0.10 * scores.differentiation +
-            0.10 * scores.experimentability
+            0.05 * scores.experimentability + 0.05 * scores.potential_impact
         )
         final_score = idea_score - 0.08 * scores.risk
 

@@ -15,7 +15,7 @@ class SemanticScholarSource(PaperSource):
     base_url = "https://api.semanticscholar.org/graph/v1"
 
     async def _do_search(self, query: str, limit: int, headers: dict) -> list[RawPaper]:
-        fields = "title,abstract,authors,year,venue,externalIds,citationCount,url,openAccessPdf"
+        fields = "title,abstract,authors,year,venue,externalIds,citationCount,url,openAccessPdf,references.paperId,references.title"
         params = {
             "query": query,
             "limit": min(limit, 100),
@@ -64,4 +64,7 @@ class SemanticScholarSource(PaperSource):
                 source=self.name,
                 raw_data=item,
             ))
+            # Parse references for citation graph (stored in raw_data)
+            # references field: [{"paperId": "abc", "title": "..."}, ...]
+            # Handled by search_papers.py via _extract_references()
         return papers

@@ -30,6 +30,8 @@ async def search_and_save_papers(db, state: ResearchState, queries: list[str], t
     logger.info("Round %d: %d papers after dedup", round_num, len(deduped))
 
     # Save to DB and track new vs existing
+    # Use a set for O(1) membership check (collected_paper_ids can grow to hundreds)
+    collected_set = set(state.collected_paper_ids)
     new_paper_ids = []
     for raw in deduped:
         normalized = normalize_paper(raw)
@@ -37,10 +39,60 @@ async def search_and_save_papers(db, state: ResearchState, queries: list[str], t
         paper_repo.create_task_paper(db, task_id, paper.id, round_num)
         if is_new:
             new_paper_ids.append(paper.id)
-        if paper.id not in state.collected_paper_ids:
+        if paper.id not in collected_set:
             state.collected_paper_ids.append(paper.id)
+            collected_set.add(paper.id)
+
+        # Fill citation relationships from S2 references (non-fatal)
+        if is_new:
+            try:
+                _save_paper_citations(db, paper, raw, task_id)
+            except Exception as e:
+                logger.debug("Citation extraction failed for paper %s: %s", paper.id[:8], e)
 
     db.commit()
     logger.info("Round %d: %d new, %d dup", round_num, len(new_paper_ids), len(deduped) - len(new_paper_ids))
 
     return papers_found, len(deduped), new_paper_ids
+
+
+def _save_paper_citations(db, source_paper, raw, task_id: str):
+    """Extract references from raw paper data and save as PaperCitation edges.
+
+    Parses S2 'references' field (list of {paperId, title}) and
+    OpenAlex 'referenced_works' (list of OpenAlex IDs).
+    Only creates edges to papers already in our DB (avoid creating stub papers).
+    """
+    from app.db.models import Paper
+    from app.services.scoring_service import normalize_title, title_hash
+
+    raw_data = raw.raw_data or {}
+    source_id = source_paper.id
+
+    # S2 references: [{"paperId": "abc123", "title": "..."}, ...]
+    references = raw_data.get("references") or []
+    citation_edges = 0
+
+    for ref in references[:50]:  # cap at 50 to avoid huge graphs
+        ref_s2_id = ref.get("paperId", "") if isinstance(ref, dict) else ""
+        ref_title = ref.get("title", "") if isinstance(ref, dict) else ""
+
+        if not ref_s2_id and not ref_title:
+            continue
+
+        # Try to find the referenced paper in our DB
+        target = None
+        if ref_s2_id:
+            target = db.query(Paper).filter(Paper.semantic_scholar_id == ref_s2_id).first()
+        if not target and ref_title:
+            th = title_hash(ref_title)
+            target = db.query(Paper).filter(Paper.title_hash == th).first()
+
+        if target and target.id != source_id:
+            paper_repo.save_citation(
+                db, source_id, target.id, "cites", weight=1.0, task_id=task_id
+            )
+            citation_edges += 1
+
+    if citation_edges:
+        logger.debug("Paper %s: saved %d citation edges", source_id[:8], citation_edges)

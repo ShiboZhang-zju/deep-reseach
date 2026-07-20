@@ -444,7 +444,7 @@ async def _process_each_idea(db, state, llm, task_id, idea_list, high_papers,
             idea_score_val = (
                 0.20 * adjusted_novelty + 0.20 * score.feasibility + 0.20 * score.significance +
                 0.20 * score.evidence_support + 0.10 * score.differentiation +
-                0.10 * score.experimentability
+                0.05 * score.experimentability + 0.05 * score.potential_impact
             )
             final_score = idea_score_val - 0.08 * score.risk
             val_penalty = validation_penalties.get(idx, 0.0)
@@ -531,19 +531,7 @@ async def _post_enrichment_baseline_check(db, llm, state, task_id, idx, item,
                         new_fabricated.append(bname)
 
             if new_fabricated:
-                async def verify_new(name):
-                    try:
-                        results = await search_service.search_all_sources(name, limit=3)
-                        if not results:
-                            return name, False
-                        for r in results[:3]:
-                            if name.lower() in (r.title or "").lower():
-                                return name, True
-                        return name, False
-                    except Exception:
-                        return name, True
-
-                new_results = await asyncio.gather(*[verify_new(n) for n in new_fabricated])
+                new_results = await asyncio.gather(*[_verify_baseline_name(n) for n in new_fabricated])
                 confirmed_fake = [n for n, real in new_results if not real]
                 if confirmed_fake:
                     extra_penalty = min(0.2, 0.1 * len(confirmed_fake))
@@ -594,6 +582,24 @@ async def _check_novelty(db, state, llm, item, enriched_method, task_id) -> floa
         logger.warning("Idea '%s': novelty search unavailable, applied conservative penalty",
                        item.title[:40])
     return novelty_penalty
+
+
+async def _verify_baseline_name(name: str) -> tuple[str, bool]:
+    """Verify a baseline name via search. Returns (name, is_real).
+
+    On search failure, returns False (do NOT give benefit of doubt —
+    consistent with the main baseline verification logic).
+    """
+    try:
+        results = await search_service.search_all_sources(name, limit=3)
+        if not results:
+            return name, False
+        for r in results[:3]:
+            if name.lower() in (r.title or "").lower():
+                return name, True
+        return name, False
+    except Exception:
+        return name, False
 
 
 async def _score_idea(db, state: ResearchState, llm, idea) -> IdeaScore:
