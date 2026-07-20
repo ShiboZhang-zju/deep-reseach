@@ -46,6 +46,16 @@ async def start_task(task_id: str, db: Session = Depends(get_db_session)):
     task = task_repo.get_task(db, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    # P0-1: reject if max concurrent agents already running
+    from app.agent.runner import _task_registry, _registry_lock
+    async with _registry_lock:
+        running = sum(1 for t in _task_registry.values() if not t.done())
+    from app.config import settings
+    if running >= settings.max_concurrent_agents:
+        raise HTTPException(
+            429,
+            f"已达最大并发任务数 ({settings.max_concurrent_agents})，请等待已有任务完成后再启动",
+        )
     asyncio.create_task(_deferred_start_agent(task_id))
     return {"status": "started"}
 

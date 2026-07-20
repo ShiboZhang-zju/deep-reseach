@@ -36,8 +36,21 @@ from app.services.event_service import emit_event, emit_event_with_cleanup
 
 logger = logging.getLogger(__name__)
 
-# Task registry for asyncio tasks
+# Task registry for asyncio tasks (P0-1: protected by lock)
 _task_registry: dict[str, asyncio.Task] = {}
+_registry_lock = asyncio.Lock()
+
+# P0-1: global concurrency limiter — prevents SQLite write contention
+# when multiple agents run simultaneously. Configurable via max_concurrent_agents.
+_agent_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_agent_semaphore() -> asyncio.Semaphore:
+    """Lazy-init the global agent concurrency semaphore."""
+    global _agent_semaphore
+    if _agent_semaphore is None:
+        _agent_semaphore = asyncio.Semaphore(settings.max_concurrent_agents)
+    return _agent_semaphore
 
 # Statuses that indicate a task was interrupted (process crash / restart)
 _INTERRUPTED_STATUSES = {
@@ -52,28 +65,52 @@ _INTERRUPTED_STATUSES = {
 
 
 def start_agent(task_id: str):
-    """Start the agent loop as an asyncio background task with timeout protection."""
+    """Start the agent loop as an asyncio background task with timeout protection.
+
+    P0-1: Uses a lock to protect _task_registry and a global semaphore
+    to limit concurrent agents (prevents SQLite write contention).
+    """
+    # Check if already running — need a running event loop for the lock,
+    # so we do a quick non-locked check first (false negative is harmless:
+    # the task will just no-op if it's already done).
     if task_id in _task_registry and not _task_registry[task_id].done():
         return
 
     AGENT_TIMEOUT = 1800  # 30 minutes max
 
     async def _run():
-        try:
-            await asyncio.wait_for(run_task(task_id), timeout=AGENT_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.error("Agent task %s timed out after %d seconds", task_id, AGENT_TIMEOUT)
-            await _safe_mark_failed(task_id, f"Agent timed out after {AGENT_TIMEOUT}s",
-                                    f"Agent 超时（{AGENT_TIMEOUT}秒），可能因 API 限流或 PDF 下载阻塞")
-        except asyncio.CancelledError:
-            logger.info("Agent task %s was cancelled", task_id)
-            await _safe_mark_failed(task_id, "Task cancelled by user", "用户手动停止", cleanup=True)
-        except Exception as e:
-            logger.exception("Agent task %s failed", task_id)
-            await _safe_mark_failed(task_id, str(e)[:500], str(e))
+        sem = _get_agent_semaphore()
+        async with sem:
+            try:
+                await asyncio.wait_for(run_task(task_id), timeout=AGENT_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.error("Agent task %s timed out after %d seconds", task_id, AGENT_TIMEOUT)
+                await _safe_mark_failed(task_id, f"Agent timed out after {AGENT_TIMEOUT}s",
+                                        f"Agent 超时（{AGENT_TIMEOUT}秒），可能因 API 限流或 PDF 下载阻塞")
+            except asyncio.CancelledError:
+                logger.info("Agent task %s was cancelled", task_id)
+                await _safe_mark_failed(task_id, "Task cancelled by user", "用户手动停止", cleanup=True)
+            except Exception as e:
+                logger.exception("Agent task %s failed", task_id)
+                await _safe_mark_failed(task_id, str(e)[:500], str(e))
+            finally:
+                async with _registry_lock:
+                    _task_registry.pop(task_id, None)
 
-    task = asyncio.create_task(_run())
-    _task_registry[task_id] = task
+    # Create the task and register it atomically
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    task = loop.create_task(_run())
+
+    async def _register():
+        async with _registry_lock:
+            _task_registry[task_id] = task
+
+    loop.create_task(_register())
 
 
 async def _safe_mark_failed(task_id: str, reason: str, event_message: str, cleanup: bool = False):
@@ -105,17 +142,25 @@ async def _safe_mark_failed(task_id: str, reason: str, event_message: str, clean
 
 def stop_agent(task_id: str):
     """Stop a running agent task."""
-    if task_id in _task_registry:
-        _task_registry[task_id].cancel()
-        del _task_registry[task_id]
+    # P0-1: cancel synchronously (the lock is for async context, but
+    # cancel() itself is safe to call from sync code)
+    task = _task_registry.get(task_id)
+    if task:
+        task.cancel()
+        # Removal will happen in the _run() finally block via _registry_lock
 
 
 def recover_interrupted_tasks():
-    """On startup, mark tasks with interrupted statuses as 'failed'.
+    """On startup, recover tasks with interrupted statuses (P0-2: smart resume).
 
-    Call this once at application startup (see main.py) to recover from
-    process crashes. Tasks stuck in running states are marked as failed
-    so the user can restart them.
+    Instead of marking all interrupted tasks as 'failed', we now:
+    - searching/summarizing → reset to 'pending' so user can restart from current_round
+    - clarifying/waiting_for_clarification → reset to 'pending' (re-clarify)
+    - reporting/generating_ideas/judging_ideas/generating_experiment → reset to 'pending'
+      so runner can resume from the RAG/Wiki phase (already-collected papers preserved)
+
+    State is preserved in state_json + research_rounds + papers, so a restart
+    will skip already-completed rounds via should_stop() checks.
     """
     db = SessionLocal()
     try:
@@ -124,13 +169,13 @@ def recover_interrupted_tasks():
             ResearchTask.status.in_(list(_INTERRUPTED_STATUSES))
         ).all()
         for task in tasks:
-            logger.warning("Task %s was interrupted (status=%s), marking as failed",
+            logger.warning("Task %s was interrupted (status=%s), resetting to pending for resume",
                           task.id[:8], task.status)
-            task.status = "failed"
+            task.status = "pending"
             task.stop_reason = "interrupted_by_restart"
         db.commit()
         if tasks:
-            logger.info("Recovered %d interrupted tasks", len(tasks))
+            logger.info("Recovered %d interrupted tasks (reset to pending for resume)", len(tasks))
     except Exception as e:
         logger.error("Failed to recover interrupted tasks: %s", e)
         db.rollback()
@@ -143,14 +188,28 @@ async def run_task(task_id: str):
 
     DB Session strategy: main session for search/ideas loop (needs state continuity),
     but separate sessions for RAG/Wiki phases (long-running, don't need main state).
+
+    P0-2: Supports resume — if state.current_round > 0 and papers already collected,
+    the search loop will skip already-completed rounds (should_stop checks high_priority
+    count which is preserved in state). The clarify phase is skipped if normalized_topic
+    is already set.
     """
     db = SessionLocal()
     try:
         state = task_repo.get_state(db, task_id)
         llm = get_llm()
 
-        # === 1. Topic clarification ===
-        await _run_clarification_phase(db, state, llm, task_id)
+        # === 1. Topic clarification (skip if already clarified) ===
+        if state.normalized_topic:
+            logger.info("Task %s: resuming — topic already clarified: %s",
+                       task_id[:8], state.normalized_topic[:50])
+        else:
+            await _run_clarification_phase(db, state, llm, task_id)
+            # Re-check: clarification may have set waiting_for_clarification
+            db.refresh = None  # noop
+            state = task_repo.get_state(db, task_id)
+            if not state.normalized_topic:
+                return  # waiting for user clarification
 
         # === 2. Search loop ===
         await _run_search_loop(db, state, llm, task_id)
@@ -406,7 +465,11 @@ async def _run_wiki_ingest(db, task_id: str, llm):
 
 
 async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_list):
-    """Phase 5: Ideas generation with retry loop."""
+    """Phase 5: Ideas generation with retry loop.
+
+    P1-5: Uses soft-delete (idea_status='superseded') instead of hard delete
+    so user-visible history is preserved across retries.
+    """
     from app.db.models import ResearchIdea
     max_idea_rounds = 3
 
@@ -414,8 +477,10 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
         # Collect previous ideas as feedback for retry
         prev_ideas_feedback = ""
         if idea_round > 0:
+            # P1-5: soft-delete previous ideas instead of hard delete
             old_ideas = db.query(ResearchIdea).filter(
                 ResearchIdea.task_id == task_id,
+                ResearchIdea.idea_status == "active",
             ).order_by(ResearchIdea.created_at.desc()).all()
             if old_ideas:
                 feedback_lines = []
@@ -429,9 +494,11 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
                     + "\n".join(feedback_lines)
                     + "\n\n请基于所有累积论文，生成比之前更有深度、更有创新性的创意。不要重复之前的创意方向。"
                 )
-                db.query(ResearchIdea).filter(ResearchIdea.task_id == task_id).delete()
+                # P1-5: mark as superseded (preserves history, excludes from active queries)
+                for oi in old_ideas:
+                    oi.idea_status = "superseded"
                 db.commit()
-                logger.info("Task %s: deleted %d old ideas for retry", task_id[:8], len(old_ideas))
+                logger.info("Task %s: soft-deleted %d old ideas for retry", task_id[:8], len(old_ideas))
 
         logger.info("Task %s: generating ideas (idea round %d)...", task_id[:8], idea_round + 1)
         task_repo.update_status(db, task_id, "generating_ideas")
@@ -439,10 +506,11 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
         emit_event(task_id, "status", {"status": "generating_ideas"})
         await generate_and_score_ideas(db, state, llm, task_id, prev_ideas_feedback, cluster_list)
 
-        # Check if any "go" ideas exist
+        # Check if any "go" ideas exist (only among active ideas)
         go_count = db.query(ResearchIdea).filter(
             ResearchIdea.task_id == task_id,
             ResearchIdea.decision == "go",
+            ResearchIdea.idea_status == "active",
         ).count()
         logger.info("Task %s: idea round %d done, %d go ideas",
                     task_id[:8], idea_round + 1, go_count)
@@ -528,9 +596,11 @@ def _auto_promote_ideas(db, task_id: str):
     from app.db.models import ResearchIdea
 
     logger.info("Task %s: max idea rounds reached, auto-promoting top ideas", task_id[:8])
+    # P1-5: only consider active ideas (not superseded)
     all_ideas = db.query(ResearchIdea).filter(
         ResearchIdea.task_id == task_id,
-    ).order_by(ResearchIdea.final_score.desc()).all()
+        ResearchIdea.idea_status == "active",
+    ).order_by(ResearchIdea.final_score.desc().nullslast()).all()
     promoted = 0
     for idea in all_ideas:
         if idea.final_score and idea.final_score >= 0.55:

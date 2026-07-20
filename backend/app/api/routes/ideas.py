@@ -11,10 +11,16 @@ router = APIRouter()
 
 
 @router.get("/tasks/{task_id}/ideas", response_model=list[IdeaOut])
-def get_ideas(task_id: str, db: Session = Depends(get_db_session)):
-    ideas = db.query(ResearchIdea).filter(
-        ResearchIdea.task_id == task_id
-    ).order_by(ResearchIdea.final_score.desc().nullslast()).all()
+def get_ideas(task_id: str, include_superseded: bool = False, db: Session = Depends(get_db_session)):
+    """Get ideas for a task.
+
+    P1-5: By default only returns 'active' ideas (excludes soft-deleted 'superseded').
+    Set include_superseded=true to see all historical ideas.
+    """
+    query = db.query(ResearchIdea).filter(ResearchIdea.task_id == task_id)
+    if not include_superseded:
+        query = query.filter(ResearchIdea.idea_status == "active")
+    ideas = query.order_by(ResearchIdea.final_score.desc().nullslast()).all()
 
     return [_to_idea_out(i) for i in ideas]
 
@@ -40,5 +46,6 @@ def _to_idea_out(idea: ResearchIdea) -> IdeaOut:
         decision=idea.decision,
         related_paper_ids_json=idea.related_paper_ids_json,
         user_selected=idea.user_selected,
+        idea_status=idea.idea_status or "active",
         created_at=isoformat_utc(idea.created_at),
     )

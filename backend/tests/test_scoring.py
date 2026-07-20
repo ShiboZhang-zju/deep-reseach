@@ -9,14 +9,16 @@ from app.agent.state import ResearchState
 
 
 class TestPaperScoringFormula:
-    """Test the scoring formula: 0.30*relevance + 0.25*authority + 0.15*recency
+    """Test the scoring formula: 0.25*relevance + 0.30*authority + 0.15*recency
     + 0.15*novelty + 0.15*idea_potential
+
+    P1-7: authority bumped from 0.25 to 0.30, relevance down from 0.30 to 0.25
     """
 
     def compute_final_score(self, relevance, authority, recency, novelty, idea_potential):
-        """Replicate the scoring formula from score_papers.py."""
+        """Replicate the scoring formula from score_papers.py (P1-7 weights)."""
         return (
-            0.30 * relevance + 0.25 * authority + 0.15 * recency +
+            0.25 * relevance + 0.30 * authority + 0.15 * recency +
             0.15 * novelty + 0.15 * idea_potential
         )
 
@@ -28,15 +30,15 @@ class TestPaperScoringFormula:
         score = self.compute_final_score(1, 1, 1, 1, 1)
         assert score == pytest.approx(1.0)
 
-    def test_high_relevance_dominates(self):
-        """relevance has the highest weight (0.30)."""
-        score_high_rel = self.compute_final_score(1.0, 0, 0, 0, 0)
+    def test_authority_now_dominates(self):
+        """P1-7: authority has the highest weight (0.30), not relevance (0.25)."""
         score_high_auth = self.compute_final_score(0, 1.0, 0, 0, 0)
-        assert score_high_rel > score_high_auth  # 0.30 > 0.25
+        score_high_rel = self.compute_final_score(1.0, 0, 0, 0, 0)
+        assert score_high_auth > score_high_rel  # 0.30 > 0.25
 
     def test_weights_sum_to_one(self):
         """Weights should sum to 1.0."""
-        total_weight = 0.30 + 0.25 + 0.15 + 0.15 + 0.15
+        total_weight = 0.25 + 0.30 + 0.15 + 0.15 + 0.15
         assert total_weight == pytest.approx(1.0)
 
     def test_priority_thresholds(self):

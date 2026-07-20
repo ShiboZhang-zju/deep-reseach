@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import re
 
+from app.config import settings
 from app.agent.state import ResearchState
 from app.agent.prompts import SCORE_SYSTEM, SCORE_USER
 from app.db.models import TaskPaper, Paper
@@ -47,17 +49,42 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
 
     async def score_one(tp_id: str):
         tp, paper = paper_map[tp_id]
+
+        # P1-7: Retrieve RAG passages to ground method_extract (avoids hallucination)
+        rag_context = ""
+        try:
+            from app.services.rag_service import rag_retrieve
+            rag_results = rag_retrieve(
+                query=paper.title or state.normalized_topic,
+                top_k=3,
+                paper_ids=[paper.id],
+                section_filter=["method", "experiment"],
+            )
+            if rag_results:
+                _fig_pat = re.compile(r'\[FIGURE:.*?\]|\[TABLE\]|\[/TABLE\]')
+                rag_context = "\n".join(
+                    f"({r['section']}) {_fig_pat.sub('', r['text'])[:400].strip()}"
+                    for r in rag_results[:3]
+                )
+        except Exception as e:
+            logger.debug("RAG retrieve for scoring paper %s failed (non-fatal): %s",
+                        paper.id[:8], e)
+
+        user_content = SCORE_USER.format(
+            topic=state.normalized_topic,
+            title=paper.title,
+            abstract=(paper.abstract or "")[:1000],
+            authors=paper.authors_json or "",
+            year=paper.year or "",
+            venue=paper.venue or "",
+            citations=paper.citation_count or 0,
+        )
+        if rag_context:
+            user_content += f"\n\n## 论文全文段落（RAG检索，用于准确提取方法细节）\n{rag_context}"
+
         messages = [
             {"role": "system", "content": SCORE_SYSTEM},
-            {"role": "user", "content": SCORE_USER.format(
-                topic=state.normalized_topic,
-                title=paper.title,
-                abstract=(paper.abstract or "")[:1000],
-                authors=paper.authors_json or "",
-                year=paper.year or "",
-                venue=paper.venue or "",
-                citations=paper.citation_count or 0,
-            )},
+            {"role": "user", "content": user_content},
         ]
         async with semaphore:
             try:
@@ -85,9 +112,13 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
         if any(kv in venue_str for kv in TOP_VENUE_KEYWORDS):
             authority_adj = min(1.0, authority_adj + 0.1)
 
+        # P1-7: use configurable weights (authority bumped to 0.30, relevance down to 0.25)
         final_score = (
-            0.30 * score.relevance + 0.25 * authority_adj + 0.15 * score.recency +
-            0.15 * score.novelty + 0.15 * score.idea_potential
+            settings.score_weight_relevance * score.relevance
+            + settings.score_weight_authority * authority_adj
+            + settings.score_weight_recency * score.recency
+            + settings.score_weight_novelty * score.novelty
+            + settings.score_weight_idea_potential * score.idea_potential
         )
         priority = "high" if final_score >= 0.75 else ("medium" if final_score >= 0.5 else "low")
 

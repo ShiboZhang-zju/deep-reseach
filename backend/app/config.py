@@ -36,6 +36,24 @@ class Settings(BaseSettings):
     papers_per_source_per_query: int = 15
     high_priority_target: int = 15
 
+    # Concurrency limits (P0-1: prevent SQLite write contention)
+    max_concurrent_agents: int = 2
+
+    # RAG / PDF download
+    enable_scihub: bool = False  # P0-4: Sci-Hub disabled by default for legal compliance
+
+    # Scoring weights (P1-7: authority bumped from 0.25 to 0.30)
+    score_weight_relevance: float = 0.25
+    score_weight_authority: float = 0.30
+    score_weight_recency: float = 0.15
+    score_weight_novelty: float = 0.15
+    score_weight_idea_potential: float = 0.15
+
+    # Rate limiting (P1-9: per-source request budget)
+    rate_limit_s2_per_min: int = 100
+    rate_limit_openalex_per_min: int = 100
+    rate_limit_default_per_min: int = 60
+
     # Database
     database_url: str = "sqlite:///./deep_research.db"
 

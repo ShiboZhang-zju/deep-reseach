@@ -103,6 +103,8 @@ async def generate_report(db, state: ResearchState, llm, cluster_list=None) -> s
 
     # Post-check: detect placeholder text
     _check_placeholders(report_text, state.task_id)
+    # P1-6: validate [Px] citations reference real papers
+    report_text = _validate_and_clean_citations(db, report_text, all_papers, state.task_id)
 
     paper_repo.save_report(db, state.task_id, report_text)
     # Record LLM token usage
@@ -270,3 +272,54 @@ def _check_placeholders(report_text: str, task_id: str):
     has_placeholders = any(re.search(p, report_text) for p in _PLACEHOLDER_PATTERNS)
     if has_placeholders:
         logger.warning("Task %s: report contains placeholder text", task_id[:8])
+
+
+def _validate_and_clean_citations(db, report_text: str, all_papers: list, task_id: str) -> str:
+    """P1-6: Validate [Px] citations reference real papers.
+
+    - Collects all [P1], [P2], ... references from the report body.
+    - Compares against the actual paper list (1-indexed).
+    - Logs warnings for fabricated citations.
+    - Does NOT delete fabricated citations from text (would break readability),
+      but logs them for visibility and emits a trace.
+    """
+    from app.db.repositories import paper_repo
+
+    # Find all [P<number>] references in the report
+    cited_indices = set()
+    for m in re.finditer(r'\[P(\d+)\]', report_text):
+        try:
+            cited_indices.add(int(m.group(1)))
+        except ValueError:
+            continue
+
+    valid_indices = set(range(1, len(all_papers) + 1))
+    fabricated = cited_indices - valid_indices
+
+    if fabricated:
+        logger.warning(
+            "Task %s: report contains %d FABRICATED citations: %s (valid range: 1-%d)",
+            task_id[:8], len(fabricated),
+            sorted(fabricated)[:10], len(all_papers),
+        )
+        try:
+            paper_repo.save_trace(db, task_id, "report_citation_check", "observation",
+                                  output_data={
+                                      "fabricated_citations": sorted(fabricated),
+                                      "valid_range": f"1-{len(all_papers)}",
+                                      "total_cited": len(cited_indices),
+                                  })
+            db.commit()
+        except Exception as e:
+            logger.debug("Failed to save citation check trace: %s", e)
+    else:
+        logger.info("Task %s: all %d citations are valid", task_id[:8], len(cited_indices))
+
+    # Compute citation coverage: how many of the provided papers were actually cited
+    cited_from_valid = cited_indices & valid_indices
+    coverage = len(cited_from_valid) / max(len(all_papers), 1)
+    if coverage < 0.3:
+        logger.warning("Task %s: low citation coverage %.1f%% (%d/%d papers cited)",
+                      task_id[:8], coverage * 100, len(cited_from_valid), len(all_papers))
+
+    return report_text

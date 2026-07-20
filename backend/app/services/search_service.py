@@ -13,6 +13,7 @@ from app.paper_sources.openalex import OpenAlexSource
 from app.paper_sources.crossref import CrossrefSource
 from app.paper_sources.ieee import IeeeSource
 from app.paper_sources.core import CoreSource
+from app.services.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ class SearchService:
             if cached:
                 logger.debug("Cache hit for %s query '%s'", src.name, query[:30])
                 return cached[0]
+            # P1-9: acquire rate-limit token before hitting the API
+            await rate_limiter.acquire(src.name)
             result = await src.search(query, limit)
             _cache_put(key, result)
             return result

@@ -1,5 +1,6 @@
 """Step: Search, deduplicate, and save papers for a round."""
 
+import asyncio
 import logging
 
 from app.config import settings
@@ -53,7 +54,26 @@ async def search_and_save_papers(db, state: ResearchState, queries: list[str], t
     db.commit()
     logger.info("Round %d: %d new, %d dup", round_num, len(new_paper_ids), len(deduped) - len(new_paper_ids))
 
+    # P1-8: Async metadata enrichment for newly found papers (non-blocking)
+    if new_paper_ids:
+        asyncio.create_task(_trigger_metadata_enrichment(new_paper_ids))
+
     return papers_found, len(deduped), new_paper_ids
+
+
+async def _trigger_metadata_enrichment(paper_ids: list[str]):
+    """Fire-and-forget metadata enrichment for newly discovered papers.
+
+    Runs in background — does not block the search loop. Failures are logged
+    but do not affect the main task.
+    """
+    try:
+        from app.services.metadata_enrichment import enrich_papers_metadata
+        result = await enrich_papers_metadata(paper_ids)
+        if result.get("enriched", 0) > 0:
+            logger.info("Metadata enrichment: %s", result)
+    except Exception as e:
+        logger.warning("Metadata enrichment failed (non-fatal): %s", e)
 
 
 def _save_paper_citations(db, source_paper, raw, task_id: str):

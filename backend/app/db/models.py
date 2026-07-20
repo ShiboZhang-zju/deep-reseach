@@ -178,9 +178,15 @@ class ResearchIdea(Base):
     decision = Column(String)
     related_paper_ids_json = Column(Text)
     user_selected = Column(Boolean, default=False)
+    # P1-5: soft-delete support for idea retry — 'active' (default) or 'superseded'
+    idea_status = Column(String, default="active")
     created_at = Column(DateTime, default=_utcnow)
 
     task = relationship("ResearchTask", back_populates="ideas")
+
+    __table_args__ = (
+        Index("idx_ideas_task_status", "task_id", "idea_status"),
+    )
 
 
 class ExperimentPlan(Base):

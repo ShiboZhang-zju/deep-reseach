@@ -393,10 +393,15 @@ async def download_pdf_multi_source(paper) -> bytes | None:
     4. Semantic Scholar (if s2_id available)
     5. OpenAlex (if openalex_id available)
     6. Unpaywall (if DOI available)
-    7. Sci-Hub (if DOI available, last resort)
+    7. Crossref links (if DOI available)
+    
+    P0-4: Sci-Hub (step 8) is DISABLED by default for legal compliance.
+    Set ENABLE_SCIHUB=true in .env to opt-in.
     
     Successfully downloaded PDFs are cached to disk for reuse.
     """
+    from app.config import settings
+    
     # 0. Check disk cache first
     cached = _load_pdf_from_cache(paper.id)
     if cached:
@@ -438,8 +443,9 @@ async def download_pdf_multi_source(paper) -> bytes | None:
     if not pdf_bytes and paper.doi:
         pdf_bytes = await _fetch_crossref_pdf(paper.doi)
     
-    # 8. Try Sci-Hub (last resort)
-    if not pdf_bytes and paper.doi:
+    # 8. Try Sci-Hub (last resort) — DISABLED by default (P0-4: legal compliance)
+    if not pdf_bytes and paper.doi and settings.enable_scihub:
+        logger.info("Attempting Sci-Hub download for DOI %s (ENABLE_SCIHUB=true)", paper.doi)
         pdf_bytes = await _fetch_scihub_pdf(paper.doi)
     
     # Cache to disk if successful
