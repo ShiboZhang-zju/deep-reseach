@@ -55,6 +55,9 @@ def stop_task(task_id: str, db: Session = Depends(get_db_session)):
     stop_agent(task_id)
     task_repo.update_status(db, task_id, "stopped")
     db.commit()
+    # Clean up SSE event queue for stopped task
+    from app.services.event_service import cleanup_task_events
+    cleanup_task_events(task_id)
     return {"status": "stopped"}
 
 

@@ -7,8 +7,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from app.config import settings
 from app.db.session import engine, Base
 from app.api.routes import tasks, papers, reports, ideas, experiments, events, traces
+from app.api.auth import ApiKeyMiddleware
+from app.agent.runner import recover_interrupted_tasks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -16,6 +19,12 @@ logger = logging.getLogger(__name__)
 # Create tables
 Base.metadata.create_all(engine)
 logger.info("Database tables created")
+
+# Recover tasks interrupted by process crash/restart
+try:
+    recover_interrupted_tasks()
+except Exception as e:
+    logger.error("Failed to recover interrupted tasks on startup: %s", e)
 
 app = FastAPI(
     title="Deep Research API",
@@ -31,6 +40,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# API Key authentication (P0-4): protects POST/PUT/DELETE on /api/tasks if API_KEY is set
+if settings.api_key:
+    app.add_middleware(ApiKeyMiddleware, api_key=settings.api_key)
+    logger.info("API Key authentication enabled")
+else:
+    logger.warning("API_KEY not set — authentication disabled (not recommended for production)")
 
 # Register routers
 app.include_router(tasks.router, prefix="/api", tags=["tasks"])

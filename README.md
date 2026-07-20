@@ -63,7 +63,7 @@ flowchart TD
 | 数据库 | SQLite |
 | ORM | SQLAlchemy 2.0 |
 | LLM | 多 provider 可切换，默认 Venus LLM Proxy（兼容 OpenAI API，模型 gpt-4o-2024-11-20） |
-| 论文数据源 | Semantic Scholar + arXiv + OpenAlex + Crossref |
+| 论文数据源 | Semantic Scholar + arXiv + OpenAlex + Crossref + IEEE + CORE |
 | 前端 | Vite + React + TypeScript + Tailwind CSS |
 | Agent 架构 | 轻量自研 Loop（不依赖 LangGraph） |
 
@@ -123,24 +123,21 @@ deep-research/
 │   │   │
 │   │   ├── agent/
 │   │   │   ├── __init__.py
-│   │   │   ├── runner.py            # Agent Loop 主调度
+│   │   │   ├── runner.py            # Agent Loop 主调度（精简版，仅编排逻辑）
 │   │   │   ├── state.py             # ResearchState 数据结构
 │   │   │   ├── policy.py             # 终止条件判断
 │   │   │   ├── prompts.py           # 所有 LLM prompt 模板
-│   │   │   └── steps/
+│   │   │   └── steps/               # 各步骤独立模块（可单测）
 │   │   │       ├── __init__.py
 │   │   │       ├── clarify_topic.py    # 方向澄清
 │   │   │       ├── generate_queries.py # 生成检索 Query
-│   │   │       ├── search_papers.py    # 多源检索
-│   │   │       ├── normalize_papers.py # 清洗标准化
-│   │   │       ├── deduplicate.py      # 去重
-│   │   │       ├── score_papers.py    # 评分
-│   │   │       ├── summarize_round.py # 轮次摘要
-│   │   │       ├── analyze_gaps.py    # 知识缺口分析
-│   │   │       ├── generate_report.py # 报告生成
-│   │   │       ├── generate_ideas.py  # Idea 生成
-│   │   │       ├── judge_ideas.py     # Idea 初评 + 深评
-│   │   │       └── generate_experiment.py # 实验方案
+│   │   │       ├── search_papers.py    # 多源检索 + 去重 + 保存
+│   │   │       ├── score_papers.py    # 评分（含 authority 调整）
+│   │   │       ├── summarize_round.py # 轮次摘要 + 知识缺口
+│   │   │       ├── build_clusters.py  # 论文聚类（Wiki 优先，LLM 兜底）
+│   │   │       ├── generate_report.py # 报告生成（STORM 两步式）
+│   │   │       ├── generate_ideas.py  # Idea 生成 + 5层验证
+│   │   │       └── generate_experiment.py # 实验方案 + 深评
 │   │   │
 │   │   ├── llm/
 │   │   │   ├── __init__.py
@@ -422,8 +419,10 @@ CREATE UNIQUE INDEX idx_rounds ON research_rounds(task_id, round_number);
 ### 论文评分
 
 ```
-paper_score = 0.35 × relevance + 0.20 × authority + 0.15 × recency + 0.15 × novelty + 0.15 × idea_potential
+paper_score = 0.30 × relevance + 0.25 × authority + 0.15 × recency + 0.15 × novelty + 0.15 × idea_potential
 ```
+
+> **authority 调整**：缺失元数据（无引用+无年份）打 0.7 折；顶会/顶刊（ICML/NeurIPS/ICLR/CVPR/ACL 等）加 0.1（上限 1.0）。
 
 | 分数 | 优先级 |
 |------|--------|
@@ -434,15 +433,17 @@ paper_score = 0.35 × relevance + 0.20 × authority + 0.15 × recency + 0.15 × 
 ### Idea 评分
 
 ```
-idea_score = 0.25 × novelty + 0.20 × feasibility + 0.20 × significance + 0.15 × evidence_support + 0.10 × differentiation + 0.10 × experimentability
-final_score = idea_score - 0.15 × risk
+idea_score = 0.20 × novelty + 0.20 × feasibility + 0.20 × significance + 0.20 × evidence_support + 0.10 × differentiation + 0.10 × experimentability
+final_score = idea_score - 0.08 × risk
 ```
+
+> 另有验证惩罚：编造基线 -0.15/个（上限 -0.3），编造数据集 -0.05/个，指标-假设不匹配 -0.05/个，非新颖 -0.1。
 
 | 分数 | 决策 |
 |------|------|
-| >= 0.75 | go |
-| 0.55 - 0.75 | revise |
-| < 0.55 | reject |
+| >= 0.70 | go |
+| 0.50 - 0.70 | revise |
+| < 0.50 | reject |
 
 ## 去重策略（优先级从高到低）
 
@@ -559,6 +560,10 @@ DATABASE_URL=sqlite:///./deep_research.db
 # 服务
 HOST=0.0.0.0
 PORT=8000
+
+# 认证（P0-4：留空则禁用认证；生产环境务必设置）
+# 设置后，POST/PUT/DELETE /api/tasks 请求需携带 X-API-Key 头
+API_KEY=
 ```
 
 ## SQLite 配置
@@ -651,6 +656,16 @@ async def generate_experiment_for_selected_ideas(task_id: str, idea_ids: list[st
 ```
 
 ## 开发计划
+
+### P0: 工程化基础（已实现）
+
+**目标**：解决架构臃肿、任务丢失、内存泄漏、无认证、无测试五大基础问题。
+
+- [x] **拆分 `runner.py`**：1573 行单文件 → 精简至 ~430 行编排逻辑 + 9 个 `steps/` 独立模块（可单测）
+- [x] **任务恢复机制**：进程重启时自动扫描 `searching`/`reporting` 等中间态任务，标记为 `failed`（`recover_interrupted_tasks()`）
+- [x] **SSE 队列限界**：`asyncio.Queue(maxsize=200)`，满时丢最旧事件；任务终态后 10 秒自动清理队列
+- [x] **API Key 认证**：`API_KEY` 环境变量控制，保护 `POST/PUT/DELETE /api/tasks`；留空则禁用（本地开发）
+- [x] **核心测试**：65 个测试覆盖去重、评分公式、终止条件、Wiki 合并、SSE 队列（`pytest tests/`）
 
 ### MVP 0: 后端最小闭环
 

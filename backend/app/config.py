@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # Authentication (P0-4): if set, POST/PUT/DELETE on /api/tasks require X-API-Key header
+    api_key: str = ""
+
     model_config = SettingsConfigDict(
         env_file=str(_env_file),
         env_file_encoding="utf-8",

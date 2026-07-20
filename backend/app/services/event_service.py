@@ -1,22 +1,86 @@
-"""SSE event service for real-time progress push."""
+"""SSE event service for real-time progress push.
+
+Improvements (P0-3):
+- Bounded queue (maxsize=200) to prevent memory leak when frontend disconnects
+- cleanup_task_events() called when task reaches terminal state
+- emit_event drops oldest event if queue is full (non-blocking)
+"""
 
 import asyncio
 import json
+import logging
 from collections import defaultdict
 
-# Per-task event queues
-_event_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+logger = logging.getLogger(__name__)
+
+# Maximum events buffered per task (prevents unbounded memory growth)
+_MAX_QUEUE_SIZE = 200
+
+# Per-task event queues (bounded)
+_event_queues: dict[str, asyncio.Queue] = {}
+
+
+def _get_or_create_queue(task_id: str) -> asyncio.Queue:
+    """Get or create a bounded queue for a task."""
+    if task_id not in _event_queues:
+        _event_queues[task_id] = asyncio.Queue(maxsize=_MAX_QUEUE_SIZE)
+    return _event_queues[task_id]
 
 
 def emit_event(task_id: str, event_type: str, data: dict):
-    """Push an event to the task's SSE queue."""
+    """Push an event to the task's SSE queue.
+
+    Uses put_nowait; if queue is full, drops the oldest event to make room.
+    This prevents the agent from blocking if the frontend is disconnected.
+    """
+    queue = _get_or_create_queue(task_id)
     event = {"event": event_type, "data": json.dumps(data, ensure_ascii=False, default=str)}
-    _event_queues[task_id].put_nowait(event)
+
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        # Queue full — drop oldest to make room for newest
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("Event queue for task %s still full after drop, event lost", task_id[:8])
+
+
+def cleanup_task_events(task_id: str):
+    """Remove all queued events for a task (call when task reaches terminal state)."""
+    if task_id in _event_queues:
+        del _event_queues[task_id]
+        logger.debug("Cleaned up event queue for task %s", task_id[:8])
+
+
+# Terminal statuses that trigger cleanup
+_TERMINAL_STATUSES = {"done", "stopped", "failed"}
+
+
+def emit_event_with_cleanup(task_id: str, event_type: str, data: dict):
+    """Emit event and auto-cleanup queue if task reaches terminal state."""
+    emit_event(task_id, event_type, data)
+    # Check if this is a terminal status event
+    if event_type == "status" and isinstance(data, dict):
+        status = data.get("status")
+        if status in _TERMINAL_STATUSES:
+            # Schedule cleanup after a short delay (allow SSE clients to receive final events)
+            asyncio.create_task(_delayed_cleanup(task_id))
+
+
+async def _delayed_cleanup(task_id: str, delay: float = 10.0):
+    """Clean up event queue after a delay (let clients receive final events)."""
+    await asyncio.sleep(delay)
+    cleanup_task_events(task_id)
 
 
 async def event_stream(task_id: str):
     """Async generator yielding SSE events for a task."""
-    queue = _event_queues[task_id]
+    queue = _get_or_create_queue(task_id)
     while True:
         try:
             event = await asyncio.wait_for(queue.get(), timeout=30)
