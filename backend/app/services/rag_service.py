@@ -124,8 +124,8 @@ def ensure_paper_embedding(paper_id: str, title: str, abstract: str, chunks: lis
         existing = collection.get(ids=[paper_id])
         if existing["ids"]:
             return  # Already has paper-level embedding
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("ChromaDB check for paper %s failed: %s", paper_id[:8], e)
 
     model = get_embedding_model()
 
@@ -489,8 +489,8 @@ def _load_pdf_from_cache(paper_id: str) -> bytes | None:
         if os.path.exists(cache_path):
             with open(cache_path, "rb") as f:
                 return f.read()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("PDF cache load failed for %s: %s", paper_id[:8], e)
     return None
 
 
@@ -591,8 +591,8 @@ async def _pymupdf_page_to_stream(doc, page, paper_id: str, paper_dir: str, page
                     "bbox": (rect.x0, rect.y0, rect.x1, rect.y1),
                     "xref": xref,
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Image rect extraction failed on page %d: %s", page_num, e)
 
     # 3. Detect vector graphics clusters (architecture diagrams)
     drawings = page.get_drawings()
@@ -880,8 +880,8 @@ def embed_and_store_chunks(paper_id: str, chunks: list[ParsedChunk]) -> None:
         existing = collection.get(where={"paper_id": paper_id})
         if existing["ids"]:
             collection.delete(ids=existing["ids"])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("ChromaDB delete for paper %s failed: %s", paper_id[:8], e)
 
     texts = [c.text for c in chunks]
     embeddings = model.encode(texts, show_progress_bar=False, batch_size=32)
@@ -974,7 +974,8 @@ def _chroma_has_paper(paper_id: str) -> bool:
         collection = get_chroma_collection()
         result = collection.get(where={"paper_id": paper_id})
         return bool(result["ids"])
-    except Exception:
+    except Exception as e:
+        logger.debug("ChromaDB has_paper check failed for %s: %s", paper_id[:8], e)
         return False
 
 

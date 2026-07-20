@@ -34,16 +34,15 @@ async def build_paper_clusters(db, state: ResearchState, llm, task_id: str):
         logger.warning("Task %s: wiki cluster retrieval failed, falling back to LLM: %s", task_id[:8], e)
 
     # === Fallback: LLM-based clustering ===
-    all_tps = db.query(TaskPaper).filter(
+    from sqlalchemy.orm import joinedload
+    all_tps = db.query(TaskPaper).options(
+        joinedload(TaskPaper.paper)
+    ).filter(
         TaskPaper.task_id == task_id,
         TaskPaper.priority.in_(["high", "medium"]),
     ).order_by(TaskPaper.final_score.desc().nullslast()).limit(80).all()
 
-    all_papers = []
-    for tp in all_tps:
-        p = db.query(Paper).filter(Paper.id == tp.paper_id).first()
-        if p:
-            all_papers.append((p, tp))
+    all_papers = [(tp.paper, tp) for tp in all_tps if tp.paper]
 
     if len(all_papers) < 5:
         logger.info("Task %s: too few papers (%d) for clustering, skipping", task_id[:8], len(all_papers))

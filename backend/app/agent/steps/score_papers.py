@@ -112,8 +112,14 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
 
     logger.info("Scored %d/%d papers in round %d", len(scored), len(paper_map), round_num)
 
+    # Record LLM token usage
+    total_tokens = 0
+    if hasattr(llm, "get_last_usage") and llm.get_last_usage():
+        total_tokens = llm.get_last_usage().get("total_tokens", 0)
+
     paper_repo.save_trace(db, state.task_id, "score_papers", "action",
                           round_number=round_num,
-                          output_data={"scored_count": len(scored)})
+                          output_data={"scored_count": len(scored)},
+                          tokens=total_tokens)
     db.commit()
     return scored

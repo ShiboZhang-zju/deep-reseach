@@ -19,15 +19,20 @@ export function PapersView({ taskId }: Props) {
   const [loading, setLoading] = useState(true);
   const [priority, setPriority] = useState('');
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [visibleCount, setVisibleCount] = useState(50);  // incremental rendering
 
   useEffect(() => {
     setLoading(true);
+    setVisibleCount(50);  // reset on filter change
     api
       .getPapers(taskId, priority || undefined, 200, 0)
       .then(setPapers)
       .catch(() => setPapers([]))
       .finally(() => setLoading(false));
   }, [taskId, priority]);
+
+  const visiblePapers = papers.slice(0, visibleCount);
+  const hasMore = visibleCount < papers.length;
 
   const parseAuthors = (json: string | null): string[] => {
     if (!json) return [];
@@ -41,7 +46,7 @@ export function PapersView({ taskId }: Props) {
   const scoreColor = (score: number | null): string => {
     if (score === null) return 'text-gray-400';
     if (score >= 0.75) return 'text-green-600 font-semibold';
-    if (score >= 0.55) return 'text-amber-600 font-semibold';
+    if (score >= 0.5) return 'text-amber-600 font-semibold';
     return 'text-red-500';
   };
 
@@ -80,7 +85,7 @@ export function PapersView({ taskId }: Props) {
         <div className="text-center py-12 text-gray-400">暂无论文数据</div>
       ) : (
         <div className="space-y-2">
-          {papers.map((paper) => (
+          {visiblePapers.map((paper) => (
             <div
               key={paper.id}
               className="bg-white rounded-lg border border-gray-200 overflow-hidden"
@@ -150,6 +155,16 @@ export function PapersView({ taskId }: Props) {
               )}
             </div>
           ))}
+          {hasMore && (
+            <div className="text-center py-4">
+              <button
+                onClick={() => setVisibleCount((c) => c + 50)}
+                className="px-4 py-2 text-sm text-blue-600 border border-blue-300 rounded-lg hover:bg-blue-50"
+              >
+                加载更多（剩余 {papers.length - visibleCount} 篇）
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

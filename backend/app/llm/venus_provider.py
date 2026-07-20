@@ -16,6 +16,7 @@ class VenusProvider(LLMProvider):
     """Calls the Venus LLM Proxy which is OpenAI-API compatible."""
 
     def __init__(self):
+        super().__init__()
         self.base_url = settings.venus_llm_proxy_url
         token = settings.env_venus_openapi_secret_id
         self.token = f"{token}@4083" if token else ""
@@ -88,4 +89,9 @@ class VenusProvider(LLMProvider):
             if resp.status_code != 200:
                 logger.error("Venus LLM error %d: %s", resp.status_code, resp.text[:500])
                 raise RuntimeError(f"LLM call failed: {resp.status_code} - {resp.text[:200]}")
-            return resp.json()
+            data = resp.json()
+            # Record token usage for cost tracking
+            usage = data.get("usage")
+            if usage:
+                self.last_usage = usage
+            return data

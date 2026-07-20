@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections import OrderedDict
 
 from app.paper_sources.base import PaperSource, RawPaper
 from app.paper_sources.semantic_scholar import SemanticScholarSource
@@ -15,15 +16,41 @@ from app.paper_sources.core import CoreSource
 
 logger = logging.getLogger(__name__)
 
-# Simple in-memory cache: (source_name, query_hash) -> (papers, timestamp)
-_cache: dict[str, tuple[list[RawPaper], float]] = {}
+# Bounded LRU cache: (source_name, query_hash) -> (papers, timestamp)
+# Uses OrderedDict to implement LRU eviction with max size.
+_CACHE_MAX_SIZE = 1000
 _CACHE_TTL = 3600  # 1 hour
+_cache: OrderedDict[str, tuple[list[RawPaper], float]] = OrderedDict()
 
 
 def _cache_key(source_name: str, query: str, limit: int) -> str:
     """Generate cache key for a search query."""
     qhash = hashlib.md5(f"{source_name}:{query}:{limit}".encode()).hexdigest()
     return f"{source_name}:{qhash}"
+
+
+def _cache_get(key: str) -> tuple[list[RawPaper], float] | None:
+    """Get from cache, evicting expired entries. Moves accessed entry to end (most recent)."""
+    entry = _cache.get(key)
+    if entry is None:
+        return None
+    papers, ts = entry
+    if (time.time() - ts) >= _CACHE_TTL:
+        # Expired — remove and return miss
+        _cache.pop(key, None)
+        return None
+    # Move to end (mark as recently used)
+    _cache.move_to_end(key)
+    return entry
+
+
+def _cache_put(key: str, papers: list[RawPaper]):
+    """Insert into cache, evicting oldest if over capacity."""
+    _cache[key] = (papers, time.time())
+    _cache.move_to_end(key)
+    # Evict oldest entries while over capacity
+    while len(_cache) > _CACHE_MAX_SIZE:
+        _cache.popitem(last=False)  # FIFO eviction (oldest first)
 
 
 class SearchService:
@@ -43,12 +70,12 @@ class SearchService:
         """Search all sources concurrently for a single query."""
         async def _search_with_cache(src: PaperSource) -> list[RawPaper]:
             key = _cache_key(src.name, query, limit)
-            cached = _cache.get(key)
-            if cached and (time.time() - cached[1]) < _CACHE_TTL:
+            cached = _cache_get(key)
+            if cached:
                 logger.debug("Cache hit for %s query '%s'", src.name, query[:30])
                 return cached[0]
             result = await src.search(query, limit)
-            _cache[key] = (result, time.time())
+            _cache_put(key, result)
             return result
 
         tasks = [_search_with_cache(src) for src in self.sources]

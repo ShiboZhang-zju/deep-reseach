@@ -16,6 +16,7 @@ class OpenAIProvider(LLMProvider):
     """Direct OpenAI API provider."""
 
     def __init__(self):
+        super().__init__()
         self.base_url = settings.openai_base_url
         self.api_key = settings.openai_api_key
         self.model = settings.openai_model
@@ -71,4 +72,8 @@ class OpenAIProvider(LLMProvider):
             )
             if resp.status_code != 200:
                 raise RuntimeError(f"OpenAI call failed: {resp.status_code} - {resp.text[:200]}")
-            return resp.json()
+            data = resp.json()
+            usage = data.get("usage")
+            if usage:
+                self.last_usage = usage
+            return data

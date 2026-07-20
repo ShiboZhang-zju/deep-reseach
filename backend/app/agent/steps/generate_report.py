@@ -105,10 +105,15 @@ async def generate_report(db, state: ResearchState, llm, cluster_list=None) -> s
     _check_placeholders(report_text, state.task_id)
 
     paper_repo.save_report(db, state.task_id, report_text)
+    # Record LLM token usage
+    total_tokens = 0
+    if hasattr(llm, "get_last_usage") and llm.get_last_usage():
+        total_tokens = llm.get_last_usage().get("total_tokens", 0)
     paper_repo.save_trace(db, state.task_id, "generate_report", "action",
                           output_data={"length": len(report_text),
                                        "method": "two_step" if outline else "one_shot",
-                                       "sections": len(outline.sections) if outline else 0})
+                                       "sections": len(outline.sections) if outline else 0},
+                          tokens=total_tokens)
     db.commit()
     emit_event(state.task_id, "report_ready", {"length": len(report_text)})
     return report_text
@@ -177,8 +182,8 @@ async def _fill_sections(db, state, llm, outline, all_papers, paper_by_index, wi
                             f"{_fig_pat.sub('', r['text'])[:400].strip()}"
                             for r in section_rag_results[:15]
                         )
-            except Exception:
-                pass  # Non-fatal, use global evidence
+            except Exception as e:
+                logger.debug("Section RAG retrieval failed (non-fatal): %s", e)
 
             try:
                 content = await llm.chat([

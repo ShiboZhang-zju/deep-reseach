@@ -58,17 +58,16 @@ async def generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
     if cluster_list is None:
         cluster_list = await build_paper_clusters(db, state, llm, task_id)
 
-    # Get high + medium priority papers for idea generation
-    all_tps = db.query(TaskPaper).filter(
+    # Get high + medium priority papers for idea generation (eager load to avoid N+1)
+    from sqlalchemy.orm import joinedload
+    all_tps = db.query(TaskPaper).options(
+        joinedload(TaskPaper.paper)
+    ).filter(
         TaskPaper.task_id == task_id,
         TaskPaper.priority.in_(["high", "medium"]),
     ).order_by(TaskPaper.final_score.desc().nullslast()).limit(50).all()
 
-    high_papers = []
-    for tp in all_tps:
-        p = db.query(Paper).filter(Paper.id == tp.paper_id).first()
-        if p:
-            high_papers.append((p, tp))
+    high_papers = [(tp.paper, tp) for tp in all_tps if tp.paper]
 
     valid_paper_ids = {p.id for p, _ in high_papers}
     high_papers_text = "\n".join(
@@ -559,13 +558,15 @@ async def _post_enrichment_baseline_check(db, llm, state, task_id, idx, item,
 async def _check_novelty(db, state, llm, item, enriched_method, task_id) -> float:
     """Novelty check — search for similar existing work."""
     novelty_penalty = 0.0
+    search_succeeded = False
     try:
         novelty_query = f"{item.title} {item.description[:100]}"
         existing_papers = await search_service.search_all_sources(novelty_query, limit=5)
+        search_succeeded = True  # search returned (even if empty)
         existing_text = "\n".join(
             f"- {p.title}: {(p.abstract or '')[:150]}"
             for p in existing_papers[:5]
-        ) or "(none found)"
+        ) or "(no similar papers found)"
 
         novelty_result = await llm.chat_json([
             {"role": "system", "content": NOVELTY_CHECK_SYSTEM},
@@ -585,6 +586,13 @@ async def _check_novelty(db, state, llm, item, enriched_method, task_id) -> floa
             logger.info("Idea '%s' novelty check: NOVEL", item.title[:40])
     except Exception as e:
         logger.warning("Novelty check failed for idea '%s': %s", item.title[:40], e)
+
+    # If search service was unavailable (rate limited / network error),
+    # do NOT trust a "novel" verdict — apply a conservative penalty instead.
+    if not search_succeeded:
+        novelty_penalty = 0.05  # small penalty: can't verify novelty, don't reward
+        logger.warning("Idea '%s': novelty search unavailable, applied conservative penalty",
+                       item.title[:40])
     return novelty_penalty
 
 

@@ -50,6 +50,15 @@ export function TaskDetail({ taskId, onBack }: Props) {
 
   const { events, connected, clarificationQuestions, clearClarification } = useTaskEvents(taskId);
 
+  // Reload task when SSE pushes a status event (reduces reliance on polling)
+  const lastStatusEvent = events.filter(e => e.event === 'status').pop();
+  useEffect(() => {
+    if (lastStatusEvent) {
+      loadTask();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastStatusEvent?.timestamp]);
+
   // Recover clarification questions from state_json if SSE missed them
   const [recoveredQuestions, setRecoveredQuestions] = useState<string[] | null>(null);
   const [clarifySubmitted, setClarifySubmitted] = useState(false);
@@ -89,11 +98,12 @@ export function TaskDetail({ taskId, onBack }: Props) {
     loadTask();
   }, [loadTask]);
 
-  // Poll while running
+  // Poll while running (fallback for SSE disconnection; SSE is primary)
   useEffect(() => {
     if (!task) return;
     if (!RUNNING_STATUSES.includes(task.status)) return;
-    const interval = setInterval(loadTask, 3000);
+    // 10s polling as SSE fallback (SSE pushes status events in real-time)
+    const interval = setInterval(loadTask, 10000);
     return () => clearInterval(interval);
   }, [task, loadTask]);
 

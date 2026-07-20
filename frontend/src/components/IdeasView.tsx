@@ -63,8 +63,8 @@ export function IdeasView({ taskId, status }: Props) {
 
   const scoreColor = (score: number | null): string => {
     if (score === null) return 'text-gray-400';
-    if (score >= 0.75) return 'text-green-600';
-    if (score >= 0.55) return 'text-amber-600';
+    if (score >= 0.70) return 'text-green-600';
+    if (score >= 0.50) return 'text-amber-600';
     return 'text-red-500';
   };
 

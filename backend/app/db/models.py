@@ -10,11 +10,12 @@ from app.db.session import Base
 
 
 def _utcnow() -> datetime:
-    """Return current time in UTC. SQLite strips tzinfo on storage,
-    so we return naive UTC to keep storage consistent.
-    API layer re-appends +00:00 via isoformat_utc().
+    """Return current time as naive UTC (SQLite strips tzinfo on storage).
+
+    Uses datetime.now(timezone.utc).replace(tzinfo=None) instead of the
+    deprecated datetime.utcnow() (removed in Python 3.12+).
     """
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def isoformat_utc(dt: datetime | None) -> str:
