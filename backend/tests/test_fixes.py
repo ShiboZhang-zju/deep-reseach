@@ -148,7 +148,9 @@ def test_recover_calibrates_current_round_upward():
 
     # Patch SessionLocal where runner imports it (app.agent.runner.SessionLocal)
     with patch("app.agent.runner.SessionLocal", return_value=db), \
-         patch("app.agent.runner.logger"):
+         patch("app.agent.runner.logger"), \
+         patch("app.agent.runner.phase_repo") as mock_phase_repo:
+        mock_phase_repo.mark_interrupted_phases.return_value = 0
         recover_interrupted_tasks()
 
     # state_json should have been updated with current_round=2
@@ -176,7 +178,9 @@ def test_recover_calibrates_current_round_downward():
     db.query.side_effect = [task_query, round_query]
 
     with patch("app.agent.runner.SessionLocal", return_value=db), \
-         patch("app.agent.runner.logger"):
+         patch("app.agent.runner.logger"), \
+         patch("app.agent.runner.phase_repo") as mock_phase_repo:
+        mock_phase_repo.mark_interrupted_phases.return_value = 0
         recover_interrupted_tasks()
 
     updated_state = ResearchState.from_json(task.state_json)
@@ -202,7 +206,9 @@ def test_recover_no_rounds_resets_to_zero():
     db.query.side_effect = [task_query, round_query]
 
     with patch("app.agent.runner.SessionLocal", return_value=db), \
-         patch("app.agent.runner.logger"):
+         patch("app.agent.runner.logger"), \
+         patch("app.agent.runner.phase_repo") as mock_phase_repo:
+        mock_phase_repo.mark_interrupted_phases.return_value = 0
         recover_interrupted_tasks()
 
     updated_state = ResearchState.from_json(task.state_json)

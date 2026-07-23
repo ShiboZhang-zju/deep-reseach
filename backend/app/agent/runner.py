@@ -14,10 +14,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 
 from app.config import settings
 from app.db.session import SessionLocal
 from app.db.repositories import task_repo, paper_repo
+from app.db.repositories import phase_repo
+from app.services import phase_service
 from app.agent.state import ResearchState
 from app.agent.policy import should_stop, early_termination_check
 from app.agent.steps import (
@@ -32,10 +35,23 @@ from app.agent.steps import (
     generate_experiments,
     build_research_contract,
     decompose_research_space,
+    extract_evidence_units,
+    update_coverage_matrix,
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.llm.factory import get_llm
 from app.services.event_service import emit_event, emit_event_with_cleanup
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SearchLoopResult:
+    """Result of the search loop — determines if downstream can proceed."""
+    status: str  # completed / stopped_normally / failed / more_research_required
+    reason: str
+    completed_rounds: int
+    failed_attempts: int
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +74,22 @@ def _get_agent_semaphore() -> asyncio.Semaphore:
 # Statuses that indicate a task was interrupted (process crash / restart)
 _INTERRUPTED_STATUSES = {
     "clarifying",
+    "building_contract",
+    "decomposing",
     "searching",
     "summarizing",
+    "analyzing_papers",
+    "building_wiki",
+    "building_clusters",
     "reporting",
     "generating_ideas",
     "judging_ideas",
     "generating_experiment",
+    # Phase 1.5: New phases
+    "mining_gaps",
+    "auditing_gaps",
+    "checking_feasibility",
+    "synthesizing_ideas",
 }
 
 
@@ -172,20 +198,7 @@ def stop_agent(task_id: str):
 def recover_interrupted_tasks():
     """On startup, recover tasks with interrupted statuses (P0-2: smart resume).
 
-    Instead of marking all interrupted tasks as 'failed', we now:
-    - searching/summarizing → reset to 'pending' so user can restart from current_round
-    - clarifying/waiting_for_clarification → reset to 'pending' (re-clarify)
-    - reporting/generating_ideas/judging_ideas/generating_experiment → reset to 'pending'
-      so runner can resume from the RAG/Wiki phase (already-collected papers preserved)
-
-    State is preserved in state_json + research_rounds + papers, so a restart
-    will skip already-completed rounds via should_stop() checks.
-
-    P1-10: Calibrate state.current_round against research_rounds table to prevent
-    inconsistency — e.g., if state_json says current_round=5 but only 2 rounds
-    were actually saved to research_rounds, a restart would immediately hit
-    max_rounds and stop without doing any work. We sync state.current_round to
-    the actual max(round_number) from research_rounds.
+    Phase 1.5: Also marks any running PhaseRun records as interrupted.
     """
     db = SessionLocal()
     try:
@@ -199,12 +212,10 @@ def recover_interrupted_tasks():
             task.status = "pending"
             task.stop_reason = "interrupted_by_restart"
 
-            # Calibrate state.current_round against actually-completed rounds.
-            # research_rounds table is the source of truth for what was persisted;
-            # state_json.current_round may be ahead (incremented but round failed
-            # before save_round committed) or behind (rare, but possible if
-            # state save failed). Sync to max(round_number) to ensure should_stop
-            # doesn't prematurely trigger max_rounds on resume.
+            # Phase 1.5: Mark any running PhaseRuns as interrupted
+            phase_repo.mark_interrupted_phases(db, task.id)
+
+            # Calibrate state.current_round
             if task.state_json:
                 try:
                     state = ResearchState.from_json(task.state_json)
@@ -262,35 +273,81 @@ async def run_task(task_id: str):
             if not state.normalized_topic:
                 return  # waiting for user clarification
 
-        # === 2. Build Research Contract (Phase 1) ===
-        # After clarification, compile user input into a structured contract
+        # === 2. Build Research Contract (Phase 1, with PhaseRun) ===
         logger.info("Task %s: building research contract...", task_id[:8])
         task_repo.update_status(db, task_id, "building_contract")
         db.commit()
         emit_event(task_id, "status", {"status": "building_contract"})
         try:
-            contract = await build_research_contract(db, state, llm, task_id)
-            # Reload state after contract update
+            async def _build_contract_op(db):
+                return await build_research_contract(db, state, llm, task_id)
+            await phase_service.execute_phase(db, task_id, "build_contract", _build_contract_op,
+                                               input_version=state.user_input[:200])
             state = task_repo.get_state(db, task_id)
         except Exception as e:
             logger.warning("Task %s: contract building failed (non-fatal, using fallback): %s",
                           task_id[:8], e)
-            # Fallback: use normalized_topic as-is (old behavior)
 
-        # === 2b. Decompose Research Space (Phase 1) ===
+        # === 2b. Decompose Research Space (Phase 1, with PhaseRun) ===
         logger.info("Task %s: decomposing research space...", task_id[:8])
         task_repo.update_status(db, task_id, "decomposing")
         db.commit()
         emit_event(task_id, "status", {"status": "decomposing"})
         try:
-            questions = await decompose_research_space(db, state, llm, task_id)
-            logger.info("Task %s: decomposed into %d research questions", task_id[:8], len(questions))
+            async def _decompose_op(db):
+                return await decompose_research_space(db, state, llm, task_id)
+            await phase_service.execute_phase(db, task_id, "decompose", _decompose_op,
+                                              input_version=state.contract_id or "")
+            state = task_repo.get_state(db, task_id)
         except Exception as e:
             logger.warning("Task %s: decomposition failed (non-fatal, continuing): %s",
                           task_id[:8], e)
 
         # === 3. Search loop ===
-        await _run_search_loop(db, state, llm, task_id)
+        search_result = await _run_search_loop(db, state, llm, task_id)
+
+        # Phase 1.5: Check search result before proceeding
+        if search_result.status == "failed":
+            logger.error("Task %s: search loop failed (%s), stopping", task_id[:8], search_result.reason)
+            task_repo.update_status(db, task_id, "failed")
+            task_repo.update_stop_reason(db, task_id, search_result.reason)
+            emit_event(task_id, "error", {"message": f"Search failed: {search_result.reason}"})
+            db.commit()
+            return
+
+        if search_result.status == "more_research_required":
+            logger.warning("Task %s: search needs more research (%s)", task_id[:8], search_result.reason)
+            task_repo.update_status(db, task_id, "more_research_required")
+            task_repo.update_stop_reason(db, task_id, search_result.reason)
+            emit_event(task_id, "status", {"status": "more_research_required", "reason": search_result.reason})
+            db.commit()
+            return
+
+        # Only completed or stopped_normally can proceed
+        logger.info("Task %s: search completed (%s, %d rounds), proceeding to analysis",
+                    task_id[:8], search_result.status, search_result.completed_rounds)
+
+        # Close main session before long-running phases
+        db.close()
+        db = SessionLocal()
+        state = task_repo.get_state(db, task_id)
+
+        # === 3b. Extract Evidence Units (Phase 2) ===
+        logger.info("Task %s: extracting evidence units...", task_id[:8])
+        task_repo.update_status(db, task_id, "extracting_evidence")
+        db.commit()
+        emit_event(task_id, "status", {"status": "extracting_evidence"})
+        try:
+            await extract_evidence_units(db, state, llm, task_id)
+        except Exception as e:
+            logger.warning("Task %s: evidence extraction failed (non-fatal): %s", task_id[:8], e)
+
+        # === 3c. Update Coverage Matrix (Phase 2) ===
+        logger.info("Task %s: updating coverage matrix...", task_id[:8])
+        try:
+            await update_coverage_matrix(db, state, llm, task_id)
+        except Exception as e:
+            logger.warning("Task %s: coverage update failed (non-fatal): %s", task_id[:8], e)
 
         # Close main session before long-running RAG/Wiki phases
         # (they don't need 'state' and can take 5-10 minutes each)
@@ -405,23 +462,24 @@ async def _run_clarification_phase(db, state: ResearchState, llm, task_id: str):
     db.commit()
 
 
-async def _run_search_loop(db, state: ResearchState, llm, task_id: str):
+async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> SearchLoopResult:
     """Phase 2: Multi-round search loop.
-    
-    Phase 0 fix: Added max_attempts_per_round and total_failed_round_budget
-    to prevent infinite retries on persistent errors.
+
+    Phase 1.5: Returns SearchLoopResult so run_task can check if downstream
+    should proceed. Also properly uses per-round attempt limits.
     """
     task_repo.update_status(db, task_id, "searching")
     db.commit()
     emit_event(task_id, "status", {"status": "searching", "topic": state.normalized_topic})
 
     no_new_high_priority_count = 0
-    # Phase 0: retry safety limits
-    MAX_ATTEMPTS_PER_ROUND = 3  # max retries within a single round
-    TOTAL_FAILED_ROUND_BUDGET = 5  # max total failed rounds across the whole task
+    # Phase 1.5: Per-round retry limits
+    MAX_ATTEMPTS_PER_ROUND = 3
+    TOTAL_FAILED_ROUND_BUDGET = 5
     total_failed_rounds = 0
     last_error_signature = None
     identical_error_streak = 0
+    completed_rounds = 0
 
     while True:
         stop, reason = should_stop(state)
@@ -431,111 +489,139 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str):
             db.commit()
             emit_event(task_id, "stopping", {"reason": reason})
             logger.info("Stopping search: %s", reason)
-            break
+            return SearchLoopResult(status="stopped_normally", reason=reason,
+                                    completed_rounds=completed_rounds, failed_attempts=total_failed_rounds)
 
         state.current_round += 1
         round_num = state.current_round
         logger.info("=== Task %s: Round %d ===", task_id[:8], round_num)
         emit_event(task_id, "round_start", {"round": round_num})
 
-        try:
-            # Generate queries
-            queries = await generate_queries(db, state, llm)
-            state.used_queries.extend(queries)
-            emit_event(task_id, "queries_generated", {"round": round_num, "queries": queries})
+        round_attempts = 0
+        round_succeeded = False
 
-            # Search + dedup + save
-            papers_found, deduped_count, new_paper_ids = await search_and_save_papers(
-                db, state, queries, task_id, round_num
-            )
+        while round_attempts < MAX_ATTEMPTS_PER_ROUND:
+            round_attempts += 1
+            try:
+                # Generate queries
+                queries = await generate_queries(db, state, llm)
+                state.used_queries.extend(queries)
+                emit_event(task_id, "queries_generated", {"round": round_num, "queries": queries})
 
-            # Score papers
-            high_priority_before = len(state.high_priority_paper_ids)
-            scored_papers = await score_papers(db, state, llm, task_id, round_num)
+                # Search + dedup + save
+                papers_found, deduped_count, new_paper_ids = await search_and_save_papers(
+                    db, state, queries, task_id, round_num
+                )
 
-            # Count new high-priority
-            new_high = len(state.high_priority_paper_ids) - high_priority_before
-            logger.info("Round %d: %d high-priority (%d new), total high=%d",
-                        round_num, new_high, new_high, len(state.high_priority_paper_ids))
-            if new_high == 0:
-                no_new_high_priority_count += 1
-            else:
-                no_new_high_priority_count = 0
+                # Score papers
+                high_priority_before = len(state.high_priority_paper_ids)
+                scored_papers = await score_papers(db, state, llm, task_id, round_num)
 
-            # Round summary
-            task_repo.update_status(db, task_id, "summarizing")
-            db.commit()
-            round_summary, gaps = await summarize_round(db, state, llm, round_num, scored_papers)
-            state.knowledge_gaps = gaps
-            state.round_summaries.append(round_summary)
+                new_high = len(state.high_priority_paper_ids) - high_priority_before
+                logger.info("Round %d: %d high-priority (%d new), total high=%d",
+                            round_num, new_high, new_high, len(state.high_priority_paper_ids))
+                if new_high == 0:
+                    no_new_high_priority_count += 1
+                else:
+                    no_new_high_priority_count = 0
 
-            duplicate_rate = 1.0 - (len(new_paper_ids) / max(papers_found, 1))
+                # Round summary
+                task_repo.update_status(db, task_id, "summarizing")
+                db.commit()
+                round_summary, gaps = await summarize_round(db, state, llm, round_num, scored_papers)
+                state.knowledge_gaps = gaps
+                state.round_summaries.append(round_summary)
 
-            # Save round record
-            paper_repo.save_round(
-                db, task_id, round_num, queries,
-                papers_found, len(new_paper_ids), duplicate_rate,
-                round_summary, gaps
-            )
+                duplicate_rate = 1.0 - (len(new_paper_ids) / max(papers_found, 1))
 
-            # Check early termination (Phase 0: moved to policy.py)
-            et_stop, et_reason = early_termination_check(state, no_new_high_priority_count, duplicate_rate)
-            if et_stop:
-                state.stop_reason = et_reason
+                paper_repo.save_round(
+                    db, task_id, round_num, queries,
+                    papers_found, len(new_paper_ids), duplicate_rate,
+                    round_summary, gaps
+                )
+
+                # Check early termination
+                et_stop, et_reason = early_termination_check(state, no_new_high_priority_count, duplicate_rate)
+                if et_stop:
+                    state.stop_reason = et_reason
+                    task_repo.save_state(db, task_id, state)
+                    db.commit()
+                    emit_event(task_id, "stopping", {"reason": et_reason})
+                    logger.info("Early stop: %s", et_reason)
+                    return SearchLoopResult(status="stopped_normally", reason=et_reason,
+                                            completed_rounds=completed_rounds + 1,
+                                            failed_attempts=total_failed_rounds)
+
                 task_repo.save_state(db, task_id, state)
                 db.commit()
-                emit_event(task_id, "stopping", {"reason": et_reason})
-                logger.info("Early stop: %s", et_reason)
-                break
+                emit_event(task_id, "round_done", {"round": round_num, "new_papers": len(new_paper_ids)})
+                logger.info("Round %d complete. Total papers: %d, high-priority: %d",
+                            round_num, len(state.collected_paper_ids), len(state.high_priority_paper_ids))
 
+                round_succeeded = True
+                completed_rounds += 1
+                break  # exit retry loop
+
+            except Exception as round_err:
+                logger.error("Task %s: Round %d attempt %d failed: %s",
+                             task_id[:8], round_num, round_attempts, round_err)
+                db.rollback()
+                # Reload state from DB (don't keep in-memory mutations from failed attempt)
+                state = task_repo.get_state(db, task_id)
+
+                error_sig = str(round_err)[:200]
+                if error_sig == last_error_signature:
+                    identical_error_streak += 1
+                else:
+                    identical_error_streak = 1
+                    last_error_signature = error_sig
+
+                total_failed_rounds += 1
+
+                # Same error 3 times in a row → immediate stop
+                if identical_error_streak >= 3:
+                    logger.error("Task %s: same error %d times, stopping", task_id[:8], identical_error_streak)
+                    reason = f"identical_error_streak ({error_sig[:100]})"
+                    state.stop_reason = reason
+                    task_repo.save_state(db, task_id, state)
+                    db.commit()
+                    emit_event(task_id, "stopping", {"reason": reason})
+                    return SearchLoopResult(status="failed", reason=reason,
+                                            completed_rounds=completed_rounds,
+                                            failed_attempts=total_failed_rounds)
+
+                # Total failed budget exceeded
+                if total_failed_rounds >= TOTAL_FAILED_ROUND_BUDGET:
+                    logger.error("Task %s: total failed rounds (%d) reached budget", task_id[:8], total_failed_rounds)
+                    reason = f"total_failed_rounds ({total_failed_rounds})"
+                    state.stop_reason = reason
+                    task_repo.save_state(db, task_id, state)
+                    db.commit()
+                    emit_event(task_id, "stopping", {"reason": reason})
+                    return SearchLoopResult(status="failed", reason=reason,
+                                            completed_rounds=completed_rounds,
+                                            failed_attempts=total_failed_rounds)
+
+                if round_attempts < MAX_ATTEMPTS_PER_ROUND:
+                    await asyncio.sleep(5)
+
+        if not round_succeeded:
+            # Round failed all attempts
+            logger.error("Task %s: Round %d failed after %d attempts", task_id[:8], round_num, round_attempts)
+            # Don't increment round_num — retry next loop iteration will re-increment
+            state.current_round -= 1
             task_repo.save_state(db, task_id, state)
             db.commit()
-            emit_event(task_id, "round_done", {"round": round_num, "new_papers": len(new_paper_ids)})
-            logger.info("Round %d complete. Total papers: %d, high-priority: %d",
-                        round_num, len(state.collected_paper_ids), len(state.high_priority_paper_ids))
 
-        except Exception as round_err:
-            # Single round failure should NOT terminate the entire task.
-            # Roll back uncommitted changes, log, and continue to next round.
-            logger.error("Task %s: Round %d failed: %s — continuing to next round",
-                         task_id[:8], round_num, round_err, exc_info=True)
-            db.rollback()
-            state.current_round -= 1  # don't consume a round on failure
-            task_repo.save_state(db, task_id, state)
-            db.commit()
-            emit_event(task_id, "round_error", {"round": round_num, "error": str(round_err)[:200]})
-
-            # Phase 0: Retry safety — detect identical errors and budget failures
-            error_sig = str(round_err)[:200]
-            if error_sig == last_error_signature:
-                identical_error_streak += 1
-            else:
-                identical_error_streak = 1
-                last_error_signature = error_sig
-
-            total_failed_rounds += 1
-
-            # If the same error happens 3 times in a row, stop immediately
-            if identical_error_streak >= 3:
-                logger.error("Task %s: same error occurred %d times, stopping search loop",
-                           task_id[:8], identical_error_streak)
-                state.stop_reason = f"identical_error_streak ({error_sig[:100]})"
-                task_repo.save_state(db, task_id, state)
-                db.commit()
-                emit_event(task_id, "stopping", {"reason": state.stop_reason})
-                break
-
-            # If total failed rounds exceed budget, stop
+            # Check if we should give up
             if total_failed_rounds >= TOTAL_FAILED_ROUND_BUDGET:
-                logger.error("Task %s: total failed rounds (%d) reached budget, stopping",
-                           task_id[:8], total_failed_rounds)
-                state.stop_reason = f"total_failed_rounds ({total_failed_rounds})"
-                task_repo.save_state(db, task_id, state)
-                db.commit()
-                emit_event(task_id, "stopping", {"reason": state.stop_reason})
-                break
+                return SearchLoopResult(status="failed", reason="failed_round_budget_exhausted",
+                                        completed_rounds=completed_rounds,
+                                        failed_attempts=total_failed_rounds)
 
-            await asyncio.sleep(5)  # cooldown before retry
+    # Should not reach here, but just in case
+    return SearchLoopResult(status="completed", reason="loop_exited",
+                            completed_rounds=completed_rounds, failed_attempts=total_failed_rounds)
 
 
 def _check_early_termination(db, task_id, state, no_new_high_count, duplicate_rate) -> bool:

@@ -455,6 +455,12 @@ class ResearchContract(Base):
     status = Column(Text, default="active")
     confidence = Column(Float, default=0.5)
 
+    # Phase 1.5: Versioning
+    version = Column(Integer, nullable=False, default=1)
+    input_hash = Column(Text, nullable=False, default="")
+    superseded_at = Column(DateTime)
+    source_feedback_ids_json = Column(Text, default="[]")
+
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -482,9 +488,13 @@ class ResearchQuestion(Base):
     importance = Column(Float, default=0.5)
     searchability = Column(Float, default=0.5)
     status = Column(Text, default="open")
-    # open / partially_covered / covered / unavailable
+    # open / partially_covered / covered / unavailable / superseded
 
     axis_name = Column(Text)  # which research axis this question belongs to
+
+    # Phase 1.5: Versioning support
+    version = Column(Integer, nullable=False, default=1)
+    superseded_at = Column(DateTime)
 
     created_at = Column(DateTime, default=_utcnow)
 
@@ -492,4 +502,129 @@ class ResearchQuestion(Base):
         Index("idx_rq_task", "task_id"),
         Index("idx_rq_status", "status"),
         Index("idx_rq_task_type", "task_id", "question_type"),
+        Index("idx_rq_contract", "contract_id"),
+    )
+
+
+# === Phase 2: Evidence + Coverage ===
+
+class EvidenceUnit(Base):
+    """A single piece of evidence extracted from a paper.
+
+    Phase 2: Replaces the 'paper_analyses' summary-only approach with
+    granular, traceable evidence units that can be linked to research questions.
+    """
+    __tablename__ = "evidence_units"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
+
+    evidence_type = Column(Text, nullable=False)
+    # problem / method / result / limitation / dataset / metric /
+    # negative_result / future_work / comparison
+
+    normalized_claim = Column(Text, nullable=False)
+    original_span = Column(Text)
+    section = Column(Text)
+    page_number = Column(Integer)
+
+    conditions_json = Column(Text, default="{}")
+    dataset_name = Column(Text)
+    metric_name = Column(Text)
+    result_value = Column(Text)
+
+    extraction_method = Column(Text, default="llm")
+    # llm / abstract_only / pdf_fulltext
+    extraction_confidence = Column(Float, default=0.5)
+
+    verification_status = Column(Text, default="unverified")
+    # unverified / verified / conflicted / rejected / abstract_only
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    paper = relationship("Paper")
+
+    __table_args__ = (
+        Index("idx_eu_task", "task_id"),
+        Index("idx_eu_paper", "paper_id"),
+        Index("idx_eu_type", "evidence_type"),
+        Index("idx_eu_verification", "verification_status"),
+    )
+
+
+class QuestionEvidenceLink(Base):
+    """Links an EvidenceUnit to a ResearchQuestion with a relationship type.
+
+    Supports coverage tracking: each question accumulates supporting/contradicting evidence.
+    """
+    __tablename__ = "question_evidence_links"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    question_id = Column(String, ForeignKey("research_questions.id"), nullable=False)
+    evidence_id = Column(String, ForeignKey("evidence_units.id"), nullable=False)
+    relation_type = Column(Text, default="supports")
+    # supports / contradicts / partially_answers / background
+    relevance_score = Column(Float, default=0.5)
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_qel_question", "question_id"),
+        Index("idx_qel_evidence", "evidence_id"),
+    )
+
+
+class PaperRole(Base):
+    """Classification of a paper's role in the research context.
+
+    A paper can have multiple roles (e.g., both 'survey' and 'benchmark').
+    Replaces the single 'priority' field with multi-dimensional classification.
+    """
+    __tablename__ = "paper_roles"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
+    role = Column(Text, nullable=False)
+    # survey / seminal / direct_neighbor / benchmark / method /
+    # negative_result / limitation_evidence / application
+    confidence = Column(Float, default=0.5)
+    reason = Column(Text)
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_pr_task", "task_id"),
+        Index("idx_pr_paper", "paper_id"),
+        Index("idx_pr_role", "role"),
+    )
+
+
+class CoverageRecord(Base):
+    """Coverage of a ResearchQuestion based on accumulated EvidenceUnits.
+
+    Updated after each search round. Drives the next round's question selection.
+    """
+    __tablename__ = "coverage_records"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    question_id = Column(String, ForeignKey("research_questions.id"), nullable=False)
+
+    coverage_score = Column(Float, default=0.0)
+    confidence = Column(Float, default=0.0)
+    supporting_evidence_count = Column(Integer, default=0)
+    contradicting_evidence_count = Column(Integer, default=0)
+    direct_neighbor_count = Column(Integer, default=0)
+    unresolved_aspects_json = Column(Text, default="[]")
+    unavailable_reason = Column(Text)
+
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_cr_task", "task_id"),
+        Index("idx_cr_question", "question_id"),
+        Index("idx_cr_task_question", "task_id", "question_id", unique=True),
     )

@@ -1,21 +1,18 @@
 """Step: Decompose research space into structured questions.
 
-Phase 1: Takes a ResearchContract and produces 5-12 specific, searchable,
-answerable Research Questions organized by research axes.
-
-This replaces the old `knowledge_gaps: list[str]` approach with structured
-questions that can be tracked, covered, and used to drive targeted search.
+Phase 1.5 fixes:
+- Only reuse questions belonging to the current contract_id (not just task_id)
+- Supersede old questions when contract changes
+- Persist state.active_question_ids
 """
 
 import json
 import logging
 
 from app.agent.state import ResearchState
-from app.agent.prompts import (
-    DECOMPOSE_SYSTEM, DECOMPOSE_USER,
-)
+from app.agent.prompts import DECOMPOSE_SYSTEM, DECOMPOSE_USER
 from app.db.models import ResearchContract, ResearchQuestion
-from app.db.repositories import paper_repo
+from app.db.repositories import paper_repo, task_repo
 from app.schemas.schemas import ResearchDecompositionSchema
 
 logger = logging.getLogger(__name__)
@@ -24,35 +21,31 @@ logger = logging.getLogger(__name__)
 async def decompose_research_space(db, state: ResearchState, llm, task_id: str) -> list[ResearchQuestion]:
     """Decompose the research contract into structured research questions.
 
-    Produces 5-12 questions organized by research axes:
-    - problem axis: what problems exist?
-    - method axis: what methods are used?
-    - evaluation axis: how are methods evaluated?
-    - dataset axis: what datasets are available?
-    - resource axis: what resources are needed?
-    - failure axis: what failure modes exist?
-    - application axis: what applications exist?
+    Phase 1.5: Only reuses questions from the current active contract.
     """
-    # Get the contract
-    contract = db.query(ResearchContract).filter(
-        ResearchContract.task_id == task_id,
-        ResearchContract.status == "active",
-    ).first()
-
-    if not contract:
-        # Fallback: use normalized_topic as a minimal contract
-        logger.warning("Task %s: no contract found, using normalized_topic as fallback", task_id[:8])
+    if not state.contract_id:
+        logger.warning("Task %s: no contract_id in state, using fallback", task_id[:8])
         return await _decompose_fallback(db, state, llm, task_id)
 
-    # Check if questions already exist
+    contract = db.get(ResearchContract, state.contract_id)
+    if not contract:
+        logger.warning("Task %s: contract %s not found, using fallback", task_id[:8], state.contract_id[:8])
+        return await _decompose_fallback(db, state, llm, task_id)
+
+    # Phase 1.5: Only reuse active questions from THIS contract
     existing_qs = db.query(ResearchQuestion).filter(
         ResearchQuestion.task_id == task_id,
-    ).count()
-    if existing_qs > 0:
-        logger.info("Task %s: %d research questions already exist, skipping", task_id[:8], existing_qs)
-        return db.query(ResearchQuestion).filter(
-            ResearchQuestion.task_id == task_id,
-        ).all()
+        ResearchQuestion.contract_id == contract.id,
+        ResearchQuestion.status != "superseded",
+    ).all()
+
+    if existing_qs:
+        logger.info("Task %s: %d active questions for contract v%d, skipping",
+                    task_id[:8], len(existing_qs), contract.version)
+        state.active_question_ids = [q.id for q in existing_qs]
+        task_repo.save_state(db, task_id, state)
+        db.commit()
+        return existing_qs
 
     # Build prompt
     user_content = DECOMPOSE_USER.format(
@@ -84,25 +77,31 @@ async def decompose_research_space(db, state: ResearchState, llm, task_id: str) 
             searchability=q.searchability,
             status="open",
             axis_name=q.axis_name,
+            version=contract.version,
         )
         db.add(rq)
         saved_questions.append(rq)
 
     db.flush()
 
-    # Update state with question IDs for backward compatibility
+    # Phase 1.5: Persist active_question_ids to state
+    state.active_question_ids = [q.id for q in saved_questions]
+    # Also update deprecated research_questions for backward compat
     state.research_questions = [q.question for q in result.questions]
+    task_repo.save_state(db, task_id, state)
 
     paper_repo.save_trace(db, task_id, "decompose_research_space", "action",
                           output_data={
+                              "contract_id": contract.id,
+                              "contract_version": contract.version,
                               "question_count": len(result.questions),
                               "axes": [a.axis_name for a in result.axes],
                               "question_types": [q.question_type for q in result.questions],
                           })
     db.commit()
 
-    logger.info("Task %s: decomposed into %d research questions across %d axes",
-               task_id[:8], len(result.questions), len(result.axes))
+    logger.info("Task %s: decomposed into %d questions for contract v%d",
+               task_id[:8], len(result.questions), contract.version)
     return saved_questions
 
 
@@ -140,10 +139,48 @@ async def _decompose_fallback(db, state: ResearchState, llm, task_id: str) -> li
         saved_questions.append(rq)
 
     db.flush()
+    state.active_question_ids = [q.id for q in saved_questions]
     state.research_questions = [q.question for q in result.questions]
+    task_repo.save_state(db, task_id, state)
 
     paper_repo.save_trace(db, task_id, "decompose_research_space", "action",
                           output_data={"question_count": len(result.questions), "fallback": True})
     db.commit()
 
     return saved_questions
+
+
+def select_target_questions(db, task_id: str, limit: int = 3) -> list[ResearchQuestion]:
+    """Select research questions to target in the next search round.
+
+    Phase 1.5: Selection criteria:
+    1. status == 'open' or 'partially_covered' (not covered/unavailable/superseded)
+    2. Sort by importance × searchability (higher first)
+    3. When CoverageRecords exist, prefer low-coverage questions
+    """
+    from app.db.models import CoverageRecord
+
+    # Get active questions
+    questions = db.query(ResearchQuestion).filter(
+        ResearchQuestion.task_id == task_id,
+        ResearchQuestion.status.in_(["open", "partially_covered"]),
+    ).all()
+
+    if not questions:
+        return []
+
+    # Try to get coverage records
+    coverage_map = {}
+    for cr in db.query(CoverageRecord).filter(
+        CoverageRecord.task_id == task_id,
+    ).all():
+        coverage_map[cr.question_id] = cr
+
+    # Sort by: (1 - coverage_score) × importance × searchability
+    def score_q(q):
+        cr = coverage_map.get(q.id)
+        coverage = cr.coverage_score if cr else 0.0
+        return (1.0 - coverage) * q.importance * q.searchability
+
+    questions.sort(key=score_q, reverse=True)
+    return questions[:limit]

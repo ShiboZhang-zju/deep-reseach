@@ -1,6 +1,8 @@
 """Pydantic schemas for API request/response and LLM structured output."""
 
-from pydantic import BaseModel, Field
+from enum import Enum
+from typing import Literal
+from pydantic import BaseModel, Field, field_validator
 
 
 # === Task schemas ===
@@ -388,8 +390,10 @@ class ResearchContractSchema(BaseModel):
     topic: str = Field(..., description="研究主题（英文，用于检索）")
     target_problem: str = Field("", description="目标问题（中文）")
     target_setting: str = Field("", description="目标场景（中文）")
-    desired_output: str = Field("method", description="期望输出类型: method/system/benchmark/empirical_analysis")
-    novelty_bar: str = Field("conference", description="创新门槛: course_project/master_thesis/conference")
+    desired_output: Literal["method", "system", "benchmark", "empirical_analysis"] = Field(
+        "method", description="期望输出类型")
+    novelty_bar: Literal["course_project", "master_thesis", "conference"] = Field(
+        "conference", description="创新门槛")
     preferred_directions: list[str] = Field(default_factory=list, description="偏好方向")
     excluded_directions: list[str] = Field(default_factory=list, description="排除方向")
     gpu_available: bool | None = None
@@ -398,6 +402,7 @@ class ResearchContractSchema(BaseModel):
     max_runtime_minutes: int | None = None
     allow_large_benchmark: bool = True
     allow_model_training: bool = True
+    experiment_preferences: dict = Field(default_factory=dict, description="实验偏好")
     key_terms: list[str] = Field(default_factory=list, description="关键术语（英文，用于检索）")
     time_scope_start: int | None = None
     time_scope_end: int | None = None
@@ -412,8 +417,9 @@ class ResearchAxisSchema(BaseModel):
 
 class ResearchQuestionSchema(BaseModel):
     """A single research question."""
-    question: str = Field(..., description="研究问题（具体、可检索、可回答）")
-    question_type: str = Field(..., description="问题类型: problem/method/evaluation/dataset/resource/failure/application")
+    question: str = Field(..., min_length=5, description="研究问题（具体、可检索、可回答）")
+    question_type: Literal["problem", "method", "evaluation", "dataset", "resource", "failure", "application"] = Field(
+        ..., description="问题类型")
     importance: float = Field(0.5, ge=0, le=1, description="重要性")
     searchability: float = Field(0.5, ge=0, le=1, description="可检索性")
     axis_name: str = Field("", description="所属研究轴")
@@ -424,9 +430,30 @@ class ResearchDecompositionSchema(BaseModel):
     axes: list[ResearchAxisSchema] = Field(default_factory=list, description="研究轴")
     questions: list[ResearchQuestionSchema] = Field(..., description="研究问题列表（5-12个）")
 
+    @field_validator("questions")
+    @classmethod
+    def validate_questions(cls, v):
+        if len(v) < 5:
+            raise ValueError(f"Must generate at least 5 questions, got {len(v)}")
+        if len(v) > 12:
+            raise ValueError(f"Must generate at most 12 questions, got {len(v)}")
+        # Check at least 3 different axes
+        axes = set(q.axis_name for q in v if q.axis_name)
+        if len(axes) < 3:
+            raise ValueError(f"Must cover at least 3 different axes, got {len(axes)}: {axes}")
+        # Check no empty questions
+        for q in v:
+            if not q.question or not q.question.strip():
+                raise ValueError("Question text must not be empty")
+        # Check no exact duplicates
+        texts = [q.question.strip().lower() for q in v]
+        if len(texts) != len(set(texts)):
+            raise ValueError("Questions must not be exact duplicates")
+        return v
+
 
 class ContractOut(BaseModel):
-    """Research contract for API response."""
+    """Research contract for API response — returns structured fields, not JSON strings."""
     id: str
     task_id: str
     topic: str
@@ -434,19 +461,22 @@ class ContractOut(BaseModel):
     target_setting: str | None = None
     desired_output: str | None = None
     novelty_bar: str | None = None
-    preferred_directions_json: str | None = None
-    excluded_directions_json: str | None = None
+    preferred_directions: list[str] = Field(default_factory=list)
+    excluded_directions: list[str] = Field(default_factory=list)
     gpu_available: bool | None = None
     max_gpu_hours: float | None = None
     max_api_budget: float | None = None
     max_runtime_minutes: int | None = None
     allow_large_benchmark: bool = True
     allow_model_training: bool = True
-    key_terms_json: str | None = None
+    key_terms: list[str] = Field(default_factory=list)
+    experiment_preferences: dict = Field(default_factory=dict)
     time_scope_start: int | None = None
     time_scope_end: int | None = None
     status: str = "active"
     confidence: float = 0.5
+    version: int = 1
+    input_hash: str | None = None
     created_at: str
     updated_at: str
 
@@ -462,4 +492,95 @@ class ResearchQuestionOut(BaseModel):
     searchability: float = 0.5
     status: str = "open"
     axis_name: str | None = None
+    version: int = 1
     created_at: str
+
+
+# === Phase 2: Evidence + Coverage schemas ===
+
+EvidenceType = Literal[
+    "problem", "method", "result", "limitation", "dataset", "metric",
+    "negative_result", "future_work", "comparison"
+]
+
+VerificationStatus = Literal[
+    "unverified", "verified", "conflicted", "rejected", "abstract_only"
+]
+
+PaperRoleType = Literal[
+    "survey", "seminal", "direct_neighbor", "benchmark", "method",
+    "negative_result", "limitation_evidence", "application"
+]
+
+RelationType = Literal[
+    "supports", "contradicts", "partially_answers", "background"
+]
+
+
+class EvidenceUnitOut(BaseModel):
+    """Evidence unit for API response."""
+    id: str
+    task_id: str
+    paper_id: str
+    evidence_type: str
+    normalized_claim: str
+    original_span: str | None = None
+    section: str | None = None
+    page_number: int | None = None
+    dataset_name: str | None = None
+    metric_name: str | None = None
+    result_value: str | None = None
+    extraction_method: str = "llm"
+    extraction_confidence: float = 0.5
+    verification_status: str = "unverified"
+    created_at: str
+
+
+class CoverageRecordOut(BaseModel):
+    """Coverage record for API response."""
+    id: str
+    task_id: str
+    question_id: str
+    coverage_score: float = 0.0
+    confidence: float = 0.0
+    supporting_evidence_count: int = 0
+    contradicting_evidence_count: int = 0
+    direct_neighbor_count: int = 0
+    unresolved_aspects: list[str] = Field(default_factory=list)
+    unavailable_reason: str | None = None
+    updated_at: str
+    created_at: str
+
+
+class PaperRoleOut(BaseModel):
+    """Paper role for API response."""
+    id: str
+    task_id: str
+    paper_id: str
+    role: str
+    confidence: float = 0.5
+    reason: str | None = None
+    created_at: str
+
+
+class EvidenceExtractionSchema(BaseModel):
+    """LLM output schema for evidence extraction from a paper chunk."""
+    evidence_type: EvidenceType
+    normalized_claim: str = Field(..., min_length=5, description="归一化的claim（中文）")
+    original_span: str = Field("", description="原文片段")
+    dataset_name: str | None = None
+    metric_name: str | None = None
+    result_value: str | None = None
+    conditions: dict = Field(default_factory=dict, description="条件信息")
+
+
+class EvidenceExtractionList(BaseModel):
+    """List of evidence units extracted from a paper chunk."""
+    evidence_units: list[EvidenceExtractionSchema] = Field(default_factory=list)
+
+
+class PaperRoleClassificationSchema(BaseModel):
+    """LLM output for paper role classification."""
+    roles: list[PaperRoleType] = Field(default_factory=list)
+    confidence: float = Field(0.5, ge=0, le=1)
+    reason: str = ""

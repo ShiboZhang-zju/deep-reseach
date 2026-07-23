@@ -83,32 +83,40 @@ def test_research_decomposition_schema():
     """ResearchDecompositionSchema can parse LLM output."""
     from app.schemas.schemas import ResearchDecompositionSchema
 
+    # Phase 1.5: Validator requires 5-12 questions across 3+ axes
     data = {
         "axes": [
             {"axis_name": "problem", "values": ["oracle generation", "bug detection"]},
             {"axis_name": "method", "values": ["GNN", "Transformer"]},
+            {"axis_name": "evaluation", "values": ["accuracy", "F1"]},
         ],
         "questions": [
-            {
-                "question": "现有GNN方法是否在固定token budget下比较？",
-                "question_type": "evaluation",
-                "importance": 0.8,
-                "searchability": 0.7,
-                "axis_name": "evaluation",
-            },
-            {
-                "question": "哪些benchmark覆盖了状态变化过程问题？",
-                "question_type": "dataset",
-                "importance": 0.6,
-                "searchability": 0.9,
-                "axis_name": "dataset",
-            },
+            {"question": "现有GNN方法是否在固定token budget下比较？", "question_type": "evaluation", "importance": 0.8, "searchability": 0.7, "axis_name": "evaluation"},
+            {"question": "哪些benchmark覆盖了状态变化过程问题？", "question_type": "dataset", "importance": 0.6, "searchability": 0.9, "axis_name": "dataset"},
+            {"question": "现有方法如何处理冲突记忆？", "question_type": "method", "importance": 0.7, "searchability": 0.8, "axis_name": "method"},
+            {"question": "哪些方法处理false-premise rejection？", "question_type": "failure", "importance": 0.5, "searchability": 0.6, "axis_name": "failure"},
+            {"question": "现有系统在什么条件下会失败？", "question_type": "problem", "importance": 0.7, "searchability": 0.5, "axis_name": "problem"},
         ],
     }
     schema = ResearchDecompositionSchema(**data)
-    assert len(schema.axes) == 2
-    assert len(schema.questions) == 2
+    assert len(schema.axes) == 3
+    assert len(schema.questions) == 5
     assert schema.questions[0].question_type == "evaluation"
+
+
+def test_research_decomposition_schema_rejects_too_few():
+    """Decomposition schema should reject < 5 questions."""
+    from app.schemas.schemas import ResearchDecompositionSchema
+    import pytest as _pytest
+
+    data = {
+        "axes": [{"axis_name": "problem", "values": []}],
+        "questions": [
+            {"question": "test question one?", "question_type": "problem", "importance": 0.5, "searchability": 0.5, "axis_name": "problem"},
+        ],
+    }
+    with _pytest.raises(Exception):
+        ResearchDecompositionSchema(**data)
 
 
 # === build_contract step ===
@@ -131,10 +139,16 @@ async def test_build_contract_creates_contract():
         preferred_directions=["GNN-based"],
         excluded_directions=[],
         key_terms=["GNN", "test oracle"],
+        experiment_preferences={},
         confidence=0.8,
     ))
 
     db = MagicMock()
+    # Simulate real task object
+    task = MagicMock()
+    task.user_input = "GNN for test oracle generation"
+    db.get.return_value = task
+
     # Simulate no existing contract
     mock_query = MagicMock()
     mock_filter = MagicMock()
@@ -142,35 +156,61 @@ async def test_build_contract_creates_contract():
     mock_query.filter.return_value = mock_filter
     db.query.return_value = mock_query
 
-    with patch("app.agent.steps.build_contract.paper_repo"):
+    # Make db.add set a fake ID on the contract
+    def fake_add(obj):
+        obj.id = "fake-contract-id"
+    db.add.side_effect = fake_add
+    db.flush = MagicMock()
+
+    with patch("app.agent.steps.build_contract.paper_repo"), \
+         patch("app.agent.steps.build_contract.task_repo") as mock_task_repo:
+        mock_task_repo.save_state = MagicMock()
+        mock_task_repo.update_normalized_topic = MagicMock()
         contract = await build_research_contract(db, state, llm, "test-task")
 
     assert contract is not None
     assert contract.topic == "graph neural networks for test oracle generation"
     assert state.normalized_topic == "graph neural networks for test oracle generation"
     assert "GNN" in state.keywords
+    assert state.contract_id is not None
 
 
 @pytest.mark.asyncio
 async def test_build_contract_skips_if_exists():
-    """build_research_contract should skip if contract already exists."""
+    """build_research_contract should skip if contract already exists with same hash."""
     from app.agent.steps.build_contract import build_research_contract
     from app.agent.state import ResearchState
 
-    state = ResearchState(task_id="test-task", user_input="test")
+    state = ResearchState(task_id="test-task", user_input="test input")
     llm = AsyncMock()
+
+    # Simulate real task
+    task = MagicMock()
+    task.user_input = "test input"
+    db = MagicMock()
+    db.get.return_value = task
+
+    # Compute the expected hash
+    from app.agent.steps.build_contract import compute_input_hash
+    expected_hash = compute_input_hash(task, state)
 
     existing_contract = MagicMock()
     existing_contract.id = "existing-id"
+    existing_contract.input_hash = expected_hash  # Match so it reuses
+    existing_contract.version = 1
+    existing_contract.topic = "test topic"
+    existing_contract.key_terms_json = '["term1"]'
 
-    db = MagicMock()
     mock_query = MagicMock()
     mock_filter = MagicMock()
     mock_filter.first.return_value = existing_contract
     mock_query.filter.return_value = mock_filter
     db.query.return_value = mock_query
 
-    contract = await build_research_contract(db, state, llm, "test-task")
+    with patch("app.agent.steps.build_contract.task_repo") as mock_task_repo:
+        mock_task_repo.save_state = MagicMock()
+        mock_task_repo.update_normalized_topic = MagicMock()
+        contract = await build_research_contract(db, state, llm, "test-task")
 
     # Should return existing contract without calling LLM
     assert contract is existing_contract
@@ -187,18 +227,20 @@ async def test_decompose_creates_questions():
     from app.schemas.schemas import ResearchDecompositionSchema, ResearchQuestionSchema, ResearchAxisSchema
     from app.db.models import ResearchContract
 
-    state = ResearchState(task_id="test-task", user_input="test")
+    state = ResearchState(task_id="test-task", user_input="test", contract_id="contract-id")
     llm = AsyncMock()
     llm.chat_json = AsyncMock(return_value=ResearchDecompositionSchema(
-        axes=[ResearchAxisSchema(axis_name="problem", values=["oracle generation"])],
+        axes=[
+            ResearchAxisSchema(axis_name="problem", values=["oracle generation"]),
+            ResearchAxisSchema(axis_name="method", values=["GNN"]),
+            ResearchAxisSchema(axis_name="evaluation", values=["accuracy"]),
+        ],
         questions=[
-            ResearchQuestionSchema(
-                question="现有方法是否在固定token budget下比较？",
-                question_type="evaluation",
-                importance=0.8,
-                searchability=0.7,
-                axis_name="evaluation",
-            ),
+            ResearchQuestionSchema(question="现有方法是否在固定token budget下比较？", question_type="evaluation", importance=0.8, searchability=0.7, axis_name="evaluation"),
+            ResearchQuestionSchema(question="哪些benchmark覆盖了状态变化过程问题？", question_type="dataset", importance=0.6, searchability=0.9, axis_name="dataset"),
+            ResearchQuestionSchema(question="现有方法如何处理冲突记忆？", question_type="method", importance=0.7, searchability=0.8, axis_name="method"),
+            ResearchQuestionSchema(question="哪些方法处理false-premise rejection？", question_type="failure", importance=0.5, searchability=0.6, axis_name="failure"),
+            ResearchQuestionSchema(question="现有系统在什么条件下会失败？", question_type="problem", importance=0.7, searchability=0.5, axis_name="problem"),
         ],
     ))
 
@@ -206,6 +248,7 @@ async def test_decompose_creates_questions():
     # Simulate contract exists
     contract = MagicMock()
     contract.id = "contract-id"
+    contract.version = 1
     contract.topic = "test topic"
     contract.target_problem = "test"
     contract.target_setting = "test"
@@ -214,21 +257,20 @@ async def test_decompose_creates_questions():
     contract.excluded_directions_json = "[]"
     contract.key_terms_json = "[]"
 
-    mock_query_contract = MagicMock()
-    mock_filter_contract = MagicMock()
-    mock_filter_contract.first.return_value = contract
-    mock_query_contract.filter.return_value = mock_filter_contract
+    db.get.return_value = contract
 
     # Simulate no existing questions
     mock_query_q = MagicMock()
-    mock_count = MagicMock()
-    mock_count.count.return_value = 0
-    mock_query_q.filter.return_value = mock_count
+    mock_filter_q = MagicMock()
+    mock_filter_q.all.return_value = []
+    mock_query_q.filter.return_value = mock_filter_q
 
-    db.query.side_effect = [mock_query_contract, mock_query_q, mock_query_q]
+    db.query.return_value = mock_query_q
 
-    with patch("app.agent.steps.decompose_research_space.paper_repo"):
+    with patch("app.agent.steps.decompose_research_space.paper_repo"), \
+         patch("app.agent.steps.decompose_research_space.task_repo") as mock_task_repo:
+        mock_task_repo.save_state = MagicMock()
         questions = await decompose_research_space(db, state, llm, "test-task")
 
-    assert len(questions) == 1
+    assert len(questions) == 5
     assert questions[0].question == "现有方法是否在固定token budget下比较？"

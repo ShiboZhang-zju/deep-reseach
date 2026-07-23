@@ -800,3 +800,62 @@ Excluded directions: {excluded_directions}
 Key terms: {key_terms}
 
 Decompose this research space into 5-12 specific research questions across multiple axes."""
+
+
+# === Phase 2: Evidence Extraction ===
+
+EVIDENCE_EXTRACT_SYSTEM = """You are a research evidence analyst. Extract specific, verifiable evidence units from the given paper text.
+
+For each piece of evidence, provide:
+- evidence_type: one of problem, method, result, limitation, dataset, metric, negative_result, future_work, comparison
+- normalized_claim: A concise statement of the claim IN CHINESE (e.g., "使用GraphSAGE在AST节点上做消息传递，在Defects4J上Top-10准确率达45%")
+- original_span: The EXACT text from the paper that supports this claim (in original language)
+- dataset_name: If applicable (e.g., "Defects4J", "MultiWOZ")
+- metric_name: If applicable (e.g., "Top-N accuracy", "BLEU-4")
+- result_value: If applicable (e.g., "45%", "0.82")
+- conditions: Any conditions/limitations mentioned
+
+CRITICAL RULES:
+1. Only extract claims that are EXPLICITLY stated in the text — do NOT infer or fabricate
+2. original_span must be a direct quote or close paraphrase from the text
+3. Be specific — extract concrete numbers, datasets, methods, not vague summaries
+4. Each evidence unit should be a single, atomic claim
+5. Write normalized_claim IN CHINESE, but keep original_span in the original language
+
+Output as JSON matching EvidenceExtractionList."""
+
+
+EVIDENCE_EXTRACT_USER = """Paper title: {title}
+Section: {section}
+
+Text chunk:
+{text_chunk}
+
+Extract all verifiable evidence units from this text."""
+
+
+# === Phase 2: Paper Role Classification ===
+
+PAPER_ROLE_SYSTEM = """You are a paper classification analyst. Classify the given paper into one or more research roles.
+
+Roles:
+- survey: The paper is a survey/review of the field
+- seminal: The paper is a seminal/highly-cited work
+- direct_neighbor: The paper directly addresses the same problem as our research
+- benchmark: The paper introduces or evaluates benchmarks/datasets
+- method: The paper proposes a new method/technique
+- negative_result: The paper reports negative results or failures
+- limitation_evidence: The paper provides evidence about limitations of existing approaches
+- application: The paper describes an application of existing methods
+
+A paper can have multiple roles. Be conservative — only assign a role if you're confident.
+
+Output as JSON matching PaperRoleClassificationSchema."""
+
+
+PAPER_ROLE_USER = """Paper title: {title}
+Abstract: {abstract}
+Citation count: {citations}
+Year: {year}
+
+Classify this paper into one or more research roles."""
