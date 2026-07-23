@@ -1,37 +1,78 @@
 """Step: Build structured Research Contract from user input + clarifications.
 
-Phase 1.5 fixes:
-- Persist state.contract_id via task_repo.save_state()
-- Add version/input_hash for contract versioning
-- Supersede old contracts when input changes
-- Remove meaningless state.user_input = state.user_input
+Phase 2.2A:
+- Single compute_contract_input_version() function with all 7 components
+- Proper Contract invalidation (supersede old + questions)
+- state.active_question_ids cleared on new Contract
 """
 
 import hashlib
 import json
 import logging
+from datetime import datetime, timezone
 
 from app.agent.state import ResearchState
 from app.agent.prompts import BUILD_CONTRACT_SYSTEM, BUILD_CONTRACT_USER
-from app.db.models import ResearchContract, ResearchTask, UserFeedback
+from app.db.models import ResearchContract, ResearchTask, ResearchQuestion, UserFeedback
 from app.db.repositories import paper_repo, task_repo
 from app.schemas.schemas import ResearchContractSchema
 
 logger = logging.getLogger(__name__)
 
 
-def compute_input_hash(task: ResearchTask, state: ResearchState) -> str:
-    """Compute a stable SHA-256 hash of all inputs that affect the Contract.
+def _normalize_str(s: str) -> str:
+    """Normalize string for stable hashing."""
+    return (s or "").strip()
 
-    Includes:
-    - task.user_input (original + clarifications)
-    - state.user_feedback
-    - state.clarification_questions (Phase 2.1: #14)
+
+def compute_contract_input_version(db, task: ResearchTask, state: ResearchState) -> str:
+    """Compute a stable SHA-256 hash of ALL inputs that affect the Contract.
+
+    Includes (in stable sorted order):
+    1. task.user_input (original input)
+    2. state.user_input (with clarifications appended)
+    3. state.user_feedback
+    4. state.clarification_questions (JSON, sorted keys)
+    5. All clarification_answer feedback records (JSON content)
+    6. All research_feedback records (JSON content)
+    7. state.pipeline_version
     """
+    # Gather clarification_answer feedback
+    clarification_answers = []
+    research_feedbacks = []
+    feedbacks = db.query(UserFeedback).filter(
+        UserFeedback.task_id == task.id,
+    ).order_by(UserFeedback.created_at).all()
+    for fb in feedbacks:
+        if fb.feedback_type == "clarification_answer":
+            clarification_answers.append(fb.content or "")
+        elif fb.feedback_type == "research_feedback":
+            research_feedbacks.append(fb.content or "")
+
+    # Build stable JSON representation
+    components = {
+        "task_user_input": _normalize_str(task.user_input),
+        "state_user_input": _normalize_str(state.user_input),
+        "state_user_feedback": _normalize_str(state.user_feedback),
+        "clarification_questions": state.clarification_questions or [],
+        "clarification_answers": clarification_answers,
+        "research_feedbacks": research_feedbacks,
+        "pipeline_version": state.pipeline_version,
+    }
+
+    # Stable serialization: sort_keys=True, fixed separators
+    combined = json.dumps(components, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+
+# Backward compat alias
+def compute_input_hash(task: ResearchTask, state: ResearchState) -> str:
+    """Deprecated: use compute_contract_input_version instead."""
+    # This is a fallback that doesn't have DB access — only includes basic fields
     parts = [
-        task.user_input or "",
-        state.user_feedback or "",
-        json.dumps(state.clarification_questions or [], ensure_ascii=False),
+        _normalize_str(task.user_input),
+        _normalize_str(state.user_feedback),
+        json.dumps(state.clarification_questions or [], sort_keys=True, ensure_ascii=False),
     ]
     combined = "\n".join(parts)
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
@@ -40,13 +81,13 @@ def compute_input_hash(task: ResearchTask, state: ResearchState) -> str:
 async def build_research_contract(db, state: ResearchState, llm, task_id: str) -> ResearchContract:
     """Build a structured Research Contract from user input and clarifications.
 
-    Phase 1.5: Implements versioning — if input_hash changed, supersede old contract.
+    Phase 2.2A: Uses compute_contract_input_version() for proper invalidation.
     """
     task = db.get(ResearchTask, task_id)
     if not task:
         raise ValueError(f"Task {task_id} not found")
 
-    current_hash = compute_input_hash(task, state)
+    current_hash = compute_contract_input_version(db, task, state)
 
     # Check for existing active contract
     existing = db.query(ResearchContract).filter(
@@ -55,8 +96,7 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
     ).first()
 
     if existing and existing.input_hash == current_hash:
-        logger.info("Task %s: contract v%d reuse (hash=%s)", task_id[:8], existing.version, current_hash)
-        # Persist contract_id to state
+        logger.info("Task %s: contract v%d reuse (hash=%s)", task_id[:8], existing.version, current_hash[:12])
         state.contract_id = existing.id
         state.normalized_topic = existing.topic
         state.keywords = json.loads(existing.key_terms_json or "[]")
@@ -66,16 +106,17 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
 
     # Input changed or no contract — supersede old ones
     if existing:
-        from app.db.models import ResearchQuestion
         existing.status = "superseded"
-        existing.superseded_at = datetime_now()
-        # Also supersede old questions
+        existing.superseded_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        # Supersede old questions belonging to THIS contract only
         old_questions = db.query(ResearchQuestion).filter(
             ResearchQuestion.contract_id == existing.id,
             ResearchQuestion.status != "superseded",
         ).all()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         for q in old_questions:
             q.status = "superseded"
+            q.superseded_at = now
         db.flush()
         logger.info("Task %s: superseded contract v%d and %d questions",
                     task_id[:8], existing.version, len(old_questions))
@@ -102,16 +143,16 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
         target_setting=result.target_setting,
         desired_output=result.desired_output,
         novelty_bar=result.novelty_bar,
-        preferred_directions_json=json.dumps(result.preferred_directions, ensure_ascii=False),
-        excluded_directions_json=json.dumps(result.excluded_directions, ensure_ascii=False),
+        preferred_directions_json=json.dumps(result.preferred_directions, sort_keys=True, ensure_ascii=False),
+        excluded_directions_json=json.dumps(result.excluded_directions, sort_keys=True, ensure_ascii=False),
         gpu_available=result.gpu_available,
         max_gpu_hours=result.max_gpu_hours,
         max_api_budget=result.max_api_budget,
         max_runtime_minutes=result.max_runtime_minutes,
         allow_large_benchmark=result.allow_large_benchmark,
         allow_model_training=result.allow_model_training,
-        experiment_preferences_json=json.dumps(result.experiment_preferences, ensure_ascii=False),
-        key_terms_json=json.dumps(result.key_terms, ensure_ascii=False),
+        experiment_preferences_json=json.dumps(result.experiment_preferences, sort_keys=True, ensure_ascii=False),
+        key_terms_json=json.dumps(result.key_terms, sort_keys=True, ensure_ascii=False),
         time_scope_start=result.time_scope_start,
         time_scope_end=result.time_scope_end,
         confidence=result.confidence,
@@ -122,8 +163,9 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
     db.add(contract)
     db.flush()
 
-    # Phase 1.5: Persist contract info to state
+    # Phase 2.2A: Clear active_question_ids on new Contract
     state.contract_id = contract.id
+    state.active_question_ids = []
     state.normalized_topic = result.topic
     state.keywords = result.key_terms
     task_repo.update_normalized_topic(db, task_id, result.topic)
@@ -144,9 +186,3 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
     logger.info("Task %s: research contract v%d built (topic=%s, confidence=%.2f)",
                task_id[:8], new_version, result.topic[:50], result.confidence)
     return contract
-
-
-def datetime_now():
-    """Helper to get UTC now (avoids circular import with models)."""
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).replace(tzinfo=None)

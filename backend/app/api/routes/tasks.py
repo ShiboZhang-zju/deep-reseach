@@ -80,9 +80,23 @@ async def submit_clarification(task_id: str, body: ClarifyRequest, db: Session =
         raise HTTPException(404, "Task not found")
 
     state = task_repo.get_state(db, task_id)
-    state.user_input = task.user_input + "\nClarifications: " + " | ".join(body.answers)
-    state.research_questions = []  # Clear old questions
+    # Phase 2.2A: Save clarification answers into user_input with structured format
+    state.user_input = task.user_input + "\nClarifications:\n" + "\n".join(body.answers)
+    # Clear clarification_questions (they've been answered)
+    state.clarification_questions = []
+    # Do NOT clear research_questions or active_question_ids — those are
+    # managed by Contract versioning (supersede when Contract changes)
     task_repo.save_state(db, task_id, state)
+
+    # Save clarification answers as structured UserFeedback
+    from app.db.repositories.paper_repo import save_feedback
+    import json
+    save_feedback(db, task_id, "clarification_answer",
+                  json.dumps({
+                      "questions": state.clarification_questions or [],
+                      "answers": body.answers,
+                  }, ensure_ascii=False),
+                  None, False)
     db.commit()
 
     # Restart agent AFTER response is sent (avoids blocking event loop)

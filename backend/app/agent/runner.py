@@ -279,10 +279,16 @@ async def run_task(task_id: str):
         db.commit()
         emit_event(task_id, "status", {"status": "building_contract"})
         try:
+            # Phase 2.2A: Use compute_contract_input_version for stable SHA-256
+            from app.agent.steps.build_contract import compute_contract_input_version
+            from app.db.models import ResearchTask as _RT
+            task_obj = db.get(_RT, task_id)
+            contract_input_version = compute_contract_input_version(db, task_obj, state) if task_obj else ""
+
             async def _build_contract_op(db):
                 return await build_research_contract(db, state, llm, task_id)
             await phase_service.execute_phase(db, task_id, "build_contract", _build_contract_op,
-                                               input_version=state.user_input[:200])
+                                               input_version=contract_input_version)
             state = task_repo.get_state(db, task_id)
         except Exception as e:
             logger.warning("Task %s: contract building failed (non-fatal, using fallback): %s",
@@ -458,7 +464,8 @@ async def _run_clarification_phase(db, state: ResearchState, llm, task_id: str):
     clarity = await clarify_topic(db, state, llm)
 
     if not clarity.is_clear:
-        state.research_questions = clarity.questions
+        # Phase 2.2A: Only write clarification_questions, NOT research_questions
+        state.clarification_questions = clarity.questions
         task_repo.save_state(db, task_id, state)
         task_repo.update_status(db, task_id, "waiting_for_clarification")
         emit_event(task_id, "clarification_needed", {"questions": clarity.questions})

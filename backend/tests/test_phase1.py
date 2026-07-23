@@ -147,14 +147,35 @@ async def test_build_contract_creates_contract():
     # Simulate real task object
     task = MagicMock()
     task.user_input = "GNN for test oracle generation"
+    task.id = "test-task"
     db.get.return_value = task
 
-    # Simulate no existing contract
-    mock_query = MagicMock()
-    mock_filter = MagicMock()
-    mock_filter.first.return_value = None
-    mock_query.filter.return_value = mock_filter
-    db.query.return_value = mock_query
+    # Phase 2.2A: Use function-based side_effect for db.query
+    from app.db.models import UserFeedback as _UF, ResearchContract as _RC2, ResearchQuestion as _RQ
+    mock_fb_query = MagicMock()
+    mock_fb_filter = MagicMock()
+    mock_fb_filter.order_by.return_value.all.return_value = []
+    mock_fb_query.filter.return_value = mock_fb_filter
+
+    mock_contract_query = MagicMock()
+    mock_contract_filter = MagicMock()
+    mock_contract_filter.first.return_value = None  # no existing
+    mock_contract_query.filter.return_value = mock_contract_filter
+
+    mock_rq_query = MagicMock()
+    mock_rq_filter = MagicMock()
+    mock_rq_filter.all.return_value = []  # no questions to supersede
+    mock_rq_query.filter.return_value = mock_rq_filter
+
+    def query_side_effect(model_cls, *args, **kwargs):
+        if model_cls is _UF:
+            return mock_fb_query
+        if model_cls is _RC2:
+            return mock_contract_query
+        if model_cls is _RQ:
+            return mock_rq_query
+        return MagicMock()
+    db.query.side_effect = query_side_effect
 
     # Make db.add set a fake ID on the contract
     def fake_add(obj):
@@ -187,12 +208,34 @@ async def test_build_contract_skips_if_exists():
     # Simulate real task
     task = MagicMock()
     task.user_input = "test input"
+    task.id = "test-task"
     db = MagicMock()
     db.get.return_value = task
 
-    # Compute the expected hash
-    from app.agent.steps.build_contract import compute_input_hash
-    expected_hash = compute_input_hash(task, state)
+    # Phase 2.2A: Use a function-based side_effect that returns the right mock
+    # for each model class queried
+    mock_fb_query = MagicMock()
+    mock_fb_filter = MagicMock()
+    mock_fb_filter.order_by.return_value.all.return_value = []
+    mock_fb_query.filter.return_value = mock_fb_filter
+
+    mock_contract_query = MagicMock()
+    mock_contract_filter = MagicMock()
+    mock_contract_query.filter.return_value = mock_contract_filter
+
+    # Use function side_effect: returns different mock based on model class name
+    from app.db.models import UserFeedback, ResearchContract as _RC
+    def query_side_effect(model_cls, *args, **kwargs):
+        if model_cls is UserFeedback:
+            return mock_fb_query
+        if model_cls is _RC:
+            return mock_contract_query
+        return MagicMock()
+    db.query.side_effect = query_side_effect
+
+    # Compute expected hash with mocked db
+    from app.agent.steps.build_contract import compute_contract_input_version
+    expected_hash = compute_contract_input_version(db, task, state)
 
     existing_contract = MagicMock()
     existing_contract.id = "existing-id"
@@ -201,11 +244,8 @@ async def test_build_contract_skips_if_exists():
     existing_contract.topic = "test topic"
     existing_contract.key_terms_json = '["term1"]'
 
-    mock_query = MagicMock()
-    mock_filter = MagicMock()
-    mock_filter.first.return_value = existing_contract
-    mock_query.filter.return_value = mock_filter
-    db.query.return_value = mock_query
+    # Set the contract query to return existing_contract
+    mock_contract_filter.first.return_value = existing_contract
 
     with patch("app.agent.steps.build_contract.task_repo") as mock_task_repo:
         mock_task_repo.save_state = MagicMock()
