@@ -29,8 +29,6 @@ jobs:
         run: python -m compileall app/ -q
 
       - name: Fresh DB migration (Alembic)
-        env:
-          DATABASE_URL: "sqlite:///./fresh_test.db"
         run: |
           rm -f fresh_test.db
           python -c "
@@ -52,6 +50,7 @@ jobs:
               assert t in tables, f'Missing table: {t}'
           print(f'All {len(required)} required tables exist')
           "
+          rm -f fresh_test.db
 
       - name: Run tests
         run: python -m pytest tests/ -q --tb=short
