@@ -113,9 +113,16 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
 
         tp, paper = paper_map[tp_id]
         authority_adj = score.authority
-        # Penalize papers with missing metadata (no citations + no year)
-        if (paper.citation_count or 0) == 0 and paper.year is None:
-            authority_adj = score.authority * 0.7
+        # P2: Citation-based authority adjustment with finer granularity
+        citations = paper.citation_count or 0
+        if citations == 0 and paper.year is None:
+            authority_adj = score.authority * 0.6   # both missing: heavy penalty
+        elif citations == 0:
+            authority_adj = score.authority * 0.85  # citation=0 but year present: moderate penalty
+        elif citations >= 100:
+            authority_adj = min(1.0, score.authority + 0.1)  # high-citation: boost
+        elif citations >= 10:
+            authority_adj = min(1.0, score.authority + 0.05)  # medium-citation: small boost
         # Boost papers from top venues
         venue_str = (paper.venue or "").upper()
         if any(kv in venue_str for kv in TOP_VENUE_KEYWORDS):
