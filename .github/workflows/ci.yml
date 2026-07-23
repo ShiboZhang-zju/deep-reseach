@@ -52,7 +52,7 @@ jobs:
           "
           rm -f fresh_test.db
 
-      - name: Run tests
+      - name: Run tests (including legacy migration test)
         run: python -m pytest tests/ -q --tb=short
 
   frontend:
