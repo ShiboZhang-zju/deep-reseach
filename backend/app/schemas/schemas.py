@@ -144,13 +144,29 @@ class ClarityResult(BaseModel):
     questions: list[str] = Field(default_factory=list, description="澄清问题列表")
 
 
+# Phase 2: Evidence types (defined here for forward references)
+EvidenceType = Literal[
+    "problem", "method", "result", "limitation", "dataset", "metric",
+    "negative_result", "future_work", "comparison"
+]
+
+SearchIntent = Literal[
+    "survey", "seminal", "recent_work", "benchmark",
+    "direct_neighbor", "limitation", "negative_result",
+    "question_answering", "gap_falsification",
+]
+
+
 class GeneratedQuery(BaseModel):
-    query: str
-    source_hint: str | None = None
+    """Structured search query — LLM must explicitly bind to a Question."""
+    query_text: str = Field(..., description="检索 query 文本 (3-8 words)")
+    intent: SearchIntent = Field(..., description="查询意图")
+    target_question_id: str = Field(..., description="目标 ResearchQuestion ID")
+    expected_evidence_type: EvidenceType | None = Field(None, description="期望证据类型")
 
 
 class QueryList(BaseModel):
-    queries: list[str] = Field(..., description="本轮检索 query 列表")
+    queries: list[GeneratedQuery] = Field(..., description="结构化 query 列表")
 
 
 class PaperScore(BaseModel):
@@ -497,11 +513,7 @@ class ResearchQuestionOut(BaseModel):
 
 
 # === Phase 2: Evidence + Coverage schemas ===
-
-EvidenceType = Literal[
-    "problem", "method", "result", "limitation", "dataset", "metric",
-    "negative_result", "future_work", "comparison"
-]
+# EvidenceType is already defined above (before GeneratedQuery)
 
 VerificationStatus = Literal[
     "unverified", "verified", "conflicted", "rejected", "abstract_only"

@@ -644,19 +644,16 @@ class CoverageRecord(Base):
 class SearchQueryRecord(Base):
     """Structured search query with target question binding.
 
-    Phase 2.1 (#3): Each query is linked to a specific ResearchQuestion,
-    has an intent, and tracks results.
+    Phase 2.2A: Added normalized_query_text, completed_at, and unique constraint.
     """
     __tablename__ = "search_query_records"
 
     id = Column(String, primary_key=True, default=_uuid)
     task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
     query_text = Column(Text, nullable=False)
+    normalized_query_text = Column(Text, default="")  # Phase 2.2A
 
     intent = Column(Text, nullable=False)
-    # survey / seminal / recent_work / benchmark / direct_neighbor /
-    # limitation / negative_result / gap_falsification / component_combination
-
     target_question_id = Column(String, ForeignKey("research_questions.id"))
     expected_evidence_type = Column(Text)
 
@@ -670,10 +667,14 @@ class SearchQueryRecord(Base):
     execution_error = Column(Text)
 
     created_at = Column(DateTime, default=_utcnow)
+    completed_at = Column(DateTime)  # Phase 2.2A
 
     __table_args__ = (
         Index("idx_sqr_task", "task_id"),
         Index("idx_sqr_intent", "intent"),
         Index("idx_sqr_round", "round_number"),
         Index("idx_sqr_question", "target_question_id"),
+        # Phase 2.2A: Unique constraint
+        Index("idx_sqr_unique", "task_id", "round_number",
+              "normalized_query_text", "target_question_id", unique=True),
     )

@@ -27,6 +27,11 @@ class FakeLLM:
 
     def __init__(self):
         self.call_count = 0
+        self._question_ids = []  # Set by test to provide valid IDs
+
+    def set_question_ids(self, ids: list[str]):
+        """Provide valid question IDs for structured query generation."""
+        self._question_ids = ids
 
     async def chat_json(self, messages, schema, **kwargs):
         self.call_count += 1
@@ -71,8 +76,19 @@ class FakeLLM:
             )
 
         elif schema_name == "QueryList":
-            from app.schemas.schemas import QueryList
-            return QueryList(queries=["agent memory token budget", "temporal state LLM memory", "memory compression evaluation"])
+            from app.schemas.schemas import QueryList, GeneratedQuery
+            # Use the first 3 question IDs if available
+            qids = self._question_ids[:3] if self._question_ids else []
+            if len(qids) >= 3:
+                return QueryList(queries=[
+                    GeneratedQuery(query_text="agent memory token budget", intent="seminal", target_question_id=qids[0], expected_evidence_type="method"),
+                    GeneratedQuery(query_text="temporal state LLM memory", intent="recent_work", target_question_id=qids[1], expected_evidence_type="result"),
+                    GeneratedQuery(query_text="memory compression evaluation", intent="benchmark", target_question_id=qids[2], expected_evidence_type="dataset"),
+                ])
+            else:
+                return QueryList(queries=[
+                    GeneratedQuery(query_text="agent memory token budget", intent="seminal", target_question_id="invalid-id", expected_evidence_type="method"),
+                ])
 
         elif schema_name == "PaperScore":
             from app.schemas.schemas import PaperScore
@@ -185,7 +201,13 @@ def temp_db():
     yield engine, Session
 
     engine.dispose()
-    os.unlink(db_path)
+    # Windows: close all connections before unlinking
+    import gc
+    gc.collect()
+    try:
+        os.unlink(db_path)
+    except PermissionError:
+        pass  # File may still be locked on Windows
 
 
 @pytest.mark.asyncio
@@ -273,6 +295,8 @@ async def test_questions_drive_queries(temp_db):
     # Generate queries — should save SearchQueryRecord with target_question_id
     state = task_repo.get_state(db, task_id)
     state.current_round = 1
+    # Set question IDs in FakeLLM so it returns valid target_question_ids
+    llm.set_question_ids([q.id for q in qs])
     from app.agent.steps.generate_queries import generate_queries
     queries = await generate_queries(db, state, llm)
 
