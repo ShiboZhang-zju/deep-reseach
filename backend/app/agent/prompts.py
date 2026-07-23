@@ -185,14 +185,20 @@ For each idea, provide:
 - title: A concise title (IN CHINESE)
 - description: Brief description of the idea (IN CHINESE). Must start with "基于[聚类X]的[具体方法]..." to show which cluster's method this idea builds upon.
 - motivation: Why is this idea important? What SPECIFIC gap does it fill? Reference specific cluster limitations. (IN CHINESE)
-- method_sketch: A DETAILED technical method description (IN CHINESE). MUST include ALL of:
-  * 具体模型架构: e.g., "基于Llama-3-8B，在attention层增加dual memory gate" (NOT "使用大语言模型")
-  * 具体算法: e.g., "top-k sparse retrieval + relevance scoring + decay-based forgetting" (NOT "优化检索策略")
-  * 具体数据集: e.g., "MultiWOZ + bAbI + 自定义多轮对话数据" (NOT "对话数据集")
-  * 具体评估指标: e.g., "BLEU-4 + task completion rate + memory retrieval latency" (NOT "准确性")
-  * 具体基线: e.g., "MemGPT, A-Mem, 标准LLM无记忆" (NOT "现有方法")
+- method_sketch: A DETAILED technical method description (IN CHINESE). MUST be structured with these EXACT labels (one per line):
+  * 模型架构: e.g., "基于Llama-3-8B，在attention层增加dual memory gate" (NOT "使用大语言模型")
+  * 算法: e.g., "top-k sparse retrieval + relevance scoring + decay-based forgetting" (NOT "优化检索策略")
+  * 数据集: MUST list SPECIFIC real datasets with split info, e.g., "Defects4J (v2.0, 395 bugs, 17 Java projects), HumanEval (164 problems)" — NOT just "Defects4J"
+  * 评估指标: MUST include SPECIFIC metrics with definitions, e.g., "Plausible@1 (通过所有测试用例的比例), Top-N (前N个补丁中正确修复的比例), 修复延迟(秒)" — NOT just "准确率"
+  * 基线: MUST list 3-5 SPECIFIC baselines with source, e.g., "ChatRepair (ICSE 2024), CigaR (FSE 2024), GPT-4 zero-shot, CodeT5 fine-tuned" — NOT just "GPT-4"
+  * 实验设计: MUST describe the EXACT experiment plan, including:
+    - 研究问题: 2-3 specific RQs (e.g., "RQ1: 多模态融合是否比单模态修复准确率更高？")
+    - 对比方案: 每个基线如何配置（模型版本、prompt模板、参数设置）
+    - 消融实验: 去掉哪个组件验证其贡献（e.g., "去掉日志模态 → 验证日志信息的贡献"）
+    - 统计检验: 如何验证结果显著性（e.g., "Wilcoxon signed-rank test, p<0.05"）
+  * 预期结果: 基于参考文献的实验数值，给出预期提升目标，e.g., "在Defects4J上从当前SOTA的45%提升到55-60%"
 - expected_contribution: What would this contribute to the field? (IN CHINESE)
-- related_paper_ids: List of paper IDs from the provided paper list that are most relevant
+- related_paper_ids: List of paper numbers (e.g., ["P1", "P3"]) from the provided paper list. ONLY use numbers that appear in the [P1], [P2] etc. labels. Do NOT invent IDs.
 - related_paper_titles: List of corresponding paper titles (keep original paper titles)
 
 CRITICAL RULES:
@@ -202,10 +208,20 @@ CRITICAL RULES:
 4. method_sketch must be specific enough that a grad student could implement it
 5. Baselines must be REAL, VERIFIABLE methods. Only use:
    - Methods explicitly mentioned in the provided paper list (use exact names from paper titles/abstracts)
-   - Well-known methods (e.g., "MemGPT", "RAG", "fine-tuned LLM", "GPT-4", "BERT", "T5")
-   - Do NOT invent framework names like "DARA", "TAMOS", "MBSE-Graph-RAG" that sound plausible but don't exist
-6. Datasets must be REAL, well-known datasets (e.g., "MultiWOZ", "MMLU", "GLUE", "MS COCO", "WikiText-103")
+   - Well-known methods (e.g., "MemGPT", "RAG", "fine-tuned LLM", "GPT-4", "BERT", "T5", "TOGA")
+   - Do NOT invent framework names like "DARA", "TAMOS", "MBSE-Graph-RAG", "TOGLL", "LangGSL" that sound plausible but don't exist
+6. Datasets must be REAL, well-known datasets (e.g., "MultiWOZ", "MMLU", "GLUE", "MS COCO", "WikiText-103", "Defects4J", "HumanEval", "MBPP")
 7. If you reference a method from a paper, use the EXACT name as it appears in the paper title or abstract
+8. related_paper_ids MUST use the [P1], [P2] format from the paper list below. Do NOT generate UUIDs or invent IDs.
+9. Each idea MUST reference at least 2 papers from the list. If you cannot find 2 relevant papers, do not generate that idea.
+10. INNOVATION RULE: Prioritize ideas that COMBINE components from DIFFERENT papers (e.g., paper A's technique + paper B's architecture). Do not generate ideas that are simple increments of a single paper. Use the "可扩展组件矩阵" provided to identify combination opportunities.
+11. Each idea's description should explicitly state which papers' components are being combined and why the combination is novel.
+12. EXPERIMENT SPECIFICITY: The 实验设计 section is MANDATORY and must be concrete enough for a PhD student to execute:
+    - Research questions must be specific and falsifiable (NOT "是否有效" but "多模态融合相比单模态在Defects4J Top-10上提升至少5%")
+    - Baselines must include the SPECIFIC model version and configuration from the cited papers (e.g., "ChatRepair with GPT-3.5-turbo, temperature=0.0" not just "ChatRepair")
+    - Ablation must test EACH novel component separately
+    - Reference the experiment_setup and key_results from the provided paper analyses to ground your expectations
+13. EXPECTED RESULTS must be grounded in the key_results from the paper analyses. If a paper reports 45% on Defects4J, state "从45%提升到55-60%" not "显著提升".
 
 Write all text fields (title, description, motivation, method_sketch, expected_contribution) IN CHINESE."""
 
@@ -214,7 +230,7 @@ IDEAS_USER = """Research topic: {topic}
 Report:
 {report}
 
-High-priority papers (use paper_id for related_paper_ids):
+Papers (use the [P1], [P2] etc. numbers for related_paper_ids — do NOT use UUIDs):
 {papers}
 
 Knowledge gaps:
@@ -481,6 +497,49 @@ Related papers summary:
 Write a detailed, concrete method_sketch for this idea, grounded in the provided passages."""
 
 
+# === P0-3: LLM-based structured extraction from method_sketch ===
+
+IDEA_EXTRACT_SYSTEM = """You are a technical method analyzer. Extract structured components from a research idea's method sketch.
+
+You will be given:
+1. The method sketch text
+2. A list of methods/datasets/models that are KNOWN REAL (extracted from the paper database)
+
+Extract the following (only include items that are EXPLICITLY mentioned in the method sketch):
+- baselines: List of baseline METHOD names (NOT datasets, NOT metrics). These are methods/systems/tools being compared against.
+- datasets: List of dataset/benchmark names.
+- metrics: List of evaluation metrics.
+- model_architecture: The model architecture description (if any).
+- algorithm: The algorithm description (if any).
+- has_fake_content: Set to True if ANY baseline or dataset name appears to be fabricated, non-existent, or invented.
+- fake_items: List of names that appear fabricated.
+
+JUDGING RULES (use your knowledge + the known_real list):
+1. If a name is in the known_real list → it is REAL, do NOT flag it.
+2. If a name is a well-known model/method/dataset that you know exists → it is REAL, do NOT flag it.
+3. If a name is a variant of a real name (e.g., "GPT-4o-mini" is a variant of "GPT-4o") → it is REAL.
+4. If a name is from a paper title in the known list (e.g., "Exploring Generalizable APR" is a paper title, the method is real) → it is REAL.
+5. Only flag a name as FAKE if you are CONFIDENT it does not exist — it sounds plausible but is clearly invented (e.g., "TOGLL", "LangGSL", "DARA" when no such method exists).
+6. When in doubt, do NOT flag — false accusations are worse than missed detections.
+
+EXTRACTION RULES:
+1. Only extract names that are EXPLICITLY mentioned in the method sketch text.
+2. CAREFULLY distinguish between baselines (methods/systems) and datasets (benchmarks/data). A dataset is something you test ON; a baseline is something you compare AGAINST.
+3. Do NOT include generic terms like "标准方法" or "现有方法" as baselines."""
+
+IDEA_EXTRACT_USER = """Research topic: {topic}
+
+Idea title: {title}
+
+Method sketch:
+{method_sketch}
+
+Known real methods/datasets/models (from the paper database — these are DEFINITELY real):
+{known_real_items}
+
+Extract all baselines, datasets, metrics from the method sketch. Use the known_real list above plus your own knowledge to judge if each name is real or fabricated."""
+
+
 # === Idea validation: dedup + baseline check + metric-hypothesis check ===
 
 IDEA_VALIDATION_SYSTEM = """You are a rigorous research idea validator. Review ALL ideas together and identify problems.
@@ -569,7 +628,10 @@ CRITICAL RULES:
 10. Always create at least one concept page per batch if the papers share a theme
 11. When creating concept pages, check existing_pages carefully — if a similar concept already exists (even with a slightly different name), update that page instead of creating a new one
 12. If the batch contains papers from DIFFERENT research themes, create SEPARATE concept pages for each theme (e.g., "记忆增强的大语言模型" and "多智能体路径规划" should be different concepts, not merged)
-13. If this is NOT the first batch (existing_pages is not empty), create at least one synthesis page that compares the new papers with existing wiki knowledge — identify gaps, contradictions, or combination opportunities"""
+13. If this is NOT the first batch (existing_pages is not empty), create at least one synthesis page that compares the new papers with existing wiki knowledge — identify gaps, contradictions, or combination opportunities
+14. CRITICAL: Do NOT put all papers into a single concept page. Even within the same research domain, papers use DIFFERENT method approaches — group by METHOD APPROACH, not by research domain. For example, "automated program repair using LLMs" is a domain, but "基于Token级定位的修复" and "基于检索增强的修复" and "基于模板的修复" are different method approaches that should be SEPARATE concept pages.
+15. Aim for 3-6 concept pages per batch, each representing a distinct method approach or technique category. Use the method_detail from the paper analysis to determine which approach each paper uses.
+16. If a concept page would contain more than 8 papers, split it into sub-concepts by method variant."""
 
 WIKI_INGEST_USER = """Batch info: {batch_info}
 
@@ -607,3 +669,55 @@ WIKI_LINT_USER = """Wiki content to audit:
 {wiki_content}
 
 Review all pages and identify issues (contradictions, orphans, stale info, missing cross-references)."""
+
+
+# === Paper Deep Analysis (新增：论文深度分析) ===
+
+PAPER_ANALYSIS_SYSTEM = """You are an expert research paper analyst. Perform a deep, structured analysis of the given paper.
+
+Your analysis will be used as the PRIMARY knowledge source for:
+1. Research report generation
+2. Research idea generation
+3. Wiki knowledge compilation
+
+Therefore, your analysis must be SPECIFIC, ACCURATE, and ACTIONABLE — not vague summaries.
+
+CRITICAL RULES:
+1. Base your analysis ONLY on the provided text (abstract + full text sections if available). Do NOT fabricate information not in the text.
+2. method_detail must be specific to the technical level:
+   - GOOD: "Toggle使用Token级定位模型预测bug位置，通过adjustment model解决tokenizer不一致问题，再用修复模型生成补丁"
+   - BAD: "使用大语言模型进行修复"
+3. key_results must include CONCRETE numbers from the paper:
+   - GOOD: "在Defects4J上Top-10准确率45%，Top-30准确率72%，Top-50准确率81%"
+   - BAD: "在多个数据集上取得了很好的效果"
+4. limitations must be based on what the paper actually acknowledges or obvious technical constraints, NOT speculation
+5. extendable_components should identify specific modules/techniques that could be reused or combined with other approaches
+6. source_sections must record which section of the paper each piece of info comes from
+7. Write ALL fields IN CHINESE (except source_sections keys which are English section names)
+8. If a field has no information in the paper, write "论文未提及" — do NOT guess
+
+Output format: JSON with fields: problem, method_detail, experiment_setup, key_results, limitations, extendable_components, source_sections"""
+
+PAPER_ANALYSIS_USER = """论文标题: {title}
+年份: {year}
+会议/期刊: {venue}
+引用数: {citations}
+
+摘要:
+{abstract}
+
+{full_text_section}
+
+请对这篇论文进行深度结构化分析。"""
+
+PAPER_ANALYSIS_USER_ABSTRACT_ONLY = """论文标题: {title}
+年份: {year}
+会议/期刊: {venue}
+引用数: {citations}
+
+摘要（完整，未截断）:
+{abstract}
+
+注意：本论文没有PDF全文可用，请基于完整摘要进行分析。对于摘要中未提及的细节，请标注"摘要未提及"。
+
+请对这篇论文进行结构化分析。"""

@@ -12,6 +12,7 @@ from app.agent.steps.build_clusters import build_paper_clusters
 from app.agent.steps.generate_report import generate_report
 from app.agent.steps.generate_ideas import generate_and_score_ideas, _score_idea
 from app.agent.steps.generate_experiment import generate_experiments
+from app.agent.steps.analyze_papers import analyze_papers
 
 __all__ = [
     "clarify_topic",
@@ -24,4 +25,5 @@ __all__ = [
     "generate_and_score_ideas",
     "generate_experiments",
     "_score_idea",
+    "analyze_papers",
 ]

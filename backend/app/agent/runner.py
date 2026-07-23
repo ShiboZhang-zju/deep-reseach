@@ -31,6 +31,7 @@ from app.agent.steps import (
     generate_and_score_ideas,
     generate_experiments,
 )
+from app.agent.steps.analyze_papers import analyze_papers
 from app.llm.factory import get_llm
 from app.services.event_service import emit_event, emit_event_with_cleanup
 
@@ -91,7 +92,7 @@ def start_agent(task_id: str) -> bool:
                        task_id[:8], settings.max_concurrent_agents)
         return False  # rejected — caller should return 429
 
-    AGENT_TIMEOUT = 1800  # 30 minutes max
+    AGENT_TIMEOUT = 3600  # P4-1: increased from 1800 to 3600 (60 min) to avoid timeout on retry
 
     async def _run():
         sem = _get_agent_semaphore()
@@ -275,6 +276,18 @@ async def run_task(task_id: str):
         logger.info("Task %s: skipping RAG indexing (disabled on Windows, using abstract fallback)", task_id[:8])
         emit_event(task_id, "status", {"status": "indexing_skipped", "reason": "RAG disabled on Windows"})
 
+        # === 2.5b. Paper Deep Analysis (新增：论文深度分析) ===
+        # Download PDFs for high-priority papers, extract text, LLM structured analysis
+        # Results stored in paper_analyses table, used by wiki/report/ideas
+        logger.info("Task %s: starting paper deep analysis...", task_id[:8])
+        task_repo.update_status(db, task_id, "analyzing_papers")
+        db.commit()
+        emit_event(task_id, "status", {"status": "analyzing_papers"})
+        try:
+            await analyze_papers(db, state, llm, task_id)
+        except Exception as e:
+            logger.warning("Task %s: paper analysis failed (non-fatal, continuing): %s", task_id[:8], e)
+
         # === 2.6. LLM Wiki: Ingest papers into wiki knowledge base ===
         await _run_wiki_ingest(db, task_id, llm)
 
@@ -445,7 +458,11 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str):
 
 
 def _check_early_termination(db, task_id, state, no_new_high_count, duplicate_rate) -> bool:
-    """Check early termination conditions. Returns True if should stop."""
+    """Check early termination conditions. Returns True if should stop.
+
+    P4-1: Lowered duplicate_rate threshold from 0.75 to 0.65 to stop sooner
+    when search results are becoming redundant.
+    """
     if no_new_high_count >= 2 and state.current_round >= 2:
         state.stop_reason = "no_new_high_priority_2_rounds"
         task_repo.save_state(db, task_id, state)
@@ -454,7 +471,7 @@ def _check_early_termination(db, task_id, state, no_new_high_count, duplicate_ra
         logger.info("Early stop: no new high-priority for 2 rounds")
         return True
 
-    if duplicate_rate > 0.75 and state.current_round >= 2:
+    if duplicate_rate > 0.65 and state.current_round >= 2:  # P4-1: 0.75 -> 0.65
         state.stop_reason = "high_duplicate_rate"
         task_repo.save_state(db, task_id, state)
         db.commit()
@@ -531,9 +548,12 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
 
     P1-5: Uses soft-delete (idea_status='superseded') instead of hard delete
     so user-visible history is preserved across retries.
+    P0-4: Reduced max_idea_rounds from 3 to 2, and retry no longer triggers
+    a full search round (which was the main cause of 30-min timeout crashes).
+    Instead, retry just re-generates ideas with stronger feedback constraints.
     """
     from app.db.models import ResearchIdea
-    max_idea_rounds = 3
+    max_idea_rounds = 2  # P0-4: reduced from 3 to 2
 
     for idea_round in range(max_idea_rounds):
         # Collect previous ideas as feedback for retry
@@ -555,6 +575,10 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
                     f"（均未达到 go 标准 0.70）：\n"
                     + "\n".join(feedback_lines)
                     + "\n\n请基于所有累积论文，生成比之前更有深度、更有创新性的创意。不要重复之前的创意方向。"
+                    + "\n\n特别注意：\n"
+                    + "- related_paper_ids 必须使用 [P1], [P2] 等编号，不能编造ID\n"
+                    + "- 基线必须使用真实方法名（如 TOGA, GPT-4, BERT），不能编造\n"
+                    + "- 数据集必须使用真实数据集名（如 Defects4J, MultiWOZ），不能编造\n"
                 )
                 # P1-5: mark as superseded (preserves history, excludes from active queries)
                 for oi in old_ideas:
@@ -568,25 +592,41 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
         emit_event(task_id, "status", {"status": "generating_ideas"})
         await generate_and_score_ideas(db, state, llm, task_id, prev_ideas_feedback, cluster_list)
 
-        # Check if any "go" ideas exist (only among active ideas)
+        # Check if any "go" or "revise" ideas exist (only among active ideas)
+        # P0-4: Also accept "revise" ideas as acceptable (score >= 0.50) to avoid
+        # unnecessary retries that cause timeout
         go_count = db.query(ResearchIdea).filter(
             ResearchIdea.task_id == task_id,
-            ResearchIdea.decision == "go",
+            ResearchIdea.decision.in_(["go"]),
             ResearchIdea.idea_status == "active",
         ).count()
-        logger.info("Task %s: idea round %d done, %d go ideas",
-                    task_id[:8], idea_round + 1, go_count)
+        revise_count = db.query(ResearchIdea).filter(
+            ResearchIdea.task_id == task_id,
+            ResearchIdea.decision == "revise",
+            ResearchIdea.idea_status == "active",
+        ).count()
+        active_count = db.query(ResearchIdea).filter(
+            ResearchIdea.task_id == task_id,
+            ResearchIdea.idea_status == "active",
+        ).count()
+        logger.info("Task %s: idea round %d done, %d go, %d revise, %d active",
+                    task_id[:8], idea_round + 1, go_count, revise_count, active_count)
 
-        if go_count > 0:
-            logger.info("Task %s: ideas ready, waiting for user review", task_id[:8])
+        # P0-4: Accept if we have any go OR revise ideas, or any active ideas at all
+        # (previously only "go" counted, causing excessive retries)
+        if go_count > 0 or revise_count > 0 or active_count > 0:
+            logger.info("Task %s: ideas ready (%d go, %d revise), waiting for user review",
+                       task_id[:8], go_count, revise_count)
             task_repo.update_status(db, task_id, "waiting_for_user_review")
             emit_event(task_id, "status", {"status": "waiting_for_user_review"})
             db.commit()
             break
 
         if idea_round < max_idea_rounds - 1:
-            # No go ideas, do another search round
-            await _idea_retry_search_round(db, state, llm, task_id, cluster_list)
+            # P0-4: No full search round — just retry idea generation with feedback
+            # (previously _idea_retry_search_round was called here, causing 30-min timeout)
+            logger.info("Task %s: no qualified ideas, retrying generation (no new search round)",
+                       task_id[:8])
         else:
             # Last attempt: auto-promote top ideas
             _auto_promote_ideas(db, task_id)
