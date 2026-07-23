@@ -59,6 +59,9 @@ def detect_schema_revision(engine) -> str | None:
     else:
         has_normalized = False
 
+    # Check for base tables (pre-Phase-1 schema)
+    has_base_tables = {'research_tasks', 'papers', 'task_papers'}.issubset(tables)
+
     if has_normalized:
         return '0007_query_norm'
     elif has_search_queries and has_span and has_round:
@@ -71,8 +74,13 @@ def detect_schema_revision(engine) -> str | None:
         return '0003_contract_questions'
     elif has_phase_runs:
         return '0002_phase_runs'
-    else:
+    elif has_base_tables:
+        # Verify it looks like a real pre-Phase-1 schema
+        # Must have at least research_tasks, papers, task_papers
         return '0001_baseline'
+    else:
+        # (#11) Unknown schema — cannot safely identify
+        return None
 
 
 def count_rows(engine, table_name: str) -> int:
@@ -225,8 +233,13 @@ def bootstrap(database_url: str = None) -> bool:
             print(f"Stamping to {detected}...")
             alembic_command.stamp(cfg, detected)
         else:
-            print("Could not detect revision, stamping to 0001_baseline")
-            alembic_command.stamp(cfg, '0001_baseline')
+            # (#11) Cannot safely identify schema — must fail, not default to baseline
+            print("ERROR: Cannot identify schema revision from existing tables.")
+            print("Tables exist but don't match any known schema pattern.")
+            print("Refusing to stamp baseline — this could corrupt data.")
+            print("Manual intervention required: inspect the database and determine")
+            print("the correct migration revision to stamp.")
+            return False
 
         # Add missing columns to existing tables before upgrade
         # (Alembic migrations assume tables match the revision they were stamped at,

@@ -84,7 +84,7 @@ async def search_and_save_papers(db, state: ResearchState,
                     (query_id, paper.id, rank, source_name, is_new_for_task)
                 )
 
-                if is_new:
+                if is_new_for_task:
                     new_paper_count_for_query += 1
                     new_paper_ids.append(paper.id)
                 if paper.id not in collected_set:
