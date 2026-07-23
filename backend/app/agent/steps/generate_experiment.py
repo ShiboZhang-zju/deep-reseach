@@ -53,7 +53,9 @@ async def generate_experiments(db, state: ResearchState, llm, task_id: str, idea
         db.flush()
         db.commit()
 
-        if decision == "go" or decision == "conditional_go":
+        # Phase 0 fix: conditional_go is no longer auto-promoted.
+        # Only genuinely "go" ideas proceed to experiment generation.
+        if decision == "go":
             good_ideas.append(idea)
         logger.info("Idea '%s' deep-scored: %.3f -> %s", idea.title[:40], final_score, decision)
 

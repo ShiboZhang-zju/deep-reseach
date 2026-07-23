@@ -19,7 +19,7 @@ from app.config import settings
 from app.db.session import SessionLocal
 from app.db.repositories import task_repo, paper_repo
 from app.agent.state import ResearchState
-from app.agent.policy import should_stop
+from app.agent.policy import should_stop, early_termination_check
 from app.agent.steps import (
     clarify_topic,
     generate_queries,
@@ -30,6 +30,8 @@ from app.agent.steps import (
     generate_report,
     generate_and_score_ideas,
     generate_experiments,
+    build_research_contract,
+    decompose_research_space,
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.llm.factory import get_llm
@@ -255,12 +257,39 @@ async def run_task(task_id: str):
         else:
             await _run_clarification_phase(db, state, llm, task_id)
             # Re-check: clarification may have set waiting_for_clarification
-            db.refresh = None  # noop
+            # Phase 0 fix: removed `db.refresh = None` — must not override Session methods
             state = task_repo.get_state(db, task_id)
             if not state.normalized_topic:
                 return  # waiting for user clarification
 
-        # === 2. Search loop ===
+        # === 2. Build Research Contract (Phase 1) ===
+        # After clarification, compile user input into a structured contract
+        logger.info("Task %s: building research contract...", task_id[:8])
+        task_repo.update_status(db, task_id, "building_contract")
+        db.commit()
+        emit_event(task_id, "status", {"status": "building_contract"})
+        try:
+            contract = await build_research_contract(db, state, llm, task_id)
+            # Reload state after contract update
+            state = task_repo.get_state(db, task_id)
+        except Exception as e:
+            logger.warning("Task %s: contract building failed (non-fatal, using fallback): %s",
+                          task_id[:8], e)
+            # Fallback: use normalized_topic as-is (old behavior)
+
+        # === 2b. Decompose Research Space (Phase 1) ===
+        logger.info("Task %s: decomposing research space...", task_id[:8])
+        task_repo.update_status(db, task_id, "decomposing")
+        db.commit()
+        emit_event(task_id, "status", {"status": "decomposing"})
+        try:
+            questions = await decompose_research_space(db, state, llm, task_id)
+            logger.info("Task %s: decomposed into %d research questions", task_id[:8], len(questions))
+        except Exception as e:
+            logger.warning("Task %s: decomposition failed (non-fatal, continuing): %s",
+                          task_id[:8], e)
+
+        # === 3. Search loop ===
         await _run_search_loop(db, state, llm, task_id)
 
         # Close main session before long-running RAG/Wiki phases
@@ -343,15 +372,20 @@ async def _run_clarification_phase(db, state: ResearchState, llm, task_id: str):
     task_repo.update_status(db, task_id, "clarifying")
     emit_event(task_id, "status", {"status": "clarifying"})
 
-    # Skip clarify if user already submitted clarifications
+    # Phase 0 fix: No longer truncate user_input at "Clarifications:".
+    # The clarification answers are already stored in state.user_input
+    # (appended by the /clarify API endpoint) and will be processed by
+    # build_research_contract (Phase 1). For now, use the full user_input
+    # as normalized_topic if it contains clarifications.
     if "\nClarifications:" in state.user_input and not state.normalized_topic:
+        # Use the full user_input (with clarifications) as the topic
         state.normalized_topic = state.user_input.split("\nClarifications:")[0].strip()
         state.keywords = []
         task_repo.update_normalized_topic(db, task_id, state.normalized_topic)
         task_repo.save_state(db, task_id, state)
         db.commit()
         emit_event(task_id, "status", {"status": "clarified", "topic": state.normalized_topic})
-        logger.info("Skipping clarify (already clarified): %s", state.normalized_topic)
+        logger.info("Clarified (with answers): %s", state.normalized_topic[:80])
         return
 
     clarity = await clarify_topic(db, state, llm)
@@ -372,12 +406,22 @@ async def _run_clarification_phase(db, state: ResearchState, llm, task_id: str):
 
 
 async def _run_search_loop(db, state: ResearchState, llm, task_id: str):
-    """Phase 2: Multi-round search loop."""
+    """Phase 2: Multi-round search loop.
+    
+    Phase 0 fix: Added max_attempts_per_round and total_failed_round_budget
+    to prevent infinite retries on persistent errors.
+    """
     task_repo.update_status(db, task_id, "searching")
     db.commit()
     emit_event(task_id, "status", {"status": "searching", "topic": state.normalized_topic})
 
     no_new_high_priority_count = 0
+    # Phase 0: retry safety limits
+    MAX_ATTEMPTS_PER_ROUND = 3  # max retries within a single round
+    TOTAL_FAILED_ROUND_BUDGET = 5  # max total failed rounds across the whole task
+    total_failed_rounds = 0
+    last_error_signature = None
+    identical_error_streak = 0
 
     while True:
         stop, reason = should_stop(state)
@@ -434,8 +478,14 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str):
                 round_summary, gaps
             )
 
-            # Check early termination
-            if _check_early_termination(db, task_id, state, no_new_high_priority_count, duplicate_rate):
+            # Check early termination (Phase 0: moved to policy.py)
+            et_stop, et_reason = early_termination_check(state, no_new_high_priority_count, duplicate_rate)
+            if et_stop:
+                state.stop_reason = et_reason
+                task_repo.save_state(db, task_id, state)
+                db.commit()
+                emit_event(task_id, "stopping", {"reason": et_reason})
+                logger.info("Early stop: %s", et_reason)
                 break
 
             task_repo.save_state(db, task_id, state)
@@ -454,32 +504,53 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str):
             task_repo.save_state(db, task_id, state)
             db.commit()
             emit_event(task_id, "round_error", {"round": round_num, "error": str(round_err)[:200]})
+
+            # Phase 0: Retry safety — detect identical errors and budget failures
+            error_sig = str(round_err)[:200]
+            if error_sig == last_error_signature:
+                identical_error_streak += 1
+            else:
+                identical_error_streak = 1
+                last_error_signature = error_sig
+
+            total_failed_rounds += 1
+
+            # If the same error happens 3 times in a row, stop immediately
+            if identical_error_streak >= 3:
+                logger.error("Task %s: same error occurred %d times, stopping search loop",
+                           task_id[:8], identical_error_streak)
+                state.stop_reason = f"identical_error_streak ({error_sig[:100]})"
+                task_repo.save_state(db, task_id, state)
+                db.commit()
+                emit_event(task_id, "stopping", {"reason": state.stop_reason})
+                break
+
+            # If total failed rounds exceed budget, stop
+            if total_failed_rounds >= TOTAL_FAILED_ROUND_BUDGET:
+                logger.error("Task %s: total failed rounds (%d) reached budget, stopping",
+                           task_id[:8], total_failed_rounds)
+                state.stop_reason = f"total_failed_rounds ({total_failed_rounds})"
+                task_repo.save_state(db, task_id, state)
+                db.commit()
+                emit_event(task_id, "stopping", {"reason": state.stop_reason})
+                break
+
             await asyncio.sleep(5)  # cooldown before retry
 
 
 def _check_early_termination(db, task_id, state, no_new_high_count, duplicate_rate) -> bool:
-    """Check early termination conditions. Returns True if should stop.
+    """DEPRECATED: Phase 0 — moved to policy.early_termination_check().
 
-    P4-1: Lowered duplicate_rate threshold from 0.75 to 0.65 to stop sooner
-    when search results are becoming redundant.
+    Kept for backward compatibility; delegates to the new function.
     """
-    if no_new_high_count >= 2 and state.current_round >= 2:
-        state.stop_reason = "no_new_high_priority_2_rounds"
+    stop, reason = early_termination_check(state, no_new_high_count, duplicate_rate)
+    if stop:
+        state.stop_reason = reason
         task_repo.save_state(db, task_id, state)
         db.commit()
-        emit_event(task_id, "stopping", {"reason": state.stop_reason})
-        logger.info("Early stop: no new high-priority for 2 rounds")
-        return True
-
-    if duplicate_rate > 0.65 and state.current_round >= 2:  # P4-1: 0.75 -> 0.65
-        state.stop_reason = "high_duplicate_rate"
-        task_repo.save_state(db, task_id, state)
-        db.commit()
-        emit_event(task_id, "stopping", {"reason": state.stop_reason})
-        logger.info("Early stop: high duplicate rate %.2f", duplicate_rate)
-        return True
-
-    return False
+        emit_event(task_id, "stopping", {"reason": reason})
+        logger.info("Early stop (legacy): %s", reason)
+    return stop
 
 
 async def _run_rag_indexing(db, task_id: str, llm):
@@ -612,9 +683,10 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
         logger.info("Task %s: idea round %d done, %d go, %d revise, %d active",
                     task_id[:8], idea_round + 1, go_count, revise_count, active_count)
 
-        # P0-4: Accept if we have any go OR revise ideas, or any active ideas at all
-        # (previously only "go" counted, causing excessive retries)
-        if go_count > 0 or revise_count > 0 or active_count > 0:
+        # Phase 0 fix: Only accept when we have go OR revise ideas.
+        # Previously `active_count > 0` meant even all-reject ideas would
+        # pass, which is wrong — active_count includes reject ideas.
+        if go_count > 0 or revise_count > 0:
             logger.info("Task %s: ideas ready (%d go, %d revise), waiting for user review",
                        task_id[:8], go_count, revise_count)
             task_repo.update_status(db, task_id, "waiting_for_user_review")
@@ -625,11 +697,12 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
         if idea_round < max_idea_rounds - 1:
             # P0-4: No full search round — just retry idea generation with feedback
             # (previously _idea_retry_search_round was called here, causing 30-min timeout)
-            logger.info("Task %s: no qualified ideas, retrying generation (no new search round)",
+            logger.info("Task %s: no qualified ideas (all reject), retrying generation",
                        task_id[:8])
         else:
-            # Last attempt: auto-promote top ideas
-            _auto_promote_ideas(db, task_id)
+            # Phase 0 fix: No auto-promote. If all ideas are rejected after
+            # max retries, the task ends with insufficient_evidence.
+            _finish_with_insufficient_evidence(db, task_id, active_count)
 
 
 async def _idea_retry_search_round(db, state: ResearchState, llm, task_id: str, cluster_list):
@@ -694,51 +767,33 @@ async def _idea_retry_rag_wiki(db, task_id: str, llm, new_paper_ids: list[str]):
 
 
 def _auto_promote_ideas(db, task_id: str):
-    """Last resort: when max idea rounds reached and no idea passed validation (>=0.70),
-    promote the top-scoring candidates as 'conditional_go' so the user can still review them.
-
-    IMPORTANT: 'conditional_go' is NOT the same as 'go'. 'go' means the idea passed
-    the 5-layer validation (novelty/baseline/dataset/metric/evidence). 'conditional_go'
-    means the system could not produce a validated idea after max retries and is
-    surfacing the best-available candidates for the user to decide manually.
-
-    This preserves the semantic integrity of 'go' while still returning a result.
+    """DEPRECATED: Phase 0 fix — auto-promote is removed.
+    
+    Previously this function would promote reject ideas to 'conditional_go'
+    to ensure the system always returns a result. This violates the
+    principle that the system must allow 0 credible ideas.
+    
+    Now redirects to _finish_with_insufficient_evidence.
     """
-    from app.db.models import ResearchIdea
+    logger.warning("Task %s: _auto_promote_ideas is deprecated, using insufficient_evidence instead", task_id[:8])
+    _finish_with_insufficient_evidence(db, task_id, 0)
 
-    logger.info("Task %s: max idea rounds reached, auto-promoting top ideas as conditional_go",
-                task_id[:8])
-    # P1-5: only consider active ideas (not superseded)
-    all_ideas = db.query(ResearchIdea).filter(
-        ResearchIdea.task_id == task_id,
-        ResearchIdea.idea_status == "active",
-    ).order_by(ResearchIdea.final_score.desc().nullslast()).all()
-    promoted = 0
-    promoted_titles = []
-    for idea in all_ideas:
-        if idea.final_score and idea.final_score >= 0.55:
-            # Use 'conditional_go' instead of 'go' to preserve validation semantics.
-            # Frontend treats both as selectable, but badge clearly distinguishes them.
-            idea.decision = "conditional_go"
-            promoted += 1
-            promoted_titles.append(idea.title[:40] if idea.title else "")
-        if promoted >= 3:
-            break
-    db.commit()
 
-    # Record trace for auditability (previously this silent state change was unlogged)
-    paper_repo.save_trace(
-        db, task_id, "auto_promote_ideas", "decision",
-        output_data={
-            "promoted_count": promoted,
-            "decision_used": "conditional_go",
-            "promoted_titles": promoted_titles,
-            "note": "ideas did not pass validation; surfaced as conditional_go for user review",
-        },
-    )
-    db.commit()
-
-    logger.info("Task %s: promoted %d ideas as conditional_go", task_id[:8], promoted)
-    task_repo.update_status(db, task_id, "waiting_for_user_review")
-    emit_event(task_id, "status", {"status": "waiting_for_user_review", "reason": "auto_promoted_conditional"})
+def _finish_with_insufficient_evidence(db, task_id: str, active_idea_count: int):
+    """Phase 0: When max idea rounds reached and no idea passed validation (>=0.50),
+    the task ends with insufficient_evidence status.
+    
+    This is a legitimate outcome — the system honestly reports that it could
+    not produce credible ideas from the available evidence, rather than
+    auto-promoting low-quality ideas.
+    """
+    logger.info("Task %s: no credible ideas after max retries (%d active, all rejected), "
+                "finishing with insufficient_evidence", task_id[:8], active_idea_count)
+    task_repo.update_status(db, task_id, "insufficient_evidence")
+    task_repo.update_stop_reason(db, task_id, "no_credible_ideas_after_retries")
+    emit_event(task_id, "status", {
+        "status": "insufficient_evidence",
+        "reason": "no_credible_ideas",
+        "active_idea_count": active_idea_count,
+    })
     db.commit()

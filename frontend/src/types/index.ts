@@ -131,6 +131,7 @@ export const STATUS_LABELS: Record<string, string> = {
   waiting_for_clarification: '等待澄清',
   searching: '检索中',
   summarizing: '摘要中',
+  analyzing_papers: '论文深度分析',
   reporting: '生成报告',
   generating_ideas: '生成 Ideas',
   waiting_for_user_review: '等待用户审阅',
@@ -139,6 +140,12 @@ export const STATUS_LABELS: Record<string, string> = {
   done: '已完成',
   stopped: '已停止',
   failed: '失败',
+  // Phase 0: New statuses
+  insufficient_evidence: '证据不足',
+  more_research_required: '需补充检索',
+  auditing_gaps: 'Gap 审计中',
+  checking_feasibility: '可行性检查',
+  synthesizing_ideas: '合成 Ideas',
 };
 
 export const STATUS_COLORS: Record<string, string> = {
@@ -147,6 +154,7 @@ export const STATUS_COLORS: Record<string, string> = {
   waiting_for_clarification: 'bg-amber-100 text-amber-700',
   searching: 'bg-indigo-100 text-indigo-700',
   summarizing: 'bg-indigo-100 text-indigo-700',
+  analyzing_papers: 'bg-indigo-100 text-indigo-700',
   reporting: 'bg-purple-100 text-purple-700',
   generating_ideas: 'bg-purple-100 text-purple-700',
   waiting_for_user_review: 'bg-amber-100 text-amber-700',
@@ -155,4 +163,10 @@ export const STATUS_COLORS: Record<string, string> = {
   done: 'bg-green-100 text-green-700',
   stopped: 'bg-gray-100 text-gray-700',
   failed: 'bg-red-100 text-red-700',
+  // Phase 0: New statuses
+  insufficient_evidence: 'bg-orange-100 text-orange-700',
+  more_research_required: 'bg-amber-100 text-amber-700',
+  auditing_gaps: 'bg-purple-100 text-purple-700',
+  checking_feasibility: 'bg-purple-100 text-purple-700',
+  synthesizing_ideas: 'bg-purple-100 text-purple-700',
 };

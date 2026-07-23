@@ -333,3 +333,133 @@ class WikiLintIssue(BaseModel):
 class WikiLintResult(BaseModel):
     """Result of wiki health check."""
     issues: list[WikiLintIssue] = Field(default_factory=list)
+
+
+# === Phase 0: New task statuses and PhaseRun schemas ===
+
+# New legitimate task statuses (in addition to existing ones)
+NEW_TASK_STATUSES = [
+    "insufficient_evidence",    # no credible ideas found after retries
+    "more_research_required",   # coverage gaps remain, user should add more direction
+    "auditing_gaps",             # adversarial gap audit in progress
+    "checking_feasibility",      # feasibility gates in progress
+    "synthesizing_ideas",        # idea synthesis from surviving gaps
+    "judging_ideas",             # independent idea judgment in progress
+]
+
+# Legitimate idea decisions (in addition to go/revise/reject)
+NEW_IDEA_DECISIONS = [
+    "insufficient_evidence",     # cannot determine due to lack of evidence
+]
+
+
+class PhaseRunOut(BaseModel):
+    """Phase execution record for API responses."""
+    id: str
+    task_id: str
+    phase_name: str
+    status: str
+    attempt_count: int = 0
+    started_at: str | None = None
+    completed_at: str | None = None
+    input_version: str | None = None
+    output_version: str | None = None
+    error_message: str | None = None
+    round_number: int | None = None
+    output_summary: str | None = None
+    created_at: str
+    updated_at: str
+
+
+# === Phase 1: Research Contract + Question Decomposition ===
+
+class ResourceConstraintsSchema(BaseModel):
+    """Resource constraints for the research."""
+    gpu_available: bool | None = None
+    max_gpu_hours: float | None = None
+    max_api_budget: float | None = None
+    max_runtime_minutes: int | None = None
+    allow_large_benchmark: bool = True
+    allow_model_training: bool = True
+
+
+class ResearchContractSchema(BaseModel):
+    """Structured research contract for LLM output."""
+    topic: str = Field(..., description="研究主题（英文，用于检索）")
+    target_problem: str = Field("", description="目标问题（中文）")
+    target_setting: str = Field("", description="目标场景（中文）")
+    desired_output: str = Field("method", description="期望输出类型: method/system/benchmark/empirical_analysis")
+    novelty_bar: str = Field("conference", description="创新门槛: course_project/master_thesis/conference")
+    preferred_directions: list[str] = Field(default_factory=list, description="偏好方向")
+    excluded_directions: list[str] = Field(default_factory=list, description="排除方向")
+    gpu_available: bool | None = None
+    max_gpu_hours: float | None = None
+    max_api_budget: float | None = None
+    max_runtime_minutes: int | None = None
+    allow_large_benchmark: bool = True
+    allow_model_training: bool = True
+    key_terms: list[str] = Field(default_factory=list, description="关键术语（英文，用于检索）")
+    time_scope_start: int | None = None
+    time_scope_end: int | None = None
+    confidence: float = Field(0.5, ge=0, le=1, description="置信度")
+
+
+class ResearchAxisSchema(BaseModel):
+    """A research axis for decomposition."""
+    axis_name: str = Field(..., description="轴名称")
+    values: list[str] = Field(default_factory=list, description="该轴上的可选值")
+
+
+class ResearchQuestionSchema(BaseModel):
+    """A single research question."""
+    question: str = Field(..., description="研究问题（具体、可检索、可回答）")
+    question_type: str = Field(..., description="问题类型: problem/method/evaluation/dataset/resource/failure/application")
+    importance: float = Field(0.5, ge=0, le=1, description="重要性")
+    searchability: float = Field(0.5, ge=0, le=1, description="可检索性")
+    axis_name: str = Field("", description="所属研究轴")
+
+
+class ResearchDecompositionSchema(BaseModel):
+    """Output of research space decomposition."""
+    axes: list[ResearchAxisSchema] = Field(default_factory=list, description="研究轴")
+    questions: list[ResearchQuestionSchema] = Field(..., description="研究问题列表（5-12个）")
+
+
+class ContractOut(BaseModel):
+    """Research contract for API response."""
+    id: str
+    task_id: str
+    topic: str
+    target_problem: str | None = None
+    target_setting: str | None = None
+    desired_output: str | None = None
+    novelty_bar: str | None = None
+    preferred_directions_json: str | None = None
+    excluded_directions_json: str | None = None
+    gpu_available: bool | None = None
+    max_gpu_hours: float | None = None
+    max_api_budget: float | None = None
+    max_runtime_minutes: int | None = None
+    allow_large_benchmark: bool = True
+    allow_model_training: bool = True
+    key_terms_json: str | None = None
+    time_scope_start: int | None = None
+    time_scope_end: int | None = None
+    status: str = "active"
+    confidence: float = 0.5
+    created_at: str
+    updated_at: str
+
+
+class ResearchQuestionOut(BaseModel):
+    """Research question for API response."""
+    id: str
+    task_id: str
+    contract_id: str | None = None
+    question: str
+    question_type: str
+    importance: float = 0.5
+    searchability: float = 0.5
+    status: str = "open"
+    axis_name: str | None = None
+    created_at: str

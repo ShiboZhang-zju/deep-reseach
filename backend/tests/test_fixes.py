@@ -1,7 +1,7 @@
 """Tests for the 5 direct fixes (P1-10/11/12/13/14).
 
 Covers:
-- auto_promote uses 'conditional_go' not 'go'
+- auto_promote is deprecated → insufficient_evidence (Phase 0 refactor)
 - citation cleanup replaces fabricated [Px] with [unsupported]
 - recover_interrupted_tasks calibrates current_round
 - start_agent does atomic capacity-check-and-register
@@ -20,20 +20,21 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
-# === Fix 2: auto_promote uses conditional_go ===
+# === Fix 2: auto_promote deprecated → insufficient_evidence (Phase 0) ===
 
-def test_auto_promote_uses_conditional_go_not_go():
-    """_auto_promote_ideas should set decision='conditional_go', not 'go'."""
+def test_auto_promote_is_deprecated():
+    """Phase 0: _auto_promote_ideas is deprecated and delegates to _finish_with_insufficient_evidence.
+    It should NOT change any idea's decision to 'conditional_go' or 'go'.
+    """
     from app.agent.runner import _auto_promote_ideas
 
-    # Mock ideas: score 0.6 (>= 0.55 threshold but < 0.70 go threshold)
     idea1 = MagicMock()
     idea1.final_score = 0.65
     idea1.title = "Test Idea 1"
     idea1.decision = "revise"
 
     idea2 = MagicMock()
-    idea2.final_score = 0.40  # below threshold, should not be promoted
+    idea2.final_score = 0.40
     idea2.title = "Test Idea 2"
     idea2.decision = "revise"
 
@@ -45,10 +46,11 @@ def test_auto_promote_uses_conditional_go_not_go():
          patch("app.agent.runner.emit_event"):
         _auto_promote_ideas(db, "test-task-id")
 
-    assert idea1.decision == "conditional_go", \
-        f"Expected conditional_go, got {idea1.decision}"
+    # Phase 0: ideas should NOT be promoted — their decision stays unchanged
+    assert idea1.decision == "revise", \
+        f"Phase 0: auto_promote is removed, decision should not change, got {idea1.decision}"
     assert idea2.decision == "revise", \
-        f"Low-score idea should not be promoted, got {idea2.decision}"
+        f"Phase 0: auto_promote is removed, decision should not change, got {idea2.decision}"
 
 
 def test_auto_promote_does_not_use_go():
