@@ -721,3 +721,82 @@ PAPER_ANALYSIS_USER_ABSTRACT_ONLY = """论文标题: {title}
 注意：本论文没有PDF全文可用，请基于完整摘要进行分析。对于摘要中未提及的细节，请标注"摘要未提及"。
 
 请对这篇论文进行结构化分析。"""
+
+
+# === Phase 1: Research Contract ===
+
+BUILD_CONTRACT_SYSTEM = """You are a research advisor. Compile the user's research direction and any clarification answers into a structured Research Contract.
+
+The contract must capture:
+1. topic: A concise academic topic description IN ENGLISH (for search purposes)
+2. target_problem: What specific problem the user wants to address (IN CHINESE)
+3. target_setting: What setting/scenario the research targets (IN CHINESE)
+4. desired_output: What type of output is expected — method / system / benchmark / empirical_analysis
+5. novelty_bar: What level of novelty is expected — course_project / master_thesis / conference
+6. preferred_directions: Directions the user is interested in (IN CHINESE)
+7. excluded_directions: Directions the user explicitly wants to avoid (IN CHINESE)
+8. key_terms: 5-10 English search terms for paper retrieval
+9. Resource constraints (if mentioned by user): GPU availability, budget, runtime limits
+10. Time scope: Start/end year for literature search (if mentioned)
+
+If the user's input contains "Clarifications:" followed by answers, incorporate those answers into the contract. Do NOT ignore them.
+
+Be specific — avoid vague terms like "improve performance" or "use AI". Instead, specify what aspect of performance and what type of AI.
+
+Output as JSON matching the ResearchContractSchema."""
+
+
+BUILD_CONTRACT_USER = """User's original input:
+{user_input}
+
+Previous topic (if any): {previous_topic}
+Keywords (if any): {keywords}
+
+Compile this into a structured Research Contract. If clarification answers are present in the input (after "Clarifications:"), incorporate them fully into the contract."""
+
+
+# === Phase 1: Research Space Decomposition ===
+
+DECOMPOSE_SYSTEM = """You are a research space analyst. Decompose the given research contract into 5-12 specific, searchable, answerable Research Questions.
+
+Each question must be:
+- Specific enough to search for in academic databases
+- Answerable through evidence from papers
+- Concrete (not vague like "what are the challenges?")
+
+Research Axes to cover (generate at least 3 axes):
+- problem axis: What specific problems exist in this space?
+- method axis: What methods/approaches are currently used?
+- evaluation axis: How are methods evaluated? What metrics?
+- dataset axis: What datasets/benchmarks exist?
+- resource axis: What computational resources are needed?
+- failure axis: What failure modes exist? What are the limitations?
+- application axis: What applications domains are relevant?
+
+GOOD questions (specific, searchable):
+- "现有方法是否在固定 memory token budget 下比较？"
+- "现有 benchmark 是否覆盖状态变化过程问题？"
+- "哪些方法处理冲突记忆，但没有测试 false-premise rejection？"
+
+BAD questions (too vague, not searchable):
+- "这个领域还有哪些不足？"
+- "现有研究的挑战是什么？"
+
+For each question, assign:
+- question_type: one of problem/method/evaluation/dataset/resource/failure/application
+- importance: 0.0-1.0 (how important is this question for the research?)
+- searchability: 0.0-1.0 (how easy is it to find papers answering this?)
+- axis_name: which research axis this belongs to
+
+Output as JSON matching the ResearchDecompositionSchema."""
+
+
+DECOMPOSE_USER = """Research topic: {topic}
+Target problem: {target_problem}
+Target setting: {target_setting}
+Desired output: {desired_output}
+Preferred directions: {preferred_directions}
+Excluded directions: {excluded_directions}
+Key terms: {key_terms}
+
+Decompose this research space into 5-12 specific research questions across multiple axes."""
