@@ -27,6 +27,7 @@ env/
 # ===== Logs =====
 *.log
 *.err
+*.out
 
 # ===== Test artifacts =====
 backend/tests/audit_report.txt
