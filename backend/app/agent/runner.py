@@ -327,43 +327,27 @@ async def run_task(task_id: str):
         logger.info("Task %s: search completed (%s, %d rounds), proceeding to analysis",
                     task_id[:8], search_result.status, search_result.completed_rounds)
 
-        # Close main session before long-running phases
+        # Close main session before long-running RAG/Wiki phases
         db.close()
         db = SessionLocal()
         state = task_repo.get_state(db, task_id)
 
-        # === 3b. Extract Evidence Units (Phase 2) ===
-        logger.info("Task %s: extracting evidence units...", task_id[:8])
-        task_repo.update_status(db, task_id, "extracting_evidence")
-        db.commit()
-        emit_event(task_id, "status", {"status": "extracting_evidence"})
-        try:
-            await extract_evidence_units(db, state, llm, task_id)
-        except Exception as e:
-            logger.warning("Task %s: evidence extraction failed (non-fatal): %s", task_id[:8], e)
+        # Phase 2.1: Evidence/Coverage now happens PER ROUND in the search loop.
+        # Check that at least some evidence was extracted.
+        from app.db.models import EvidenceUnit
+        evidence_count = db.query(EvidenceUnit).filter(
+            EvidenceUnit.task_id == task_id,
+        ).count()
 
-        # === 3c. Update Coverage Matrix (Phase 2) ===
-        logger.info("Task %s: updating coverage matrix...", task_id[:8])
-        evidence_coverage_ok = True
-        try:
-            await update_coverage_matrix(db, state, llm, task_id)
-        except Exception as e:
-            logger.error("Task %s: coverage update failed: %s", task_id[:8], e)
-            evidence_coverage_ok = False
-
-        # Phase 2.1 (#19): Evidence/Coverage failure blocks old idea pipeline
-        if not evidence_coverage_ok:
-            logger.error("Task %s: evidence/coverage pipeline failed, blocking idea generation", task_id[:8])
+        if state.pipeline_version >= 2 and evidence_count == 0:
+            logger.error("Task %s: no evidence units extracted after search, blocking pipeline", task_id[:8])
             task_repo.update_status(db, task_id, "failed")
-            task_repo.update_stop_reason(db, task_id, "evidence_coverage_failure")
-            emit_event(task_id, "error", {"message": "Evidence/Coverage pipeline failed"})
+            task_repo.update_stop_reason(db, task_id, "no_evidence_extracted")
+            emit_event(task_id, "error", {"message": "No evidence units extracted"})
             db.commit()
             return
 
-        # Close main session before long-running RAG/Wiki phases
-        db.close()
-        db = SessionLocal()
-        state = task_repo.get_state(db, task_id)  # reload after search loop
+        logger.info("Task %s: %d evidence units available, proceeding", task_id[:8], evidence_count)
 
         # === 2.5. RAG: Download PDFs and index high-priority papers ===
         # P1-17: RAG indexing disabled on Windows due to PyTorch segfault.
@@ -565,6 +549,26 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
                     papers_found, len(new_paper_ids), duplicate_rate,
                     round_summary, gaps
                 )
+
+                # Phase 2.1 (#1): Extract evidence + update coverage PER ROUND
+                if state.pipeline_version >= 2:
+                    try:
+                        task_repo.update_status(db, task_id, "extracting_evidence")
+                        db.commit()
+                        emit_event(task_id, "status", {"status": "extracting_evidence", "round": round_num})
+                        ev_count = await extract_evidence_units(db, state, llm, task_id, round_num)
+                        logger.info("Round %d: extracted %d evidence units", round_num, ev_count)
+
+                        task_repo.update_status(db, task_id, "updating_coverage")
+                        db.commit()
+                        deltas = await update_coverage_matrix(db, state, llm, task_id, round_num)
+                        # (#2) Coverage from round N changes question selection for round N+1
+                        logger.info("Round %d: coverage updated, next round questions will be re-selected", round_num)
+                    except Exception as ev_err:
+                        logger.error("Task %s: Round %d evidence/coverage failed: %s",
+                                     task_id[:8], round_num, ev_err)
+                        # Evidence/coverage failure is non-fatal per-round, but tracked
+                        emit_event(task_id, "evidence_error", {"round": round_num, "error": str(ev_err)[:200]})
 
                 # Check early termination
                 et_stop, et_reason = early_termination_check(state, no_new_high_priority_count, duplicate_rate)

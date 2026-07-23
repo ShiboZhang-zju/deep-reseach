@@ -1,183 +1,358 @@
 """Step: Extract evidence units from papers.
 
-Phase 2: Replaces the 'analyze_papers' summary-only approach with
-granular, traceable evidence units linked to research questions.
+Phase 2.1 comprehensive rewrite:
+- (#4) PDF download happens BEFORE extraction
+- (#5) Real PDF page numbers, not chunk_idx+1
+- (#6) Validate original_span exists in source chunk
+- (#7) Save span_start, span_end, source_chunk_hash
+- (#8) Incremental by paper/chunk/source_hash — skip already-extracted chunks
+- (#9) Abstract-only evidence can be upgraded to full-text
+- (#10) Idempotent — re-runs don't produce duplicates
+- (#11) Each concurrent LLM call uses its own Session
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
-import re
 
 from app.agent.state import ResearchState
 from app.agent.prompts import EVIDENCE_EXTRACT_SYSTEM, EVIDENCE_EXTRACT_USER
-from app.db.models import Paper, TaskPaper, EvidenceUnit, PaperRole, ResearchQuestion
+from app.db.models import (
+    Paper, TaskPaper, EvidenceUnit, PaperRole, ResearchQuestion,
+)
+from app.db.session import SessionLocal
 from app.db.repositories import paper_repo
-from app.schemas.schemas import EvidenceExtractionList, PaperRoleClassificationSchema
+from app.schemas.schemas import EvidenceExtractionList
 from app.services.event_service import emit_event
 
 logger = logging.getLogger(__name__)
 
-# Max chars per chunk for evidence extraction
 CHUNK_SIZE = 4000
-MAX_CHUNKS_PER_PAPER = 15
 
 
-async def extract_evidence_units(db, state: ResearchState, llm, task_id: str):
-    """Extract evidence units from high-priority papers.
+def compute_chunk_hash(text: str) -> str:
+    """SHA-256 of chunk text for dedup."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    For each paper:
-    1. Get full text (PDF chunks or abstract)
-    2. Split into chunks
-    3. LLM extracts evidence units per chunk
-    4. Store with provenance (paper_id, section, page_number, original_span)
+
+def find_span_in_chunk(original_span: str, chunk_text: str) -> tuple[int, int] | None:
+    """(#6) Validate that original_span actually exists in the source chunk.
+
+    Returns (start, end) character offsets, or None if not found.
     """
-    from app.agent.steps.analyze_papers import get_analyses_for_task, extract_pdf_text_by_section
+    if not original_span or not chunk_text:
+        return None
+    # Try exact match first
+    pos = chunk_text.find(original_span)
+    if pos >= 0:
+        return pos, pos + len(original_span)
+    # Try first 80 chars (LLM may have slightly modified the span)
+    snippet = original_span[:80]
+    if snippet:
+        pos = chunk_text.find(snippet)
+        if pos >= 0:
+            return pos, pos + len(original_span)
+    # Try last 80 chars
+    snippet = original_span[-80:]
+    if snippet:
+        pos = chunk_text.find(snippet)
+        if pos >= 0:
+            return pos, pos + len(original_span)
+    return None
 
-    # Get high-priority papers
-    from sqlalchemy.orm import joinedload
-    all_tps = db.query(TaskPaper).options(
-        joinedload(TaskPaper.paper)
-    ).filter(
+
+async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
+                                  round_number: int = 0):
+    """Extract evidence units from papers found in this round (or all if round=0).
+
+    Phase 2.1:
+    - (#1) Called per-round from search loop
+    - (#4) PDF download before extraction
+    - (#8) Incremental — skips chunks already extracted
+    - (#10) Idempotent — no duplicates on re-run
+    - (#11) Concurrent LLM calls use separate sessions
+    """
+    from app.agent.steps.analyze_papers import extract_pdf_text_by_section
+    from app.services.rag_service import download_pdf_multi_source
+
+    # Get papers to process
+    query = db.query(TaskPaper).filter(
         TaskPaper.task_id == task_id,
         TaskPaper.priority.in_(["high", "medium"]),
-    ).order_by(TaskPaper.final_score.desc().nullslast()).limit(30).all()
+    )
+    if round_number > 0:
+        query = query.filter(TaskPaper.discovered_round == round_number)
+    all_tps = query.order_by(TaskPaper.final_score.desc().nullslast()).limit(30).all()
 
     papers = [(tp.paper, tp) for tp in all_tps if tp.paper]
 
     if not papers:
-        logger.warning("Task %s: no papers for evidence extraction", task_id[:8])
-        return
+        logger.info("Task %s: no papers for evidence extraction (round %d)", task_id[:8], round_number)
+        return 0
 
-    # Check for existing evidence to skip
-    existing_count = db.query(EvidenceUnit).filter(
-        EvidenceUnit.task_id == task_id,
-    ).count()
-    if existing_count > 0:
-        logger.info("Task %s: %d evidence units already exist, skipping extraction", task_id[:8], existing_count)
-        return
+    logger.info("Task %s: extracting evidence from %d papers (round %d)",
+                task_id[:8], len(papers), round_number)
+    emit_event(task_id, "status", {"status": "extracting_evidence", "total": len(papers), "round": round_number})
 
-    logger.info("Task %s: extracting evidence from %d papers", task_id[:8], len(papers))
-    emit_event(task_id, "status", {"status": "extracting_evidence", "total": len(papers)})
+    # (#4) Download PDFs first (before extraction)
+    pdf_paths = await _download_pdfs(papers, task_id)
 
-    # Get active research questions for linking
-    questions = db.query(ResearchQuestion).filter(
-        ResearchQuestion.task_id == task_id,
-        ResearchQuestion.status.in_(["open", "partially_covered"]),
-    ).all()
+    # (#11) Each concurrent extraction uses its own session
+    semaphore = asyncio.Semaphore(3)
+    tasks_list = [
+        _extract_from_paper_safe(task_id, paper, tp, pdf_paths.get(paper.id), llm, round_number, semaphore)
+        for paper, tp in papers
+    ]
+    results = await asyncio.gather(*tasks_list, return_exceptions=True)
 
-    semaphore = asyncio.Semaphore(5)
+    # Collect results and write to DB in main session
     total_evidence = 0
-
-    async def extract_one(paper, tp):
-        nonlocal total_evidence
-        async with semaphore:
-            return await _extract_from_paper(db, llm, task_id, paper, tp, questions)
-
-    results = await asyncio.gather(*[extract_one(p, tp) for p, tp in papers], return_exceptions=True)
-
     for r in results:
         if isinstance(r, int):
             total_evidence += r
+        elif isinstance(r, Exception):
+            logger.error("Evidence extraction task failed: %s", r)
 
     # Classify paper roles
-    await _classify_paper_roles(db, llm, task_id, papers)
+    await _classify_paper_roles_safe(db, task_id, papers)
 
-    logger.info("Task %s: extracted %d evidence units from %d papers",
-                task_id[:8], total_evidence, len(papers))
+    logger.info("Task %s: extracted %d evidence units from %d papers (round %d)",
+                task_id[:8], total_evidence, len(papers), round_number)
 
     paper_repo.save_trace(db, task_id, "extract_evidence_units", "action",
-                          output_data={"total_evidence": total_evidence, "papers_processed": len(papers)})
+                          round_number=round_number,
+                          output_data={
+                              "total_evidence": total_evidence,
+                              "papers_processed": len(papers),
+                              "round": round_number,
+                          })
     db.commit()
+    return total_evidence
 
 
-async def _extract_from_paper(db, llm, task_id, paper, tp, questions) -> int:
-    """Extract evidence from a single paper."""
-    # Try to get PDF full text
+async def _download_pdfs(papers, task_id: str) -> dict[str, str]:
+    """(#4) Download PDFs for papers before extraction."""
+    from app.services.rag_service import download_pdf_multi_source
+
+    pdf_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(__file__))))), "pdf_cache")
+    os.makedirs(pdf_cache_dir, exist_ok=True)
+
+    pdf_paths = {}
+    semaphore = asyncio.Semaphore(3)
+
+    async def download_one(paper):
+        async with semaphore:
+            cache_path = os.path.join(pdf_cache_dir, f"{paper.id}.pdf")
+            if os.path.exists(cache_path):
+                return paper.id, cache_path
+            try:
+                pdf_bytes = await download_pdf_multi_source(paper)
+                if pdf_bytes:
+                    with open(cache_path, "wb") as f:
+                        f.write(pdf_bytes)
+                    return paper.id, cache_path
+            except Exception as e:
+                logger.debug("PDF download failed for paper %s: %s", paper.id[:8], e)
+            return paper.id, None
+
+    results = await asyncio.gather(*[download_one(p) for p, _ in papers], return_exceptions=True)
+    for r in results:
+        if isinstance(r, tuple):
+            pdf_paths[r[0]] = r[1]
+    return pdf_paths
+
+
+async def _extract_from_paper_safe(task_id, paper, tp, pdf_path, llm, round_number, semaphore) -> int:
+    """(#11) Wrapper that creates its own DB session for concurrent extraction."""
+    db = SessionLocal()
+    try:
+        async with semaphore:
+            return await _extract_from_paper(db, llm, task_id, paper, tp, pdf_path, round_number)
+    except Exception as e:
+        logger.error("Evidence extraction failed for paper %s: %s", paper.id[:8], e)
+        db.rollback()
+        return 0
+    finally:
+        db.close()
+
+
+async def _extract_from_paper(db, llm, task_id, paper, tp, pdf_path, round_number) -> int:
+    """Extract evidence from a single paper with provenance validation."""
+    evidence_count = 0
+
+    # Try PDF full text extraction
     sections = None
-    pdf_path = _get_pdf_path(paper.id)
-
     if pdf_path and os.path.exists(pdf_path):
         try:
             from app.agent.steps.analyze_papers import extract_pdf_text_by_section
             sections = extract_pdf_text_by_section(pdf_path)
         except Exception as e:
-            logger.debug("PDF extraction failed for paper %s: %s", paper.id[:8], e)
-
-    evidence_count = 0
+            logger.debug("PDF section extraction failed for paper %s: %s", paper.id[:8], e)
 
     if sections:
-        # Extract from PDF sections
-        for sec_name, sec_text in sections.items():
-            if not sec_text.strip():
-                continue
-            # Split section into chunks
-            chunks = [sec_text[i:i+CHUNK_SIZE] for i in range(0, len(sec_text), CHUNK_SIZE)][:3]
-            for chunk_idx, chunk in enumerate(chunks):
-                try:
-                    evidence_list = await _llm_extract_evidence(
-                        llm, task_id, paper, chunk, sec_name,
-                        page_number=chunk_idx + 1,
-                    )
-                    for ev in evidence_list:
-                        eu = EvidenceUnit(
-                            task_id=task_id,
-                            paper_id=paper.id,
-                            evidence_type=ev.evidence_type,
-                            normalized_claim=ev.normalized_claim,
-                            original_span=ev.original_span[:500] if ev.original_span else "",
-                            section=sec_name,
-                            page_number=chunk_idx + 1,
-                            dataset_name=ev.dataset_name,
-                            metric_name=ev.metric_name,
-                            result_value=ev.result_value,
-                            extraction_method="pdf_fulltext",
-                            extraction_confidence=0.8,
-                            verification_status="unverified",
-                        )
-                        db.add(eu)
-                        evidence_count += 1
-                except Exception as e:
-                    logger.debug("Evidence extraction failed for paper %s chunk %s.%d: %s",
-                                paper.id[:8], sec_name, chunk_idx, e)
+        # (#5) Use real PDF page numbers
+        evidence_count += await _extract_from_sections(db, llm, task_id, paper, sections, round_number)
+
+        # (#9) Upgrade abstract-only evidence to full-text
+        await _upgrade_abstract_evidence(db, paper, task_id)
     else:
         # Abstract fallback
         abstract = paper.abstract or ""
         if len(abstract) > 50:
+            evidence_count += await _extract_from_abstract(db, llm, task_id, paper, abstract, round_number)
+
+    db.commit()
+    return evidence_count
+
+
+async def _extract_from_sections(db, llm, task_id, paper, sections, round_number) -> int:
+    """Extract evidence from PDF sections with page numbers and chunk hashes."""
+    from app.agent.steps.analyze_papers import extract_pdf_text_by_section
+
+    # We need page-level text, not just section-level
+    # Re-extract with page info
+    pdf_path = _get_pdf_path(paper.id)
+    page_texts = _extract_page_texts(pdf_path) if pdf_path else {}
+
+    evidence_count = 0
+
+    for sec_name, sec_text in sections.items():
+        if not sec_text.strip():
+            continue
+
+        # Split into chunks
+        for chunk_start in range(0, len(sec_text), CHUNK_SIZE):
+            chunk_text = sec_text[chunk_start:chunk_start + CHUNK_SIZE]
+            if len(chunk_text) < 50:
+                continue
+
+            chunk_hash = compute_chunk_hash(chunk_text)
+
+            # (#8) Skip if this chunk already extracted
+            existing = db.query(EvidenceUnit).filter(
+                EvidenceUnit.task_id == task_id,
+                EvidenceUnit.paper_id == paper.id,
+                EvidenceUnit.source_chunk_hash == chunk_hash,
+            ).first()
+            if existing:
+                logger.debug("Paper %s: chunk hash %s already extracted, skipping",
+                           paper.id[:8], chunk_hash[:8])
+                continue
+
+            # (#5) Determine real page number
+            page_num = _find_page_for_text(chunk_text, page_texts, sec_name)
+
             try:
-                evidence_list = await _llm_extract_evidence(
-                    llm, task_id, paper, abstract, "abstract", page_number=None,
-                )
+                evidence_list = await _llm_extract_evidence(llm, paper, chunk_text, sec_name)
                 for ev in evidence_list:
+                    # (#6) Validate original_span exists in chunk
+                    span_pos = find_span_in_chunk(ev.original_span, chunk_text)
+                    if span_pos is None:
+                        logger.warning("Paper %s: original_span not found in chunk, skipping evidence",
+                                     paper.id[:8])
+                        continue
+
                     eu = EvidenceUnit(
                         task_id=task_id,
                         paper_id=paper.id,
                         evidence_type=ev.evidence_type,
                         normalized_claim=ev.normalized_claim,
                         original_span=ev.original_span[:500] if ev.original_span else "",
-                        section="abstract",
-                        page_number=None,
+                        section=sec_name,
+                        page_number=page_num,
+                        page_start=page_num,
+                        page_end=page_num,
+                        span_start=span_pos[0],
+                        span_end=span_pos[1],
+                        source_chunk_hash=chunk_hash,
                         dataset_name=ev.dataset_name,
                         metric_name=ev.metric_name,
                         result_value=ev.result_value,
-                        extraction_method="abstract_only",
-                        extraction_confidence=0.4,
-                        verification_status="abstract_only",
+                        extraction_method="pdf_fulltext",
+                        extraction_confidence=0.8,
+                        verification_status="unverified",
                     )
                     db.add(eu)
                     evidence_count += 1
             except Exception as e:
-                logger.debug("Abstract evidence extraction failed for paper %s: %s", paper.id[:8], e)
+                logger.debug("Evidence extraction failed for paper %s section %s: %s",
+                            paper.id[:8], sec_name, e)
 
     db.flush()
     return evidence_count
 
 
-async def _llm_extract_evidence(llm, task_id, paper, text_chunk, section, page_number):
-    """Call LLM to extract evidence units from a text chunk."""
-    from app.agent.prompts import EVIDENCE_EXTRACT_SYSTEM, EVIDENCE_EXTRACT_USER
+async def _extract_from_abstract(db, llm, task_id, paper, abstract, round_number) -> int:
+    """Extract evidence from abstract (fallback)."""
+    chunk_hash = compute_chunk_hash(abstract)
 
+    # (#10) Check if already extracted
+    existing = db.query(EvidenceUnit).filter(
+        EvidenceUnit.task_id == task_id,
+        EvidenceUnit.paper_id == paper.id,
+        EvidenceUnit.source_chunk_hash == chunk_hash,
+    ).count()
+    if existing > 0:
+        logger.debug("Paper %s: abstract already extracted, skipping", paper.id[:8])
+        return 0
+
+    try:
+        evidence_list = await _llm_extract_evidence(llm, paper, abstract, "abstract")
+        evidence_count = 0
+        for ev in evidence_list:
+            span_pos = find_span_in_chunk(ev.original_span, abstract)
+            eu = EvidenceUnit(
+                task_id=task_id,
+                paper_id=paper.id,
+                evidence_type=ev.evidence_type,
+                normalized_claim=ev.normalized_claim,
+                original_span=ev.original_span[:500] if ev.original_span else "",
+                section="abstract",
+                page_number=None,
+                page_start=None,
+                page_end=None,
+                span_start=span_pos[0] if span_pos else None,
+                span_end=span_pos[1] if span_pos else None,
+                source_chunk_hash=chunk_hash,
+                dataset_name=ev.dataset_name,
+                metric_name=ev.metric_name,
+                result_value=ev.result_value,
+                extraction_method="abstract_only",
+                extraction_confidence=0.4,
+                verification_status="abstract_only",
+            )
+            db.add(eu)
+            evidence_count += 1
+        db.flush()
+        return evidence_count
+    except Exception as e:
+        logger.debug("Abstract evidence extraction failed for paper %s: %s", paper.id[:8], e)
+        return 0
+
+
+async def _upgrade_abstract_evidence(db, paper, task_id):
+    """(#9) Mark abstract-only evidence as upgraded when full-text is available."""
+    abstract_evidence = db.query(EvidenceUnit).filter(
+        EvidenceUnit.task_id == task_id,
+        EvidenceUnit.paper_id == paper.id,
+        EvidenceUnit.extraction_method == "abstract_only",
+    ).all()
+
+    for eu in abstract_evidence:
+        eu.verification_status = "upgraded"
+        eu.extraction_confidence = 0.6  # Slightly higher than abstract_only
+
+    if abstract_evidence:
+        logger.info("Paper %s: upgraded %d abstract-only evidence to 'upgraded'",
+                    paper.id[:8], len(abstract_evidence))
+    db.flush()
+
+
+async def _llm_extract_evidence(llm, paper, text_chunk, section):
+    """Call LLM to extract evidence units from a text chunk."""
     messages = [
         {"role": "system", "content": EVIDENCE_EXTRACT_SYSTEM},
         {"role": "user", "content": EVIDENCE_EXTRACT_USER.format(
@@ -192,48 +367,81 @@ async def _llm_extract_evidence(llm, task_id, paper, text_chunk, section, page_n
 def _get_pdf_path(paper_id: str) -> str | None:
     """Get cached PDF path for a paper."""
     pdf_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.dirname(__file__)))), "pdf_cache")
+        os.path.dirname(os.path.dirname(__file__))))), "pdf_cache")
     path = os.path.join(pdf_cache_dir, f"{paper_id}.pdf")
     return path if os.path.exists(path) else None
 
 
-async def _classify_paper_roles(db, llm, task_id, papers):
-    """Classify papers into roles (survey, seminal, benchmark, etc.)."""
-    from app.agent.prompts import PAPER_ROLE_SYSTEM, PAPER_ROLE_USER
+def _extract_page_texts(pdf_path: str) -> dict[int, str]:
+    """Extract text per page from PDF for page number mapping."""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        page_texts = {}
+        for i, page in enumerate(doc):
+            page_texts[i + 1] = page.get_text("text")
+        doc.close()
+        return page_texts
+    except Exception as e:
+        logger.debug("Page text extraction failed: %s", e)
+        return {}
 
-    semaphore = asyncio.Semaphore(5)
 
-    async def classify_one(paper, tp):
-        async with semaphore:
-            try:
-                # Simple heuristic classification (can be enhanced with LLM)
-                roles = []
-                title_lower = (paper.title or "").lower()
-                abstract_lower = (paper.abstract or "").lower()
-                combined = title_lower + " " + abstract_lower
+def _find_page_for_text(chunk_text: str, page_texts: dict[int, str], section: str) -> int | None:
+    """(#5) Find the actual PDF page number for a chunk of text."""
+    if not page_texts:
+        return None
+    # Use first 100 chars of chunk to find page
+    snippet = chunk_text[:100]
+    for page_num, page_text in page_texts.items():
+        if snippet in page_text:
+            return page_num
+    # Try last 100 chars
+    snippet = chunk_text[-100:]
+    for page_num, page_text in page_texts.items():
+        if snippet in page_text:
+            return page_num
+    return None
 
-                if any(w in combined for w in ["survey", "review", "tutorial", "comprehensive"]):
-                    roles.append("survey")
-                if (paper.citation_count or 0) > 100:
-                    roles.append("seminal")
-                if any(w in combined for w in ["benchmark", "dataset", "evaluation"]):
-                    roles.append("benchmark")
-                if any(w in combined for w in ["negative", "failure", "limitation", "cannot"]):
-                    roles.append("negative_result")
-                if not roles:
-                    roles.append("method")
 
-                for role in roles:
-                    pr = PaperRole(
-                        task_id=task_id,
-                        paper_id=paper.id,
-                        role=role,
-                        confidence=0.6,
-                        reason=f"heuristic: title/abstract contains '{role}' indicators",
-                    )
-                    db.add(pr)
-            except Exception as e:
-                logger.debug("Role classification failed for paper %s: %s", paper.id[:8], e)
+async def _classify_paper_roles_safe(db, task_id, papers):
+    """Classify papers into roles — uses main session."""
+    from app.db.models import PaperRole
 
-    await asyncio.gather(*[classify_one(p, tp) for p, tp in papers], return_exceptions=True)
+    for paper, tp in papers:
+        # (#10) Check if roles already exist for this paper
+        existing = db.query(PaperRole).filter(
+            PaperRole.task_id == task_id,
+            PaperRole.paper_id == paper.id,
+        ).count()
+        if existing > 0:
+            continue
+
+        roles = []
+        title_lower = (paper.title or "").lower()
+        abstract_lower = (paper.abstract or "").lower()
+        combined = title_lower + " " + abstract_lower
+
+        if any(w in combined for w in ["survey", "review", "tutorial", "comprehensive"]):
+            roles.append("survey")
+        if (paper.citation_count or 0) > 100:
+            roles.append("seminal")
+        if any(w in combined for w in ["benchmark", "dataset", "evaluation"]):
+            roles.append("benchmark")
+        if any(w in combined for w in ["negative", "failure", "limitation", "cannot"]):
+            roles.append("negative_result")
+        if not roles:
+            roles.append("method")
+
+        for role in roles:
+            pr = PaperRole(
+                task_id=task_id,
+                paper_id=paper.id,
+                role=role,
+                confidence=0.6,
+                reason=f"heuristic: {role} indicators in title/abstract",
+            )
+            db.add(pr)
+
     db.flush()
+    db.commit()
