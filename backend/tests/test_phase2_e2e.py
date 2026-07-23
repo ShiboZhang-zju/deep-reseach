@@ -77,9 +77,12 @@ class FakeLLM:
 
         elif schema_name == "QueryList":
             from app.schemas.schemas import QueryList, GeneratedQuery
-            # Use the first 3 question IDs if available
-            qids = self._question_ids[:3] if self._question_ids else []
+            # Use ALL available question IDs — select_target_questions picks the top 3
+            # by importance, but we don't know which ones. So use all 5.
+            qids = self._question_ids if self._question_ids else []
             if len(qids) >= 3:
+                # Return 3 queries targeting the first 3 question IDs
+                # (the test sets all 5, so any 3 that match select_target_questions are fine)
                 return QueryList(queries=[
                     GeneratedQuery(query_text="agent memory token budget", intent="seminal", target_question_id=qids[0], expected_evidence_type="method"),
                     GeneratedQuery(query_text="temporal state LLM memory", intent="recent_work", target_question_id=qids[1], expected_evidence_type="result"),
@@ -295,9 +298,12 @@ async def test_questions_drive_queries(temp_db):
     # Generate queries — should save SearchQueryRecord with target_question_id
     state = task_repo.get_state(db, task_id)
     state.current_round = 1
-    # Set question IDs in FakeLLM so it returns valid target_question_ids
-    llm.set_question_ids([q.id for q in qs])
-    from app.agent.steps.generate_queries import generate_queries
+    # Get the questions that select_target_questions will return
+    from app.agent.steps.decompose_research_space import select_target_questions
+    target_qs = select_target_questions(db, task_id, limit=3)
+    # Set FakeLLM to use these exact IDs
+    llm.set_question_ids([q.id for q in target_qs])
+    from app.agent.steps.generate_queries import generate_queries, SearchQueryExecution
     queries = await generate_queries(db, state, llm)
 
     # Verify SearchQueryRecord saved

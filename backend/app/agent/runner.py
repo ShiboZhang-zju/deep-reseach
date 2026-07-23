@@ -53,6 +53,16 @@ class SearchLoopResult:
     completed_rounds: int
     failed_attempts: int
 
+
+@dataclass
+class RoundEvidenceCoverageResult:
+    """Phase 2.2A Closure (#7): Per-round evidence/coverage result."""
+    evidence_status: str   # completed / failed / partial
+    coverage_status: str   # completed / failed
+    new_evidence_count: int
+    coverage_snapshot_count: int
+    reason: str
+
 logger = logging.getLogger(__name__)
 
 # Task registry for asyncio tasks (P0-1: protected by lock)
@@ -557,25 +567,55 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
                     round_summary, gaps
                 )
 
-                # Phase 2.1 (#1): Extract evidence + update coverage PER ROUND
+                # Phase 2.2A Closure (#7): Extract evidence + update coverage PER ROUND
+                # with RoundEvidenceCoverageResult for failure propagation
                 if state.pipeline_version >= 2:
+                    ec_result = RoundEvidenceCoverageResult(
+                        evidence_status="pending", coverage_status="pending",
+                        new_evidence_count=0, coverage_snapshot_count=0, reason=""
+                    )
                     try:
                         task_repo.update_status(db, task_id, "extracting_evidence")
+                        state.current_phase = f"extract_evidence_round_{round_num}"
                         db.commit()
                         emit_event(task_id, "status", {"status": "extracting_evidence", "round": round_num})
                         ev_count = await extract_evidence_units(db, state, llm, task_id, round_num)
+                        ec_result.new_evidence_count = ev_count
+                        ec_result.evidence_status = "completed" if ev_count >= 0 else "failed"
                         logger.info("Round %d: extracted %d evidence units", round_num, ev_count)
-
-                        task_repo.update_status(db, task_id, "updating_coverage")
-                        db.commit()
-                        deltas = await update_coverage_matrix(db, state, llm, task_id, round_num)
-                        # (#2) Coverage from round N changes question selection for round N+1
-                        logger.info("Round %d: coverage updated, next round questions will be re-selected", round_num)
                     except Exception as ev_err:
-                        logger.error("Task %s: Round %d evidence/coverage failed: %s",
-                                     task_id[:8], round_num, ev_err)
-                        # Evidence/coverage failure is non-fatal per-round, but tracked
+                        logger.error("Task %s: Round %d evidence failed: %s", task_id[:8], round_num, ev_err)
+                        ec_result.evidence_status = "failed"
+                        ec_result.reason = f"evidence: {str(ev_err)[:200]}"
                         emit_event(task_id, "evidence_error", {"round": round_num, "error": str(ev_err)[:200]})
+
+                    if ec_result.evidence_status != "failed":
+                        try:
+                            task_repo.update_status(db, task_id, "updating_coverage")
+                            state.current_phase = f"update_coverage_round_{round_num}"
+                            db.commit()
+                            deltas = await update_coverage_matrix(db, state, llm, task_id, round_num)
+                            from app.db.models import CoverageRecord as _CR
+                            ec_result.coverage_snapshot_count = db.query(_CR).filter(
+                                _CR.task_id == task_id,
+                                _CR.round_number == round_num,
+                            ).count()
+                            ec_result.coverage_status = "completed" if ec_result.coverage_snapshot_count > 0 else "failed"
+                            if ec_result.coverage_status == "failed":
+                                ec_result.reason = "no coverage snapshots generated"
+                            logger.info("Round %d: coverage updated (%d snapshots)", round_num, ec_result.coverage_snapshot_count)
+                        except Exception as cov_err:
+                            logger.error("Task %s: Round %d coverage failed: %s", task_id[:8], round_num, cov_err)
+                            ec_result.coverage_status = "failed"
+                            ec_result.reason = f"coverage: {str(cov_err)[:200]}"
+                            emit_event(task_id, "coverage_error", {"round": round_num, "error": str(cov_err)[:200]})
+
+                    # (#7) Check if round should fail
+                    if ec_result.evidence_status == "failed" or ec_result.coverage_status == "failed":
+                        logger.error("Task %s: Round %d evidence/coverage failed — %s",
+                                     task_id[:8], round_num, ec_result.reason)
+                        # This round is not fully successful — continue but track
+                        # If ALL rounds fail, SearchLoopResult will be failed
 
                 # Check early termination
                 et_stop, et_reason = early_termination_check(state, no_new_high_priority_count, duplicate_rate)

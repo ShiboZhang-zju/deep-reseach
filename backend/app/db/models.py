@@ -678,3 +678,26 @@ class SearchQueryRecord(Base):
         Index("idx_sqr_unique", "task_id", "round_number",
               "normalized_query_text", "target_question_id", unique=True),
     )
+
+
+class SearchQueryPaper(Base):
+    """Maps search queries to papers found — for yield tracking and provenance.
+
+    Phase 2.2A Closure (#3): Query→Paper mapping for traceability.
+    """
+    __tablename__ = "search_query_papers"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    query_id = Column(String, ForeignKey("search_query_records.id"), nullable=False)
+    paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
+    rank = Column(Integer, default=0)
+    source = Column(Text, default="unknown")
+    is_new_for_task = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_sqp_query", "query_id"),
+        Index("idx_sqp_paper", "paper_id"),
+        Index("idx_sqp_unique", "query_id", "paper_id", "source", unique=True),
+    )
