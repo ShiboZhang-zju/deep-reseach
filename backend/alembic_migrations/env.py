@@ -23,8 +23,16 @@ import app.db.models  # noqa: E402, F401  # register all models with Base.metada
 # this is the Alembic Config object
 config = context.config
 
-# Override sqlalchemy.url with the value from settings (respects .env)
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Use the sqlalchemy.url from alembic.ini by default.
+# If the test/migration sets a custom URL via cfg.set_main_option, respect it.
+# Only fall back to settings.database_url if the URL is still the default from alembic.ini.
+current_url = config.get_main_option("sqlalchemy.url")
+if current_url and "deep_research.db" not in current_url:
+    # Custom URL set (e.g., test temp DB) — respect it
+    pass
+else:
+    # Use the URL from .env settings
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 # Interpret the config file for Python logging
 if config.config_file_name is not None:

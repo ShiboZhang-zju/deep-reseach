@@ -17,8 +17,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger(__name__)
 
 # Create tables
-Base.metadata.create_all(engine)
-logger.info("Database tables created")
+# Phase 2.2: Alembic is the authoritative schema source.
+# create_all() is disabled for production; set AUTO_CREATE_SCHEMA=true for dev/test.
+if os.environ.get("AUTO_CREATE_SCHEMA", "false").lower() == "true":
+    Base.metadata.create_all(engine)
+    logger.info("Database tables created via create_all (AUTO_CREATE_SCHEMA=true)")
+else:
+    logger.info("Schema managed by Alembic. Run 'alembic upgrade head' to create/update tables.")
 
 # Recover tasks interrupted by process crash/restart
 try:

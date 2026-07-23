@@ -163,22 +163,23 @@ class FakePaperSource:
 
 @pytest.fixture
 def temp_db():
-    """Create a temporary SQLite database with all tables."""
+    """Create a temporary SQLite database via Alembic migrations."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
 
+    # Use Alembic to create schema (authoritative)
+    from alembic.config import Config as AlembicConfig
+    from alembic import command as alembic_command
+
+    cfg = AlembicConfig()
+    cfg.set_main_option('sqlalchemy.url', f'sqlite:///{db_path}')
+    script_loc = os.path.join(os.path.dirname(__file__), "..", "alembic_migrations")
+    cfg.set_main_option('script_location', script_loc)
+    alembic_command.upgrade(cfg, 'head')
+
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
-    from app.db.session import Base
-    from app.db.models import (
-        ResearchTask, Paper, TaskPaper, ResearchRound, Report, ResearchIdea,
-        ExperimentPlan, AgentTrace, UserFeedback, PaperChunk, PaperAnalysis,
-        PaperCitation, WikiPage, PhaseRun, ResearchContract, ResearchQuestion,
-        EvidenceUnit, QuestionEvidenceLink, PaperRole, CoverageRecord, SearchQueryRecord,
-    )
-
     engine = create_engine(f"sqlite:///{db_path}")
-    Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
 
     yield engine, Session
@@ -437,48 +438,21 @@ async def test_search_failure_blocks_pipeline(temp_db):
 
 
 def test_fresh_db_migration():
-    """(#21) Fresh DB can be created via Alembic upgrade head.
-
-    NOTE: In local dev, alembic pip package may not be installed (local alembic/ dir
-    shadows it). In CI, alembic is installed via requirements.txt.
-    This test uses alembic if available, falls back to create_all for local dev.
-    """
+    """(#21) Fresh DB can be created via Alembic upgrade head — no fallback."""
     import tempfile
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
 
     try:
-        # Try to use alembic (available in CI)
-        alembic_available = False
-        try:
-            # Temporarily remove backend dir from path to avoid local alembic/ shadowing
-            backend_abs = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            saved_path = list(sys.path)
-            sys.path = [p for p in sys.path if os.path.abspath(p) != backend_abs]
-            try:
-                from alembic.config import Config as AlembicConfig
-                from alembic import command as alembic_command
-                alembic_available = True
-            finally:
-                sys.path = saved_path
-        except ImportError:
-            pass
+        from alembic.config import Config as AlembicConfig
+        from alembic import command as alembic_command
 
-        if alembic_available:
-            cfg = AlembicConfig()
-            cfg.set_main_option('sqlalchemy.url', f'sqlite:///{db_path}')
-            script_loc = os.path.join(os.path.dirname(__file__), "..", "alembic")
-            cfg.set_main_option('script_location', script_loc)
-            alembic_command.upgrade(cfg, 'head')
-            print("Migration via alembic upgrade head succeeded")
-        else:
-            # Fallback: use create_all (local dev without alembic pip package)
-            from sqlalchemy import create_engine
-            from app.db.session import Base
-            import app.db.models  # noqa: F401 — ensures all models are registered
-            engine = create_engine(f'sqlite:///{db_path}')
-            Base.metadata.create_all(engine)
-            print("Migration via create_all (alembic not installed locally)")
+        cfg = AlembicConfig()
+        cfg.set_main_option('sqlalchemy.url', f'sqlite:///{db_path}')
+        script_loc = os.path.join(os.path.dirname(__file__), "..", "alembic_migrations")
+        cfg.set_main_option('script_location', script_loc)
+        alembic_command.upgrade(cfg, 'head')
+        print("Migration via alembic upgrade head succeeded")
 
         # Verify tables exist
         from sqlalchemy import create_engine, inspect
