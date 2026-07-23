@@ -28,14 +28,29 @@ jobs:
       - name: Compile check
         run: python -m compileall app/ -q
 
-      - name: Create tables (fresh DB)
+      - name: Fresh DB migration (Alembic)
+        env:
+          DATABASE_URL: "sqlite:///./fresh_test.db"
         run: |
+          rm -f fresh_test.db
           python -c "
-          import sys; sys.path.insert(0, '.')
-          from app.db.session import engine, Base
-          from app.db.models import *
-          Base.metadata.create_all(engine)
-          print('All tables created successfully')
+          from alembic.config import Config
+          from alembic import command
+          cfg = Config('alembic.ini')
+          cfg.set_main_option('sqlalchemy.url', 'sqlite:///./fresh_test.db')
+          command.upgrade(cfg, 'head')
+          print('Alembic upgrade head succeeded')
+          "
+          python -c "
+          from sqlalchemy import create_engine, inspect
+          engine = create_engine('sqlite:///./fresh_test.db')
+          inspector = inspect(engine)
+          tables = inspector.get_table_names()
+          required = ['research_tasks', 'papers', 'research_contracts', 'research_questions',
+                      'evidence_units', 'coverage_records', 'search_query_records', 'phase_runs']
+          for t in required:
+              assert t in tables, f'Missing table: {t}'
+          print(f'All {len(required)} required tables exist')
           "
 
       - name: Run tests
