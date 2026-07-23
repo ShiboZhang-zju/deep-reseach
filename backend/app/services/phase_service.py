@@ -1,9 +1,10 @@
 """Phase service — wraps phases with PhaseRun tracking.
 
-Phase 2.1 fixes:
-- (#16) PhaseRun covers search round, source prep, evidence, coverage, summary
-- (#17) Use SHA-256 for output_version, not Python hash()
-- (#18) Fix skip-then-reexecute problem: should_skip checks input_version properly
+Phase 2.2A:
+- (#3) Fixed skip logic: queries for completed with matching input_version
+- (#3) Removed skip_phase() — no longer creates masking skipped records
+- (#3) attempt_count increments based on previous max
+- (#3) All versions use full SHA-256 (64 hex chars)
 """
 
 import hashlib
@@ -17,42 +18,36 @@ logger = logging.getLogger(__name__)
 
 
 def compute_output_version(result) -> str:
-    """(#17) Compute stable SHA-256 output version, not Python hash()."""
+    """Compute stable SHA-256 output version (64 hex chars)."""
     if result is None:
-        return "none"
+        return hashlib.sha256(b"none").hexdigest()
     try:
         if isinstance(result, (list, dict)):
-            content = json.dumps(result, ensure_ascii=False, default=str)
+            content = json.dumps(result, sort_keys=True, ensure_ascii=False, default=str)
         elif hasattr(result, '__dict__'):
-            content = json.dumps(result.__dict__, ensure_ascii=False, default=str)
+            content = json.dumps(result.__dict__, sort_keys=True, ensure_ascii=False, default=str)
         else:
             content = str(result)
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
     except Exception:
-        return "computed"
+        return hashlib.sha256(b"error").hexdigest()
 
 
 async def execute_phase(db, task_id: str, phase_name: str, operation,
                         input_version: str = "", round_number: int = None):
     """Execute a phase with PhaseRun tracking.
 
-    Args:
-        db: SQLAlchemy session
-        task_id: Task ID
-        phase_name: Name of the phase
-        operation: Async callable(db) -> result
-        input_version: Hash/version of input data (for skip detection)
-        round_number: Optional round number for search rounds
-
-    Returns:
-        Result of operation, or None if skipped.
+    Phase 2.2A:
+    - Checks should_skip_phase (queries for completed with matching input_version)
+    - Does NOT create a 'skipped' PhaseRun (to avoid masking completed records)
+    - Records start/completion/failure
+    - attempt_count increments properly
     """
-    # (#18) Check if should skip — only if completed AND same input_version
+    # Check if should skip
     if phase_repo.should_skip_phase(db, task_id, phase_name, input_version):
-        logger.info("Task %s: phase '%s' skipped (completed, same input)",
+        logger.info("Task %s: phase '%s' skipped (completed with same input_version)",
                     task_id[:8], phase_name)
-        phase_repo.skip_phase(db, task_id, phase_name, "already_completed_same_input")
-        db.commit()
+        # Do NOT create a skipped PhaseRun — just return None
         return None
 
     # Start phase
