@@ -85,6 +85,84 @@ def count_rows(engine, table_name: str) -> int:
         return 0
 
 
+def _add_missing_columns(database_url: str):
+    """Add missing columns to existing legacy tables.
+
+    When a legacy database has tables created by Base.metadata.create_all()
+    or manual SQL, but some columns are missing (because they were added in
+    later migrations), this function adds them via ALTER TABLE.
+    """
+    engine = create_engine(database_url)
+    inspector = inspect(engine)
+
+    # Define expected columns per table (matching current ORM models)
+    expected_columns = {
+        'research_tasks': [
+            ('stop_reason', 'TEXT'),
+        ],
+        'papers': [
+            ('authors_json', 'TEXT'),
+            ('arxiv_id', 'TEXT'),
+            ('semantic_scholar_id', 'TEXT'),
+            ('openalex_id', 'TEXT'),
+            ('url', 'TEXT'),
+            ('pdf_url', 'TEXT'),
+            ('sources_json', 'TEXT'),
+            ('raw_json', 'TEXT'),
+            ('normalized_title', 'TEXT'),
+            ('title_hash', 'TEXT'),
+        ],
+        'task_papers': [
+            ('relevance_score', 'REAL'),
+            ('authority_score', 'REAL'),
+            ('recency_score', 'REAL'),
+            ('novelty_score', 'REAL'),
+            ('idea_potential_score', 'REAL'),
+            ('reason', 'TEXT'),
+            ('summary', 'TEXT'),
+            ('created_at', 'DATETIME'),
+        ],
+        'research_rounds': [
+            ('queries_json', 'TEXT'),
+            ('duplicate_rate', 'REAL'),
+            ('knowledge_gaps_json', 'TEXT'),
+        ],
+        'research_ideas': [
+            ('motivation', 'TEXT'),
+            ('method_sketch', 'TEXT'),
+            ('expected_contribution', 'TEXT'),
+            ('novelty', 'REAL'),
+            ('feasibility', 'REAL'),
+            ('significance', 'REAL'),
+            ('evidence_support', 'REAL'),
+            ('differentiation', 'REAL'),
+            ('experimentability', 'REAL'),
+            ('potential_impact', 'REAL'),
+            ('risk', 'REAL'),
+            ('related_paper_ids_json', 'TEXT'),
+            ('user_selected', 'BOOLEAN DEFAULT 0'),
+            ('idea_status', "TEXT DEFAULT 'active'"),
+        ],
+    }
+
+    with engine.connect() as conn:
+        for table_name, columns in expected_columns.items():
+            if table_name not in inspector.get_table_names():
+                continue
+
+            existing_cols = {c['name'] for c in inspector.get_columns(table_name)}
+            for col_name, col_type in columns:
+                if col_name not in existing_cols:
+                    print(f"  Adding column {table_name}.{col_name} ({col_type})")
+                    conn.execute(text(
+                        f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                    ))
+                    existing_cols.add(col_name)
+        conn.commit()
+
+    engine.dispose()
+
+
 def backup_database(db_path: str) -> str:
     """Create a timestamped backup of the database file."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -149,6 +227,12 @@ def bootstrap(database_url: str = None) -> bool:
         else:
             print("Could not detect revision, stamping to 0001_baseline")
             alembic_command.stamp(cfg, '0001_baseline')
+
+        # Add missing columns to existing tables before upgrade
+        # (Alembic migrations assume tables match the revision they were stamped at,
+        # but legacy DBs may have partial columns)
+        print("Checking for missing columns in existing tables...")
+        _add_missing_columns(database_url)
 
         print("Running alembic upgrade head...")
         alembic_command.upgrade(cfg, 'head')

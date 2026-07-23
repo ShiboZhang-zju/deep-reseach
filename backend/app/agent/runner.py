@@ -12,6 +12,9 @@ All step implementations live in app/agent/steps/ for testability.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -45,6 +48,10 @@ from app.services.event_service import emit_event, emit_event_with_cleanup
 logger = logging.getLogger(__name__)
 
 
+class RoundEvidenceCoverageError(Exception):
+    """Raised when evidence extraction or coverage update fails in a round."""
+
+
 @dataclass
 class SearchLoopResult:
     """Result of the search loop — determines if downstream can proceed."""
@@ -62,8 +69,6 @@ class RoundEvidenceCoverageResult:
     new_evidence_count: int
     coverage_snapshot_count: int
     reason: str
-
-logger = logging.getLogger(__name__)
 
 # Task registry for asyncio tasks (P0-1: protected by lock)
 _task_registry: dict[str, asyncio.Task] = {}
@@ -530,20 +535,83 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
         while round_attempts < MAX_ATTEMPTS_PER_ROUND:
             round_attempts += 1
             try:
-                # Generate queries
-                queries = await generate_queries(db, state, llm)
-                state.used_queries.extend(queries)
-                emit_event(task_id, "queries_generated", {"round": round_num, "queries": queries})
+                # Phase 2.2A Hotfix (#5): PhaseRun for search_round_N
+                search_phase_name = f"search_round_{round_num}"
+                search_input_version = hashlib.sha256(
+                    f"{state.contract_id}:{round_num}:{','.join(state.used_queries[-20:])}".encode()
+                ).hexdigest()
 
-                # Search + dedup + save
-                papers_found, deduped_count, new_paper_ids = await search_and_save_papers(
-                    db, state, queries, task_id, round_num
+                async def _search_op(db):
+                    # Generate queries — returns list[SearchQueryExecution]
+                    query_executions = await generate_queries(db, state, llm)
+                    # state.used_queries is already updated inside generate_queries
+                    # — runner must NOT extend it again (single write point)
+
+                    # Emit structured event (not dataclass)
+                    query_payloads = [dataclasses.asdict(q) for q in query_executions]
+                    emit_event(task_id, "queries_generated", {
+                        "round": round_num,
+                        "queries": [q.query_text for q in query_executions],
+                        "structured_queries": query_payloads,
+                    })
+
+                    # Search + dedup + save (now accepts SearchQueryExecution list)
+                    papers_found, deduped_count, new_paper_ids = await search_and_save_papers(
+                        db, state, query_executions, task_id, round_num
+                    )
+
+                    # Score papers
+                    scored = await score_papers(db, state, llm, task_id, round_num)
+
+                    # Round summary
+                    round_summary, gaps = await summarize_round(db, state, llm, round_num, scored)
+                    state.knowledge_gaps = gaps
+                    state.round_summaries.append(round_summary)
+
+                    duplicate_rate = 1.0 - (len(new_paper_ids) / max(papers_found, 1))
+
+                    # Save round with structured query JSON
+                    query_texts = [q.query_text for q in query_executions]
+                    paper_repo.save_round(
+                        db, task_id, round_num,
+                        query_texts,
+                        papers_found, len(new_paper_ids), duplicate_rate,
+                        round_summary, gaps
+                    )
+                    db.commit()
+
+                    return {
+                        "papers_found": papers_found,
+                        "new_papers": new_paper_ids,
+                        "scored_count": len(scored),
+                    }
+
+                search_result = await phase_service.execute_phase(
+                    db, task_id, search_phase_name, _search_op,
+                    input_version=search_input_version,
+                    round_number=round_num,
                 )
+                # Reload state after search phase
+                state = task_repo.get_state(db, task_id)
 
-                # Score papers
+                # Extract results from search phase (or from DB if skipped)
+                if search_result is None:
+                    # Phase was skipped — recover from DB
+                    from app.db.models import ResearchRound as _RR
+                    rr = db.query(_RR).filter(
+                        _RR.task_id == task_id, _RR.round_number == round_num
+                    ).first()
+                    new_paper_ids = []
+                    if rr:
+                        papers_found = rr.papers_found or 0
+                    else:
+                        papers_found = 0
+                else:
+                    papers_found = search_result["papers_found"]
+                    new_paper_ids = search_result["new_papers"]
+
+                # Update high priority tracking
                 high_priority_before = len(state.high_priority_paper_ids)
-                scored_papers = await score_papers(db, state, llm, task_id, round_num)
-
                 new_high = len(state.high_priority_paper_ids) - high_priority_before
                 logger.info("Round %d: %d high-priority (%d new), total high=%d",
                             round_num, new_high, new_high, len(state.high_priority_paper_ids))
@@ -552,72 +620,106 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
                 else:
                     no_new_high_priority_count = 0
 
-                # Round summary
-                task_repo.update_status(db, task_id, "summarizing")
-                db.commit()
-                round_summary, gaps = await summarize_round(db, state, llm, round_num, scored_papers)
-                state.knowledge_gaps = gaps
-                state.round_summaries.append(round_summary)
-
-                duplicate_rate = 1.0 - (len(new_paper_ids) / max(papers_found, 1))
-
-                paper_repo.save_round(
-                    db, task_id, round_num, queries,
-                    papers_found, len(new_paper_ids), duplicate_rate,
-                    round_summary, gaps
-                )
-
-                # Phase 2.2A Closure (#7): Extract evidence + update coverage PER ROUND
-                # with RoundEvidenceCoverageResult for failure propagation
+                # Phase 2.2A Hotfix (#4,#5): Extract evidence + update coverage PER ROUND
+                # with proper failure propagation and PhaseRun integration
                 if state.pipeline_version >= 2:
                     ec_result = RoundEvidenceCoverageResult(
                         evidence_status="pending", coverage_status="pending",
                         new_evidence_count=0, coverage_snapshot_count=0, reason=""
                     )
+
+                    # Evidence extraction via PhaseRun
+                    ev_phase_name = f"extract_evidence_round_{round_num}"
+                    ev_input_version = hashlib.sha256(
+                        f"{task_id}:{round_num}:{len(state.collected_paper_ids)}".encode()
+                    ).hexdigest()
+
+                    async def _ev_op(db):
+                        return await extract_evidence_units(db, state, llm, task_id, round_num)
+
                     try:
                         task_repo.update_status(db, task_id, "extracting_evidence")
-                        state.current_phase = f"extract_evidence_round_{round_num}"
+                        state.current_phase = ev_phase_name
+                        task_repo.save_state(db, task_id, state)
                         db.commit()
                         emit_event(task_id, "status", {"status": "extracting_evidence", "round": round_num})
-                        ev_count = await extract_evidence_units(db, state, llm, task_id, round_num)
+
+                        ev_result = await phase_service.execute_phase(
+                            db, task_id, ev_phase_name, _ev_op,
+                            input_version=ev_input_version,
+                            round_number=round_num,
+                        )
+                        state = task_repo.get_state(db, task_id)
+                        ev_count = ev_result if isinstance(ev_result, int) else 0
                         ec_result.new_evidence_count = ev_count
-                        ec_result.evidence_status = "completed" if ev_count >= 0 else "failed"
-                        logger.info("Round %d: extracted %d evidence units", round_num, ev_count)
+
+                        # Check for valid evidence
+                        from app.db.models import EvidenceUnit as _EU
+                        valid_evidence_count = db.query(_EU).filter(
+                            _EU.task_id == task_id,
+                            _EU.verification_status.notin_(["rejected"]),
+                        ).count()
+
+                        if valid_evidence_count == 0 and ev_count == 0:
+                            ec_result.evidence_status = "failed"
+                            ec_result.reason = "no valid evidence extracted"
+                        else:
+                            ec_result.evidence_status = "completed"
+                        logger.info("Round %d: extracted %d evidence units (%d valid total)",
+                                    round_num, ev_count, valid_evidence_count)
                     except Exception as ev_err:
                         logger.error("Task %s: Round %d evidence failed: %s", task_id[:8], round_num, ev_err)
                         ec_result.evidence_status = "failed"
                         ec_result.reason = f"evidence: {str(ev_err)[:200]}"
                         emit_event(task_id, "evidence_error", {"round": round_num, "error": str(ev_err)[:200]})
 
+                    # Coverage update (only if evidence succeeded) via PhaseRun
                     if ec_result.evidence_status != "failed":
+                        cov_phase_name = f"update_coverage_round_{round_num}"
+                        cov_input_version = hashlib.sha256(
+                            f"{task_id}:{round_num}:{ec_result.new_evidence_count}".encode()
+                        ).hexdigest()
+
+                        async def _cov_op(db):
+                            return await update_coverage_matrix(db, state, llm, task_id, round_num)
+
                         try:
                             task_repo.update_status(db, task_id, "updating_coverage")
-                            state.current_phase = f"update_coverage_round_{round_num}"
+                            state.current_phase = cov_phase_name
+                            task_repo.save_state(db, task_id, state)
                             db.commit()
-                            deltas = await update_coverage_matrix(db, state, llm, task_id, round_num)
+                            await phase_service.execute_phase(
+                                db, task_id, cov_phase_name, _cov_op,
+                                input_version=cov_input_version,
+                                round_number=round_num,
+                            )
+                            state = task_repo.get_state(db, task_id)
                             from app.db.models import CoverageRecord as _CR
                             ec_result.coverage_snapshot_count = db.query(_CR).filter(
                                 _CR.task_id == task_id,
                                 _CR.round_number == round_num,
                             ).count()
-                            ec_result.coverage_status = "completed" if ec_result.coverage_snapshot_count > 0 else "failed"
-                            if ec_result.coverage_status == "failed":
+                            if ec_result.coverage_snapshot_count > 0:
+                                ec_result.coverage_status = "completed"
+                            else:
+                                ec_result.coverage_status = "failed"
                                 ec_result.reason = "no coverage snapshots generated"
-                            logger.info("Round %d: coverage updated (%d snapshots)", round_num, ec_result.coverage_snapshot_count)
+                            logger.info("Round %d: coverage updated (%d snapshots)",
+                                        round_num, ec_result.coverage_snapshot_count)
                         except Exception as cov_err:
                             logger.error("Task %s: Round %d coverage failed: %s", task_id[:8], round_num, cov_err)
                             ec_result.coverage_status = "failed"
-                            ec_result.reason = f"coverage: {str(cov_err)[:200]}"
+                            if not ec_result.reason:
+                                ec_result.reason = f"coverage: {str(cov_err)[:200]}"
+                            else:
+                                ec_result.reason += f" | coverage: {str(cov_err)[:200]}"
                             emit_event(task_id, "coverage_error", {"round": round_num, "error": str(cov_err)[:200]})
 
-                    # (#7) Check if round should fail
+                    # (#4) Failure propagation: raise to trigger round retry
                     if ec_result.evidence_status == "failed" or ec_result.coverage_status == "failed":
-                        logger.error("Task %s: Round %d evidence/coverage failed — %s",
-                                     task_id[:8], round_num, ec_result.reason)
-                        # This round is not fully successful — continue but track
-                        # If ALL rounds fail, SearchLoopResult will be failed
+                        raise RoundEvidenceCoverageError(ec_result.reason or "evidence/coverage failed")
 
-                # Check early termination
+                # Check early termination (only after evidence+coverage succeed)
                 et_stop, et_reason = early_termination_check(state, no_new_high_priority_count, duplicate_rate)
                 if et_stop:
                     state.stop_reason = et_reason
@@ -880,19 +982,25 @@ async def _idea_retry_search_round(db, state: ResearchState, llm, task_id: str, 
     logger.info("=== Task %s: Round %d (idea retry) ===", task_id[:8], round_num)
     emit_event(task_id, "round_start", {"round": round_num})
 
-    queries = await generate_queries(db, state, llm)
-    state.used_queries.extend(queries)
-    emit_event(task_id, "queries_generated", {"round": round_num, "queries": queries})
+    query_executions = await generate_queries(db, state, llm)
+    # state.used_queries already updated inside generate_queries
+    query_payloads = [dataclasses.asdict(q) for q in query_executions]
+    emit_event(task_id, "queries_generated", {
+        "round": round_num,
+        "queries": [q.query_text for q in query_executions],
+        "structured_queries": query_payloads,
+    })
 
     papers_found, deduped_count, new_paper_ids = await search_and_save_papers(
-        db, state, queries, task_id, round_num
+        db, state, query_executions, task_id, round_num
     )
 
     await score_papers(db, state, llm, task_id, round_num)
     round_summary, gaps = await summarize_round(db, state, llm, round_num, [])
     state.knowledge_gaps = gaps
     state.round_summaries.append(round_summary)
-    paper_repo.save_round(db, task_id, round_num, queries, papers_found,
+    query_texts = [q.query_text for q in query_executions]
+    paper_repo.save_round(db, task_id, round_num, query_texts, papers_found,
                           len(new_paper_ids), 1.0 - (len(new_paper_ids) / max(papers_found, 1)),
                           round_summary, gaps)
     task_repo.save_state(db, task_id, state)
