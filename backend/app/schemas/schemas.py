@@ -207,6 +207,29 @@ class ExperimentPlanSchema(BaseModel):
     risks: str
 
 
+class IdeaMethodExtract(BaseModel):
+    """P0-3: Structured extraction of method_sketch components via LLM.
+    Replaces regex-based extraction with LLM-based parsing for accuracy."""
+    baselines: list[str] = Field(default_factory=list, description="Baseline method names mentioned (real, verifiable methods only)")
+    datasets: list[str] = Field(default_factory=list, description="Dataset names mentioned (real, well-known datasets only)")
+    metrics: list[str] = Field(default_factory=list, description="Evaluation metrics mentioned")
+    model_architecture: str = Field(default="", description="Model architecture description")
+    algorithm: str = Field(default="", description="Algorithm description")
+    has_fake_content: bool = Field(default=False, description="True if any baseline/dataset appears fabricated or non-existent")
+    fake_items: list[str] = Field(default_factory=list, description="Names that appear fabricated or non-existent")
+
+
+class PaperAnalysisSchema(BaseModel):
+    """Structured deep analysis of a single paper."""
+    problem: str = Field(..., description="论文解决的具体问题（中文）")
+    method_detail: str = Field(..., description="方法细节：架构、算法、关键创新点（中文，具体到技术层级）")
+    experiment_setup: str = Field(..., description="实验设置：数据集、基线、评估指标（中文）")
+    key_results: str = Field(..., description="关键结果：具体数值（中文，如'Top-10: 45%'而非'效果很好'）")
+    limitations: str = Field(..., description="局限性：作者承认的或显而易见的局限（中文）")
+    extendable_components: str = Field(..., description="可复用/改进的组件：哪些模块可以被复用、改进或与其他方法组合（中文）")
+    source_sections: dict = Field(default_factory=dict, description="信息来源章节，如 {'method': 'Section 3', 'results': 'Table 2'}")
+
+
 # === Self-feedback schemas (P0) ===
 
 class ReportFeedback(BaseModel):
