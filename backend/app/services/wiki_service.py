@@ -139,8 +139,13 @@ async def ingest_papers_to_wiki(db: Session, papers: list, llm, task_id: str) ->
 # === Helpers: Build context for LLM ===
 
 def _build_paper_context(papers: list, task_id: str, db: Session) -> str:
-    """Build paper context text for wiki ingest prompt."""
-    from app.db.models import TaskPaper
+    """Build paper context text for wiki ingest prompt.
+
+    Uses paper_analyses (deep structured analysis) when available,
+    falls back to abstract + method_extract.
+    """
+    from app.db.models import TaskPaper, PaperAnalysis
+    from app.agent.steps.analyze_papers import format_analysis_for_context
 
     lines = []
     for i, p in enumerate(papers):
@@ -149,16 +154,30 @@ def _build_paper_context(papers: list, task_id: str, db: Session) -> str:
             TaskPaper.paper_id == p.id,
         ).first()
 
-        method_extract = ""
-        if tp and tp.summary:
-            parts = tp.summary.split("方法:")
-            if len(parts) > 1:
-                method_extract = parts[1].strip()
+        # P0-5: Use deep analysis if available
+        analysis = db.query(PaperAnalysis).filter(
+            PaperAnalysis.paper_id == p.id,
+            PaperAnalysis.task_id == task_id,
+        ).first()
 
-        lines.append(
-            f"[P{i + 1}] ID:{p.id[:8]} | {p.title} ({p.year}) [{p.venue or 'N/A'}]\n"
-            f"  摘要: {(p.abstract or 'N/A')[:500]}\n"
-            f"  方法提取: {method_extract or 'N/A'}\n"
+        if analysis:
+            lines.append(
+                f"[P{i + 1}] ID:{p.id[:8]} | {p.title} ({p.year}) [{p.venue or 'N/A'}]\n"
+                f"  深度分析:\n"
+                f"{format_analysis_for_context(analysis)}"
+            )
+        else:
+            # Fallback: use abstract + method_extract (old behavior)
+            method_extract = ""
+            if tp and tp.summary:
+                parts = tp.summary.split("方法:")
+                if len(parts) > 1:
+                    method_extract = parts[1].strip()
+
+            lines.append(
+                f"[P{i + 1}] ID:{p.id[:8]} | {p.title} ({p.year}) [{p.venue or 'N/A'}]\n"
+                f"  摘要: {(p.abstract or 'N/A')[:500]}\n"
+                f"  方法提取: {method_extract or 'N/A'}\n"
             f"  引用数: {p.citation_count or 0}"
         )
 

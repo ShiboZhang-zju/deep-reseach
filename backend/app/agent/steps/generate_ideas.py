@@ -12,17 +12,37 @@ from app.agent.prompts import (
     NOVELTY_CHECK_SYSTEM, NOVELTY_CHECK_USER,
     IDEA_VALIDATION_SYSTEM, IDEA_VALIDATION_USER,
     IDEA_METHOD_ENRICH_SYSTEM, IDEA_METHOD_ENRICH_USER,
+    IDEA_EXTRACT_SYSTEM, IDEA_EXTRACT_USER,
 )
 from app.db.models import Paper, TaskPaper, Report
 from app.db.repositories import paper_repo
 from app.schemas.schemas import (
     IdeaList, IdeaScore, NoveltyCheck,
-    IdeaValidationList,
+    IdeaValidationList, IdeaMethodExtract,
 )
 from app.services.event_service import emit_event
 from app.services.search_service import search_service
 
 logger = logging.getLogger(__name__)
+
+
+def _is_real_match(name: str, text: str) -> bool:
+    """Check if name appears as a real method/dataset name in text.
+
+    Uses word-boundary matching for short names (<=4 chars) to avoid
+    false positives like 'GAT' matching 'concatenate'.
+    For longer names, substring match is acceptable.
+    """
+    if not name or not text:
+        return False
+    name_lower = name.lower()
+    text_lower = text.lower()
+    if len(name_lower) <= 4:
+        # Short names: require word boundary to avoid false matches
+        # Match as whole word or with common separators
+        pattern = r'(?<![a-z0-9])' + re.escape(name_lower) + r'(?![a-z0-9])'
+        return bool(re.search(pattern, text_lower))
+    return name_lower in text_lower
 
 
 # Known real baselines (generic terms that are real but not specific method names)
@@ -36,6 +56,23 @@ KNOWN_REAL_BASELINES = {
     "标准对话系统", "标准多智能体", "标准记忆机制", "标准记忆", "标准方法",
     "标准多模态", "标准LLM", "标准LLM无记忆", "无记忆", "标准基线",
     "标准对话", "标准多智能体协作", "标准框架",
+    # P0-2: Added test oracle / SE baselines
+    "toga", "codet5", "graphcodebert", "codellama", "starcoder",
+    "gcn", "gat", "graphsage", "gin", "mpnn",
+    "llamaguard", "deepseek-coder", "wizardcoder",
+    "defects4j", "sf110",
+    # P1: Added more APR/SE method names
+    "chatrepair", "cigar", "repaircat", "fixgpt", "gpt-4o", "gpt-4o-mini",
+    "gpt-3.5-turbo", "gpt-3.5", "deepseek", "deepseek-v3", "deepseek-r1",
+    "deepseek coder", "claude", "claude-3", "claude-3.5", "claude-3 opus",
+    "gemini", "mistral", "grok", "qwen", "qwen2.5", "glm-4",
+    "kodezi", "kodezi chronos", "chronos-1", "chronos",
+    "self-debug", "rtlfixer", "verigen", "rtlcoder",
+    "tbar", "selfapr", "alpharepair", "recoder", "codereviewer",
+    "hdldebugger", "scanfix", "bloomapr", "pracapr", "gamma",
+    "autoprogram", "fixagent", "viscratch", "hafix", "knowbug",
+    "codet5+", "plbart", "codegen", "polycoder",
+    "virustotal", "sonarqube",
 }
 
 KNOWN_DATASETS = {
@@ -46,6 +83,15 @@ KNOWN_DATASETS = {
     "imagenet", "cifar", "cifar-10", "cifar-100", "mnist", "fashion-mnist",
     "openbookqa", "arc", "hellaswag", "winogrande", "gsm8k", "math",
     "human eval", "humaneval", "mbpp", "codecontests",
+    # P0-2: Added SE datasets
+    "defects4j", "sf110", "codexglue", "concode", "tocode",
+    # P1: Added more SE benchmarks
+    "swe-bench", "swe-bench lite", "swe-bench verified", "gitbug-java", "gitbug-java",
+    "debugbench", "mdeval", "llmseceval", "securityeval", "xsafety",
+    "quixbugs", "codeflaws", "bugsinpy", "bugsjs", "bugsphp",
+    "repairbench", "runbugrun", "codereval",
+    "hackage", "tocode", "evor-bench",
+    "appsurvey", "codeforces", "leetcode",
 }
 
 
@@ -70,11 +116,31 @@ async def generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
     high_papers = [(tp.paper, tp) for tp in all_tps if tp.paper]
 
     valid_paper_ids = {p.id for p, _ in high_papers}
-    high_papers_text = "\n".join(
-        f"[{p.id}] {p.title} ({p.year}) [{p.venue or 'N/A'}]: {(p.abstract or '')[:500]}\n"
-        f"  方法摘要: {tp.summary or 'N/A'}"
-        for p, tp in high_papers
-    )
+    # Build P-number -> paper_id mapping for hallucination-free reference
+    paper_num_to_id = {}
+    # P0-5: Use deep analysis when available, fallback to abstract + summary
+    from app.agent.steps.analyze_papers import get_analyses_for_task, format_analysis_for_context
+    analyses = get_analyses_for_task(db, task_id)
+
+    paper_lines = []
+    for i, (p, tp) in enumerate(high_papers):
+        num = f"P{i+1}"
+        paper_num_to_id[num] = p.id
+        analysis = analyses.get(p.id)
+        if analysis:
+            paper_lines.append(
+                f"[{num}] {p.title} ({p.year}) [{p.venue or 'N/A'}]:\n"
+                f"{format_analysis_for_context(analysis)}"
+            )
+        else:
+            paper_lines.append(
+                f"[{num}] {p.title} ({p.year}) [{p.venue or 'N/A'}]: {(p.abstract or '')[:500]}\n"
+                f"  方法摘要: {tp.summary or 'N/A'}"
+            )
+    high_papers_text = "\n".join(paper_lines)
+
+    # P1-1: Build component combination matrix from extendable_components
+    combination_context = _build_combination_context(analyses, high_papers)
 
     # RAG: Retrieve full-text passages for idea grounding
     rag_evidence = await _retrieve_idea_rag(state, valid_paper_ids, task_id)
@@ -95,6 +161,8 @@ async def generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
     )
     if cluster_context:
         user_content += "\n\n" + cluster_context
+    if combination_context:
+        user_content += "\n\n" + combination_context
     if rag_evidence:
         user_content += rag_evidence
     # Add wiki context
@@ -125,7 +193,7 @@ async def generate_and_score_ideas(db, state: ResearchState, llm, task_id: str,
 
     # Step 2: Search-based baseline + dataset verification
     validation_penalties = await _verify_baselines_and_datasets(
-        db, state, task_id, idea_list, high_papers, all_paper_abstracts_lower,
+        db, state, llm, task_id, idea_list, high_papers, all_paper_abstracts_lower,
         validation_penalties, ideas_to_skip
     )
 
@@ -160,6 +228,40 @@ async def _retrieve_idea_rag(state, valid_paper_ids, task_id) -> str:
     except Exception as e:
         logger.warning("Task %s: RAG retrieval failed (non-fatal): %s", task_id[:8], e)
     return ""
+
+
+def _build_combination_context(analyses: dict, high_papers: list) -> str:
+    """P1-1: Build component combination matrix from paper_analyses.
+
+    Extracts extendable_components from each paper's analysis and presents
+    them as a combination matrix, encouraging LLM to generate cross-paper
+    innovation ideas.
+    """
+    if not analyses:
+        return ""
+
+    lines = ["## 论文可扩展组件矩阵（用于跨论文组合创新）\n"]
+    lines.append("以下是从各论文中提取的可复用/可改进组件。生成Idea时，优先考虑**跨论文组合**这些组件：\n")
+
+    for i, (paper, _) in enumerate(high_papers):
+        analysis = analyses.get(paper.id)
+        if not analysis or not analysis.extendable_components:
+            continue
+        if analysis.extendable_components.strip() and analysis.extendable_components.strip() != "论文未提及":
+            lines.append(f"- [P{i+1}] {paper.title[:60]}:")
+            # Split by newline or numbered list
+            components = re.split(r'[\n;；]|(?<=\d\.)\s', analysis.extendable_components)
+            for comp in components:
+                comp = comp.strip().rstrip('。.')
+                if comp and len(comp) > 3:
+                    lines.append(f"  * {comp}")
+
+    lines.append("\n**组合创新示例**：将论文A的组件X + 论文B的组件Y → 新方法。每个Idea应明确说明组合了哪些论文的哪些组件。")
+
+    result = "\n".join(lines)
+    if len(result) < 100:  # Not enough useful content
+        return ""
+    return result
 
 
 def _build_cluster_context(cluster_list) -> str:
@@ -247,150 +349,104 @@ async def _llm_validate_ideas(db, llm, state, task_id, idea_list, high_papers,
     return ideas_to_skip, validation_penalties
 
 
-async def _verify_baselines_and_datasets(db, state, task_id, idea_list, high_papers,
+async def _verify_baselines_and_datasets(db, state, llm, task_id, idea_list, high_papers,
                                           all_paper_abstracts_lower, validation_penalties, ideas_to_skip):
-    """Search-based baseline + dataset verification."""
+    """LLM-based baseline + dataset verification.
+
+    Replaces white-list + search verification with LLM judgment.
+    The LLM is given the known-real methods/datasets from paper_analyses
+    as context, and uses its own knowledge to judge if each name is real.
+    """
     try:
-        baselines_to_check: list[tuple[str, int]] = []
+        # === Build known-real items list from paper_analyses ===
+        from app.db.models import PaperAnalysis
+        all_analyses = db.query(PaperAnalysis).filter(
+            PaperAnalysis.task_id == task_id,
+        ).all()
+
+        # Extract method names and dataset names from paper analyses + paper titles
+        known_methods = set()
+        known_datasets = set()
+        _stop_words = {'The', 'This', 'These', 'Using', 'Based', 'For', 'With', 'From', 'They',
+                       'Our', 'We', 'Their', 'And', 'But', 'Not', 'Are', 'Was', 'Were', 'Has',
+                       'Have', 'Had', 'Will', 'Would', 'Could', 'Should', 'May', 'Might', 'Can',
+                       'All', 'Each', 'Some', 'Most', 'More', 'Less', 'Very', 'Such', 'Same',
+                       'Other', 'Than', 'Then', 'When', 'Where', 'While', 'Which', 'What', 'Who',
+                       'How', 'Why', 'That', 'Those', 'A', 'An', 'Towards', 'Exploring',
+                       'Leveraging', 'Enhancing', 'Automated', 'Automatic', 'Assessing',
+                       'Evaluating', 'Understanding', 'Combining', 'Beyond', 'Large', 'Language',
+                       'Models', 'Deep', 'Learning', 'Neural', 'Network', 'Program', 'Code',
+                       'Software', 'Bug', 'Fault', 'Repair', 'Fix', 'Debug', 'Error', 'Test',
+                       'Survey', 'Review', 'Study', 'Analysis', 'Approach', 'Framework', 'System',
+                       'Method', 'Tool', 'Benchmark', 'Evaluation', 'How', 'Is', 'Self'}
+
+        for a in all_analyses:
+            combined = f"{a.method_detail or ''} {a.experiment_setup or ''}"
+            for match in re.findall(r'\b[A-Z][A-Za-z0-9-]{2,}\b', combined):
+                if match not in _stop_words:
+                    known_methods.add(match)
+            for match in re.findall(r'\b[A-Z][A-Za-z0-9-]*(?:Bench|Eval|Test|Set|Data|Corpus|Suite|Base|DB|4J|Java|Py|JS|PHP)\b', combined):
+                known_datasets.add(match)
+
+        for p, _ in high_papers:
+            if p.title:
+                for w in re.findall(r'\b([A-Z][A-Za-z0-9-]{2,})\b', p.title)[:3]:
+                    if w not in _stop_words:
+                        known_methods.add(w)
+
+        known_real_items = sorted(known_methods | known_datasets)[:100]
+        known_real_text = ", ".join(known_real_items) if known_real_items else "(none)"
+        logger.info("Task %s: built known-real list with %d items from paper analyses",
+                    task_id[:8], len(known_real_items))
+
+        # === LLM extraction with known-real context ===
+        extraction_results: dict[int, IdeaMethodExtract] = {}
         for idx, item in enumerate(idea_list.ideas):
             if idx in ideas_to_skip:
                 continue
             method = item.method_sketch or ""
-            baseline_match = re.search(r'基线[：:]\s*(.+?)(?:\n|$)', method)
-            if baseline_match:
-                baseline_text = baseline_match.group(1)
-                raw_names = re.split(r'[、,，;；和与]\s*', baseline_text)
-                for name in raw_names:
-                    name = name.strip().rstrip('。.')
-                    name = re.sub(r'^(比较|对比|与|和)\s*', '', name).strip()
-                    name = re.sub(r'(进行对比|对比|的性能|等基线|等|基线|框架|系统)$', '', name).strip()
-                    name = re.sub(r'[（(].*?[)）]\s*$', '', name).strip()
-                    if len(name) > 2 and name.lower() not in KNOWN_REAL_BASELINES:
-                        if not re.match(r'^(标准|普通|基础|传统|常规|一般)', name):
-                            baselines_to_check.append((name, idx))
+            if not method.strip():
+                continue
+            try:
+                extraction = await llm_extract_method_components(
+                    db, state, task_id, item.title, method, known_real_text
+                )
+                extraction_results[idx] = extraction
+            except Exception as e:
+                logger.warning("Task %s: LLM extraction failed for idea %d: %s", task_id[:8], idx+1, e)
 
-        unique_names = set(name for name, _ in baselines_to_check)
-        logger.info("Task %s: verifying %d unique baseline names via search",
-                    task_id[:8], len(unique_names))
-
-        verified_baselines: set[str] = set()
+        # === Apply penalties based on LLM judgment ===
         fabricated_baselines: list[tuple[str, int]] = []
+        for idx, extraction in extraction_results.items():
+            if extraction.has_fake_content and extraction.fake_items:
+                for fake_name in extraction.fake_items:
+                    fabricated_baselines.append((fake_name, idx))
+                    logger.warning("Task %s: idea %d LLM flagged fabricated: %s",
+                                 task_id[:8], idx+1, fake_name)
 
-        # First check: paper database
-        for name, idea_idx in baselines_to_check:
-            name_lower = name.lower()
-            found_in_db = any(
-                name_lower in title or name_lower in abstract
-                for title, abstract in all_paper_abstracts_lower
-            )
-            if found_in_db:
-                verified_baselines.add(name)
-
-        # Second check: search verification
-        names_to_search = {name for name, _ in baselines_to_check if name not in verified_baselines}
-        semaphore = asyncio.Semaphore(3)
-
-        async def verify_one_baseline(name: str) -> tuple[str, bool]:
-            if name in verified_baselines:
-                return name, True
-            async with semaphore:
-                name_lower = name.lower()
-                try:
-                    results = await search_service.search_all_sources(name, limit=5)
-                    if not results or len(results) == 0:
-                        try:
-                            from app.paper_sources.crossref import CrossrefSource
-                            cr = CrossrefSource()
-                            cr_results = await cr.search(name, limit=5)
-                            if cr_results:
-                                for r in cr_results[:5]:
-                                    if name_lower in (r.title or "").lower():
-                                        return name, True
-                        except Exception:
-                            pass
-                        return name, False
-                    check_limit = 3 if len(name) < 5 else 5
-                    for r in results[:check_limit]:
-                        title_lower = (r.title or "").lower()
-                        if name_lower in title_lower:
-                            return name, True
-                    return name, False
-                except Exception:
-                    return name, False
-
-        if names_to_search:
-            tasks_verify = [verify_one_baseline(name) for name in names_to_search]
-            verify_results = await asyncio.gather(*tasks_verify)
-            for name, is_real in verify_results:
-                if is_real:
-                    verified_baselines.add(name)
-
-        # Build fabricated baselines list
-        for name, idea_idx in baselines_to_check:
-            if name not in verified_baselines:
-                fabricated_baselines.append((name, idea_idx))
-
-        # Apply penalties
         idea_fabricated_count: dict[int, list[str]] = {}
         for name, idea_idx in fabricated_baselines:
             idea_fabricated_count.setdefault(idea_idx, []).append(name)
 
         for idea_idx, fake_names in idea_fabricated_count.items():
-            penalty = min(0.3, 0.15 * len(fake_names))
+            penalty = min(0.2, 0.08 * len(fake_names))
             validation_penalties[idea_idx] = validation_penalties.get(idea_idx, 0) + penalty
             logger.warning("Task %s: idea %d '%s' has %d FABRICATED baselines: %s (penalty: +%.2f)",
                           task_id[:8], idea_idx+1, idea_list.ideas[idea_idx].title[:40],
                           len(fake_names), fake_names, penalty)
 
-        logger.info("Task %s: baseline verification done — %d verified, %d fabricated",
-                    task_id[:8], len(verified_baselines), len(fabricated_baselines))
+        verified_count = sum(len(e.baselines) for e in extraction_results.values()) - len(fabricated_baselines)
+        logger.info("Task %s: baseline verification done (LLM-based) — %d verified, %d fabricated",
+                    task_id[:8], verified_count, len(fabricated_baselines))
         paper_repo.save_trace(db, task_id, "idea_baseline_verification", "observation",
-                              output_data={"verified": len(verified_baselines),
+                              output_data={"verified": verified_count,
                                            "fabricated": len(fabricated_baselines),
-                                           "fabricated_names": [n for n, _ in fabricated_baselines]})
+                                           "fabricated_names": [n for n, _ in fabricated_baselines],
+                                           "method": "llm_judgment"})
         db.commit()
 
-        # === Dataset verification ===
-        datasets_to_check: list[tuple[str, int]] = []
-        for idx, item in enumerate(idea_list.ideas):
-            if idx in ideas_to_skip:
-                continue
-            method = item.method_sketch or ""
-            ds_match = re.search(r'数据集[：:]\s*(.+?)(?:\n|$)', method)
-            if ds_match:
-                ds_text = ds_match.group(1)
-                raw_names = re.split(r'[、,，;；和与]\s*', ds_text)
-                for name in raw_names:
-                    name = name.strip().rstrip('。.（）()')
-                    name = re.sub(r'格式的.*$', '', name).strip()
-                    if len(name) > 2:
-                        datasets_to_check.append((name, idx))
-
-        fabricated_datasets: list[tuple[str, int]] = []
-        for ds_name, idea_idx in datasets_to_check:
-            ds_lower = ds_name.lower()
-            if ds_lower in KNOWN_DATASETS:
-                continue
-            found_in_db = any(
-                ds_lower in title or ds_lower in abstract
-                for title, abstract in all_paper_abstracts_lower
-            )
-            if not found_in_db:
-                fabricated_datasets.append((ds_name, idea_idx))
-
-        for ds_name, idea_idx in fabricated_datasets:
-            penalty = 0.05
-            validation_penalties[idea_idx] = validation_penalties.get(idea_idx, 0) + penalty
-            logger.warning("Task %s: idea %d has SUSPICIOUS dataset: %s (penalty: +%.2f)",
-                          task_id[:8], idea_idx+1, ds_name, penalty)
-
-        if fabricated_datasets:
-            paper_repo.save_trace(db, task_id, "idea_dataset_verification", "observation",
-                                  output_data={"suspicious_datasets": [n for n, _ in fabricated_datasets]})
-            db.commit()
-
     except Exception as e:
-        logger.warning("Task %s: baseline search verification failed (non-fatal): %s", task_id[:8], e)
+        logger.warning("Task %s: baseline verification failed (non-fatal): %s", task_id[:8], e)
         paper_repo.save_trace(db, task_id, "idea_baseline_verification", "observation",
                               output_data={"status": "failed", "error": str(e)[:200]})
         db.commit()
@@ -402,16 +458,46 @@ async def _process_each_idea(db, state, llm, task_id, idea_list, high_papers,
     """Process each idea: enrich method, novelty check, score."""
     id_to_title = {p.id: p.title for p, _ in high_papers}
 
+    # Build P-number -> paper_id mapping (same as in generate_and_score_ideas)
+    paper_num_to_id = {}
+    for i, (p, _) in enumerate(high_papers):
+        paper_num_to_id[f"P{i+1}"] = p.id
+
     for idx, item in enumerate(idea_list.ideas):
         if idx in ideas_to_skip:
             logger.info("Task %s: skipping duplicate idea '%s'", task_id[:8], item.title[:40])
             continue
 
-        # Validate related_paper_ids
-        valid_ids = [pid for pid in item.related_paper_ids if pid in valid_paper_ids]
+        # Validate related_paper_ids — support both [P1] format and raw UUIDs
+        valid_ids = []
+        for pid in item.related_paper_ids:
+            # Try P-number format first (e.g., "P1", "P3")
+            if pid.upper().startswith("P") and pid[1:].isdigit():
+                paper_id = paper_num_to_id.get(pid.upper())
+                if paper_id:
+                    valid_ids.append(paper_id)
+                else:
+                    logger.warning("Idea '%s': invalid paper number '%s' (not in list)", item.title[:40], pid)
+            # Fall back to raw UUID (legacy)
+            elif pid in valid_paper_ids:
+                valid_ids.append(pid)
+            else:
+                logger.warning("Idea '%s': invalid paper ID '%s' (not in database)", item.title[:40], pid)
+
         invalid_count = len(item.related_paper_ids) - len(valid_ids)
         if invalid_count > 0:
             logger.warning("Idea '%s': %d invalid paper IDs filtered out", item.title[:40], invalid_count)
+
+        # P0-1: Reject ideas with NO valid paper references — they are hallucinated
+        if not valid_ids:
+            logger.warning("Task %s: idea '%s' has NO valid paper references — REJECTING (hallucination guard)",
+                          task_id[:8], item.title[:40])
+            paper_repo.save_trace(db, task_id, "idea_rejected_no_refs", "observation",
+                                  output_data={"title": item.title[:200],
+                                               "reason": "no valid related_paper_ids",
+                                               "raw_ids": item.related_paper_ids})
+            db.commit()
+            continue
 
         # Two-step: Enrich method_sketch with per-idea RAG retrieval
         enriched_method = await _enrich_method_sketch(
@@ -514,30 +600,74 @@ async def _enrich_method_sketch(db, state, llm, item, valid_ids, high_papers, va
     return enriched_method
 
 
+async def llm_extract_method_components(db, state, task_id, idea_title: str,
+                                         method_sketch: str, known_real_text: str = "(none)") -> IdeaMethodExtract:
+    """P0-3: Use LLM to extract structured components from method_sketch.
+
+    Replaces regex-based extraction with LLM-based parsing for accuracy.
+    Returns structured data including baselines, datasets, metrics, and
+    a has_fake_content flag for hallucination detection.
+    """
+    messages = [
+        {"role": "system", "content": IDEA_EXTRACT_SYSTEM},
+        {"role": "user", "content": IDEA_EXTRACT_USER.format(
+            topic=state.normalized_topic,
+            title=idea_title,
+            method_sketch=method_sketch,
+            known_real_items=known_real_text,
+        )},
+    ]
+    result = await llm_extract_with_retry(messages)
+    return result
+
+
+async def llm_extract_with_retry(messages, max_retries: int = 2):
+    """Call LLM for IdeaMethodExtract with retry on parse failure."""
+    from app.llm.factory import get_llm
+    llm = get_llm()
+    for attempt in range(max_retries + 1):
+        try:
+            return await llm.chat_json(messages, IdeaMethodExtract)
+        except Exception as e:
+            if attempt < max_retries:
+                await asyncio.sleep(1)
+            else:
+                raise
+
+
 async def _post_enrichment_baseline_check(db, llm, state, task_id, idx, item,
                                            enriched_method, validation_penalties):
-    """Check baselines in the enriched method sketch."""
-    try:
-        enriched_baseline_match = re.search(r'基线[：:]\s*(.+?)(?:\n|$)', enriched_method)
-        if enriched_baseline_match:
-            enriched_baselines = re.split(r'[、,，;；和与]\s*', enriched_baseline_match.group(1))
-            new_fabricated = []
-            for bname in enriched_baselines:
-                bname = re.sub(r'^(比较|对比|与|和)\s*', '', bname.strip().rstrip('。.'))
-                bname = re.sub(r'(进行对比|对比|的性能|等基线|等|基线|框架|系统)$', '', bname).strip()
-                bname = re.sub(r'[（(].*?[)）]\s*$', '', bname).strip()
-                if len(bname) > 2 and bname.lower() not in KNOWN_REAL_BASELINES:
-                    if not re.match(r'^(标准|普通|基础|传统|常规|一般)', bname):
-                        new_fabricated.append(bname)
+    """Check baselines in the enriched method sketch.
 
-            if new_fabricated:
-                new_results = await asyncio.gather(*[_verify_baseline_name(n) for n in new_fabricated])
-                confirmed_fake = [n for n, real in new_results if not real]
-                if confirmed_fake:
-                    extra_penalty = min(0.2, 0.1 * len(confirmed_fake))
-                    validation_penalties[idx] = validation_penalties.get(idx, 0) + extra_penalty
-                    logger.warning("Task %s: idea %d enriched method has %d FABRICATED baselines: %s (penalty: +%.2f)",
-                                  task_id[:8], idx+1, len(confirmed_fake), confirmed_fake, extra_penalty)
+    P0-3: Uses LLM extraction instead of regex.
+    """
+    try:
+        # P0-3: Use LLM extraction instead of regex
+        extraction = await llm_extract_method_components(
+            db, state, task_id, item.title, enriched_method
+        )
+
+        new_fabricated = []
+        for bname in extraction.baselines:
+            bname = bname.strip()
+            if len(bname) > 1 and bname.lower() not in KNOWN_REAL_BASELINES:
+                if not re.match(r'^(标准|普通|基础|传统|常规|一般)', bname):
+                    new_fabricated.append(bname)
+
+        # Also check LLM-flagged fake items
+        if extraction.has_fake_content:
+            for fake_name in extraction.fake_items:
+                if fake_name not in new_fabricated:
+                    new_fabricated.append(fake_name)
+
+        if new_fabricated:
+            new_results = await asyncio.gather(*[_verify_baseline_name(n) for n in new_fabricated])
+            confirmed_fake = [n for n, real in new_results if not real]
+            if confirmed_fake:
+                extra_penalty = min(0.2, 0.1 * len(confirmed_fake))
+                validation_penalties[idx] = validation_penalties.get(idx, 0) + extra_penalty
+                logger.warning("Task %s: idea %d enriched method has %d FABRICATED baselines: %s (penalty: +%.2f)",
+                              task_id[:8], idx+1, len(confirmed_fake), confirmed_fake, extra_penalty)
     except Exception as e:
         logger.warning("Task %s: post-enrichment baseline check failed: %s", task_id[:8], e)
     return validation_penalties

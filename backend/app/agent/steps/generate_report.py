@@ -37,11 +37,24 @@ async def generate_report(db, state: ResearchState, llm, cluster_list=None) -> s
         return "无可用论文，无法生成报告。"
 
     # Build papers text with [P1], [P2] numbering
-    papers_text = "\n".join(
-        f"[P{i+1}] {p.title} ({p.year}) [{p.venue or 'N/A'}] [citations: {p.citation_count}] DOI: {p.doi or 'N/A'}\n"
-        f"  摘要: {(p.abstract or 'N/A')[:600]}"
-        for i, p in enumerate(all_papers)
-    )
+    # P0-5: Use deep analysis when available, fallback to abstract
+    from app.agent.steps.analyze_papers import get_analyses_for_task, format_analysis_for_context
+    analyses = get_analyses_for_task(db, state.task_id)
+
+    paper_lines = []
+    for i, p in enumerate(all_papers):
+        analysis = analyses.get(p.id)
+        if analysis:
+            paper_lines.append(
+                f"[P{i+1}] {p.title} ({p.year}) [{p.venue or 'N/A'}] [citations: {p.citation_count}] DOI: {p.doi or 'N/A'}\n"
+                f"  深度分析:\n{format_analysis_for_context(analysis)}"
+            )
+        else:
+            paper_lines.append(
+                f"[P{i+1}] {p.title} ({p.year}) [{p.venue or 'N/A'}] [citations: {p.citation_count}] DOI: {p.doi or 'N/A'}\n"
+                f"  摘要: {(p.abstract or 'N/A')[:600]}"
+            )
+    papers_text = "\n".join(paper_lines)
     paper_by_index = {i + 1: p for i, p in enumerate(all_papers)}
 
     # Build clusters text from in-memory cluster_list (passed from caller)
@@ -94,7 +107,7 @@ async def generate_report(db, state: ResearchState, llm, cluster_list=None) -> s
 
     if outline and outline.sections:
         report_text = await _fill_sections(
-            db, state, llm, outline, all_papers, paper_by_index, wiki_context_text
+            db, state, llm, outline, all_papers, paper_by_index, wiki_context_text, analyses
         )
     else:
         report_text = await _one_shot_report(
@@ -121,9 +134,12 @@ async def generate_report(db, state: ResearchState, llm, cluster_list=None) -> s
     return report_text
 
 
-async def _fill_sections(db, state, llm, outline, all_papers, paper_by_index, wiki_context_text) -> str:
+async def _fill_sections(db, state, llm, outline, all_papers, paper_by_index, wiki_context_text, analyses=None) -> str:
     """Fill each section of the outline concurrently."""
     import asyncio
+
+    if analyses is None:
+        analyses = {}
 
     logger.info("Task %s: filling %d sections (step 2/2)...", state.task_id[:8], len(outline.sections))
 
@@ -158,13 +174,22 @@ async def _fill_sections(db, state, llm, outline, all_papers, paper_by_index, wi
 
             section_papers = []
             section_paper_ids = []
+            # P0-5: Use deep analysis when available
+            from app.agent.steps.analyze_papers import format_analysis_for_context
             for idx in section_paper_indices:
                 p = paper_by_index.get(idx)
                 if p:
-                    section_papers.append(
-                        f"[P{idx}] {p.title} ({p.year}) [{p.venue or 'N/A'}] [citations: {p.citation_count}]\n"
-                        f"  摘要: {(p.abstract or 'N/A')[:600]}"
-                    )
+                    analysis = analyses.get(p.id)
+                    if analysis:
+                        section_papers.append(
+                            f"[P{idx}] {p.title} ({p.year}) [{p.venue or 'N/A'}] [citations: {p.citation_count}]\n"
+                            f"  深度分析:\n{format_analysis_for_context(analysis)}"
+                        )
+                    else:
+                        section_papers.append(
+                            f"[P{idx}] {p.title} ({p.year}) [{p.venue or 'N/A'}] [citations: {p.citation_count}]\n"
+                            f"  摘要: {(p.abstract or 'N/A')[:600]}"
+                        )
                     section_paper_ids.append(p.id)
 
             # RAG evidence specific to this section's papers
