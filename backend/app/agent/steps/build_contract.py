@@ -21,18 +21,20 @@ logger = logging.getLogger(__name__)
 
 
 def compute_input_hash(task: ResearchTask, state: ResearchState) -> str:
-    """Compute a stable hash of all inputs that affect the Contract.
+    """Compute a stable SHA-256 hash of all inputs that affect the Contract.
 
     Includes:
     - task.user_input (original + clarifications)
     - state.user_feedback
+    - state.clarification_questions (Phase 2.1: #14)
     """
     parts = [
         task.user_input or "",
         state.user_feedback or "",
+        json.dumps(state.clarification_questions or [], ensure_ascii=False),
     ]
     combined = "\n".join(parts)
-    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
 async def build_research_contract(db, state: ResearchState, llm, task_id: str) -> ResearchContract:
@@ -108,7 +110,7 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
         max_runtime_minutes=result.max_runtime_minutes,
         allow_large_benchmark=result.allow_large_benchmark,
         allow_model_training=result.allow_model_training,
-        experiment_preferences_json=json.dumps({}, ensure_ascii=False),
+        experiment_preferences_json=json.dumps(result.experiment_preferences, ensure_ascii=False),
         key_terms_json=json.dumps(result.key_terms, ensure_ascii=False),
         time_scope_start=result.time_scope_start,
         time_scope_end=result.time_scope_end,

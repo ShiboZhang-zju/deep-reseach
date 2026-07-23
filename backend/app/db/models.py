@@ -511,8 +511,8 @@ class ResearchQuestion(Base):
 class EvidenceUnit(Base):
     """A single piece of evidence extracted from a paper.
 
-    Phase 2: Replaces the 'paper_analyses' summary-only approach with
-    granular, traceable evidence units that can be linked to research questions.
+    Phase 2.1: Added span_start, span_end, source_chunk_hash for provenance
+    validation. Page numbers come from actual PDF pages, not chunk indices.
     """
     __tablename__ = "evidence_units"
 
@@ -521,13 +521,18 @@ class EvidenceUnit(Base):
     paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
 
     evidence_type = Column(Text, nullable=False)
-    # problem / method / result / limitation / dataset / metric /
-    # negative_result / future_work / comparison
 
     normalized_claim = Column(Text, nullable=False)
     original_span = Column(Text)
     section = Column(Text)
-    page_number = Column(Integer)
+    page_number = Column(Integer)      # Real PDF page number
+    page_start = Column(Integer)       # Phase 2.1: for multi-page spans
+    page_end = Column(Integer)
+
+    # Phase 2.1: Byte-level provenance within source chunk
+    span_start = Column(Integer)       # Character offset in source chunk
+    span_end = Column(Integer)         # Character offset end in source chunk
+    source_chunk_hash = Column(Text)   # SHA-256 of the source chunk text
 
     conditions_json = Column(Text, default="{}")
     dataset_name = Column(Text)
@@ -535,13 +540,13 @@ class EvidenceUnit(Base):
     result_value = Column(Text)
 
     extraction_method = Column(Text, default="llm")
-    # llm / abstract_only / pdf_fulltext
     extraction_confidence = Column(Float, default=0.5)
 
     verification_status = Column(Text, default="unverified")
-    # unverified / verified / conflicted / rejected / abstract_only
+    # unverified / verified / conflicted / rejected / abstract_only / upgraded
 
     created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     paper = relationship("Paper")
 
@@ -550,6 +555,8 @@ class EvidenceUnit(Base):
         Index("idx_eu_paper", "paper_id"),
         Index("idx_eu_type", "evidence_type"),
         Index("idx_eu_verification", "verification_status"),
+        Index("idx_eu_chunk_hash", "source_chunk_hash"),
+        Index("idx_eu_task_paper_hash", "task_id", "paper_id", "source_chunk_hash"),
     )
 
 
@@ -605,6 +612,7 @@ class CoverageRecord(Base):
     """Coverage of a ResearchQuestion based on accumulated EvidenceUnits.
 
     Updated after each search round. Drives the next round's question selection.
+    Phase 2.1: Added round_number for per-round snapshots.
     """
     __tablename__ = "coverage_records"
 
@@ -620,11 +628,52 @@ class CoverageRecord(Base):
     unresolved_aspects_json = Column(Text, default="[]")
     unavailable_reason = Column(Text)
 
+    # Phase 2.1: Round tracking for snapshots
+    round_number = Column(Integer, nullable=False, default=0)
+
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
     created_at = Column(DateTime, default=_utcnow)
 
     __table_args__ = (
         Index("idx_cr_task", "task_id"),
         Index("idx_cr_question", "question_id"),
-        Index("idx_cr_task_question", "task_id", "question_id", unique=True),
+        Index("idx_cr_task_question_round", "task_id", "question_id", "round_number"),
+    )
+
+
+class SearchQueryRecord(Base):
+    """Structured search query with target question binding.
+
+    Phase 2.1 (#3): Each query is linked to a specific ResearchQuestion,
+    has an intent, and tracks results.
+    """
+    __tablename__ = "search_query_records"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    query_text = Column(Text, nullable=False)
+
+    intent = Column(Text, nullable=False)
+    # survey / seminal / recent_work / benchmark / direct_neighbor /
+    # limitation / negative_result / gap_falsification / component_combination
+
+    target_question_id = Column(String, ForeignKey("research_questions.id"))
+    expected_evidence_type = Column(Text)
+
+    round_number = Column(Integer, nullable=False)
+    status = Column(Text, default="pending")
+    # pending / completed / failed
+
+    result_count = Column(Integer, default=0)
+    new_paper_count = Column(Integer, default=0)
+    evidence_unit_count = Column(Integer, default=0)
+    execution_error = Column(Text)
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_sqr_task", "task_id"),
+        Index("idx_sqr_intent", "intent"),
+        Index("idx_sqr_round", "round_number"),
+        Index("idx_sqr_question", "target_question_id"),
     )

@@ -344,13 +344,23 @@ async def run_task(task_id: str):
 
         # === 3c. Update Coverage Matrix (Phase 2) ===
         logger.info("Task %s: updating coverage matrix...", task_id[:8])
+        evidence_coverage_ok = True
         try:
             await update_coverage_matrix(db, state, llm, task_id)
         except Exception as e:
-            logger.warning("Task %s: coverage update failed (non-fatal): %s", task_id[:8], e)
+            logger.error("Task %s: coverage update failed: %s", task_id[:8], e)
+            evidence_coverage_ok = False
+
+        # Phase 2.1 (#19): Evidence/Coverage failure blocks old idea pipeline
+        if not evidence_coverage_ok:
+            logger.error("Task %s: evidence/coverage pipeline failed, blocking idea generation", task_id[:8])
+            task_repo.update_status(db, task_id, "failed")
+            task_repo.update_stop_reason(db, task_id, "evidence_coverage_failure")
+            emit_event(task_id, "error", {"message": "Evidence/Coverage pipeline failed"})
+            db.commit()
+            return
 
         # Close main session before long-running RAG/Wiki phases
-        # (they don't need 'state' and can take 5-10 minutes each)
         db.close()
         db = SessionLocal()
         state = task_repo.get_state(db, task_id)  # reload after search loop
@@ -388,8 +398,24 @@ async def run_task(task_id: str):
         emit_event(task_id, "status", {"status": "reporting"})
         await generate_report(db, state, llm, cluster_list)
 
-        # === 5. Ideas generation loop (retry if no qualified ideas) ===
-        await _run_ideas_loop(db, state, llm, task_id, cluster_list)
+        # === 5. Ideas generation ===
+        # Phase 2.1 (#20): Pipeline V2 does NOT call old generate_and_score_ideas
+        # until Phase 3 (Gap Mining) + Phase 4 (Idea Synthesis) are implemented.
+        # For now, go to waiting_for_user_review with evidence/coverage summary.
+        if state.pipeline_version >= 2:
+            logger.info("Task %s: Pipeline V2 — evidence/coverage complete, "
+                       "skipping old idea pipeline (Phase 3-4 not yet implemented)", task_id[:8])
+            task_repo.update_status(db, task_id, "waiting_for_user_review")
+            task_repo.update_stop_reason(db, task_id, "pipeline_v2_evidence_coverage_done")
+            emit_event(task_id, "status", {
+                "status": "waiting_for_user_review",
+                "reason": "pipeline_v2_phase2_complete",
+                "note": "Gap Mining (Phase 3) and Idea Synthesis (Phase 4) not yet implemented"
+            })
+            db.commit()
+        else:
+            # Legacy pipeline: generate ideas directly
+            await _run_ideas_loop(db, state, llm, task_id, cluster_list)
 
     finally:
         db.close()
