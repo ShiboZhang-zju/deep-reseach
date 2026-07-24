@@ -82,6 +82,7 @@ async def generate_interventions(
     passed_ids = []
     gaps = db.query(GapCandidate).filter(
         GapCandidate.task_id == task_id,
+        GapCandidate.contract_id == contract.id,
         GapCandidate.status == "surviving",
     ).all()
     for gap in gaps:
@@ -115,6 +116,7 @@ async def generate_interventions(
             gates = _evaluate_hard_gates(gap, latest_audit, evidence_ids, candidate, contract)
             item = intervention_repo.create_intervention_candidate(db, task_id, gap.id, {
                 **candidate.model_dump(),
+                "contract_id": contract.id,
                 **gates,
                 "status": "passed" if all(value == "PASS" for value in gates["gate_statuses"].values()) else "rejected",
                 "evidence_gate": gates["gate_statuses"]["evidence"],

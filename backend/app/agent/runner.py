@@ -560,6 +560,7 @@ async def run_task(task_id: str):
                 from app.db.models import GapCandidate
                 state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
                     GapCandidate.task_id == task_id,
+                    GapCandidate.contract_id == state.contract_id,
                     GapCandidate.status == "surviving",
                 ).all()]
                 task_repo.save_state(db, task_id, state)
@@ -590,7 +591,9 @@ async def run_task(task_id: str):
             )
             if interventions is None:
                 from app.db.repositories import intervention_repo
-                recovered_interventions = intervention_repo.list_interventions_for_task(db, task_id)
+                recovered_interventions = intervention_repo.list_interventions_for_task(
+                    db, task_id, contract_id=state.contract_id, gap_ids=state.surviving_gap_ids
+                )
                 passed_intervention_ids = [item.id for item in recovered_interventions if item.status == "passed"]
             else:
                 passed_intervention_ids = interventions.passed_intervention_ids
@@ -621,7 +624,10 @@ async def run_task(task_id: str):
                 from app.db.models import ResearchIdea
                 idea_ids = [idea.id for idea in db.query(ResearchIdea).filter(
                     ResearchIdea.task_id == task_id,
-                    ResearchIdea.decision == "go",
+                    ResearchIdea.contract_id == state.contract_id,
+                    ResearchIdea.intervention_id.in_(passed_intervention_ids),
+                    ResearchIdea.pipeline_version == state.pipeline_version,
+                    ResearchIdea.decision == "conditional_go",
                     ResearchIdea.idea_status == "active",
                 ).all()]
             else:

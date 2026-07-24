@@ -161,6 +161,10 @@ class ResearchIdea(Base):
 
     id = Column(String, primary_key=True, default=_uuid)
     task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    contract_id = Column(String, ForeignKey("research_contracts.id"))
+    gap_id = Column(String, ForeignKey("gap_candidates.id"))
+    intervention_id = Column(String, ForeignKey("intervention_candidates.id"))
+    pipeline_version = Column(Integer)
     title = Column(Text)
     description = Column(Text)
     motivation = Column(Text)
@@ -186,6 +190,8 @@ class ResearchIdea(Base):
 
     __table_args__ = (
         Index("idx_ideas_task_status", "task_id", "idea_status"),
+        Index("idx_ideas_contract", "contract_id"),
+        Index("idx_ideas_intervention", "intervention_id"),
     )
 
 
@@ -818,6 +824,7 @@ class InterventionCandidate(Base):
     id = Column(String, primary_key=True, default=_uuid)
     task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
     gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+    contract_id = Column(String, ForeignKey("research_contracts.id"))
     intervention_type = Column(Text, nullable=False)
     failure_mechanism = Column(Text, nullable=False)
     proposed_intervention = Column(Text, nullable=False)
@@ -838,6 +845,7 @@ class InterventionCandidate(Base):
     __table_args__ = (
         Index("idx_ic_task", "task_id"),
         Index("idx_ic_gap", "gap_id"),
+        Index("idx_ic_contract", "contract_id"),
         Index("idx_ic_status", "status"),
     )
 

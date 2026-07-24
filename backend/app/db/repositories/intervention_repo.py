@@ -1,4 +1,4 @@
-"""Persistence helpers for lightweight intervention candidates."""
+﻿"""Persistence helpers for lightweight intervention candidates."""
 
 import json
 
@@ -15,6 +15,7 @@ def create_intervention_candidate(db: Session, task_id: str, gap_id: str, data: 
     item = InterventionCandidate(
         task_id=task_id,
         gap_id=gap_id,
+        contract_id=data.get("contract_id"),
         intervention_type=data["intervention_type"],
         failure_mechanism=data["failure_mechanism"],
         proposed_intervention=data["proposed_intervention"],
@@ -35,7 +36,10 @@ def create_intervention_candidate(db: Session, task_id: str, gap_id: str, data: 
     return item
 
 
-def list_interventions_for_task(db: Session, task_id: str) -> list[InterventionCandidate]:
-    return db.query(InterventionCandidate).filter(
-        InterventionCandidate.task_id == task_id,
-    ).order_by(InterventionCandidate.created_at).all()
+def list_interventions_for_task(db: Session, task_id: str, contract_id: str | None = None, gap_ids: list[str] | None = None) -> list[InterventionCandidate]:
+    query = db.query(InterventionCandidate).filter(InterventionCandidate.task_id == task_id)
+    if contract_id:
+        query = query.filter(InterventionCandidate.contract_id == contract_id)
+    if gap_ids is not None:
+        query = query.filter(InterventionCandidate.gap_id.in_(gap_ids))
+    return query.order_by(InterventionCandidate.created_at).all()

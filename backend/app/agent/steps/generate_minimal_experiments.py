@@ -58,7 +58,7 @@ class MinimalExperimentResult:
 
 
 async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: str) -> MinimalExperimentResult:
-    """Persist GO ideas and their small falsifiable experiments from passed interventions."""
+    """Persist conditional ideas and small falsifiable experiments from passed interventions."""
     from app.db.models import ResearchContract
 
     contract = db.get(ResearchContract, state.contract_id) if state.contract_id else None
@@ -67,6 +67,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
 
     interventions = db.query(InterventionCandidate).filter(
         InterventionCandidate.task_id == task_id,
+        InterventionCandidate.contract_id == contract.id,
         InterventionCandidate.status == "passed",
     ).all()
     idea_ids = []
@@ -100,17 +101,12 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             "method_sketch": intervention.proposed_intervention,
             "expected_contribution": intervention.measurable_outcome,
             "related_paper_ids_json": json.dumps(paper_ids, ensure_ascii=False),
+            "contract_id": contract.id,
+            "gap_id": gap.id,
+            "intervention_id": intervention.id,
+            "pipeline_version": state.pipeline_version,
+            "decision": "conditional_go",
         })
-        paper_repo.update_idea_scores(db, idea.id, {
-            "novelty": 1.0,
-            "feasibility": 1.0,
-            "significance": 1.0,
-            "evidence_support": 1.0,
-            "differentiation": 1.0,
-            "experimentability": 1.0,
-            "potential_impact": 1.0,
-            "risk": 0.0,
-        }, 1.0, "go")
         steps = [
             *plan.steps,
             f"Success condition: {plan.success_condition}",
