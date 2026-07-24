@@ -41,6 +41,7 @@ from app.agent.steps import (
     extract_evidence_units,
     update_coverage_matrix,
     mine_gap_candidates,
+    audit_gap_candidates,
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.llm.factory import get_llm
@@ -540,12 +541,37 @@ async def run_task(task_id: str):
                 db.commit()
                 return
 
+            task_repo.update_status(db, task_id, "auditing_gaps")
+            db.commit()
+            emit_event(task_id, "status", {"status": "auditing_gaps", "gap_count": len(gaps)})
+
+            async def _audit_gaps_op(db):
+                return await audit_gap_candidates(db, state, llm, task_id)
+
+            audit_input_version = hashlib.sha256(json.dumps({
+                "gap_ids": sorted(gap.id for gap in gaps),
+                "round": state.current_round,
+                "pipeline_version": state.pipeline_version,
+            }, sort_keys=True).encode()).hexdigest()
+            audit_results = await phase_service.execute_phase(
+                db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
+            )
+            if audit_results is None:
+                audit_results = []
+            state = task_repo.get_state(db, task_id)
+            if not state.surviving_gap_ids:
+                task_repo.update_status(db, task_id, "more_research_required")
+                task_repo.update_stop_reason(db, task_id, "no_surviving_gap_after_audit")
+                emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_surviving_gap_after_audit"})
+                db.commit()
+                return
+
             task_repo.update_status(db, task_id, "waiting_for_user_review")
-            task_repo.update_stop_reason(db, task_id, "gap_candidates_ready_for_audit")
+            task_repo.update_stop_reason(db, task_id, "surviving_gaps_ready_for_intervention")
             emit_event(task_id, "status", {
                 "status": "waiting_for_user_review",
-                "reason": "gap_candidates_ready_for_audit",
-                "gap_count": len(gaps),
+                "reason": "surviving_gaps_ready_for_intervention",
+                "gap_count": len(state.surviving_gap_ids),
             })
             db.commit()
         else:

@@ -20,6 +20,7 @@ from app.agent.steps.decompose_research_space import decompose_research_space
 from app.agent.steps.extract_evidence import extract_evidence_units
 from app.agent.steps.update_coverage import update_coverage_matrix
 from app.agent.steps.mine_gaps import mine_gap_candidates
+from app.agent.steps.audit_gaps import audit_gap_candidates
 
 __all__ = [
     "clarify_topic",
@@ -40,4 +41,5 @@ __all__ = [
     "extract_evidence_units",
     "update_coverage_matrix",
     "mine_gap_candidates",
+    "audit_gap_candidates",
 ]
