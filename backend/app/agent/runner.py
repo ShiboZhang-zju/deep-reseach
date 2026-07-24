@@ -46,6 +46,7 @@ from app.agent.steps import (
     generate_minimal_experiments,
 )
 from app.agent.steps.analyze_papers import analyze_papers
+from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
 from app.llm.factory import get_llm
 from app.services.event_service import emit_event, emit_event_with_cleanup
 
@@ -522,6 +523,7 @@ async def run_task(task_id: str):
                 "contract_id": state.contract_id,
                 "round": state.current_round,
                 "pipeline_version": state.pipeline_version,
+                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
             }, sort_keys=True).encode()).hexdigest()
 
             async def _mine_gaps_op(db):
@@ -532,7 +534,8 @@ async def run_task(task_id: str):
             )
             if gaps is None:
                 from app.db.repositories import gap_repo
-                gaps = gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
+                gaps = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
+                        if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
             state = task_repo.get_state(db, task_id)
             if not gaps:
                 task_repo.update_status(db, task_id, "more_research_required")
@@ -552,6 +555,7 @@ async def run_task(task_id: str):
                 "gap_ids": sorted(gap.id for gap in gaps),
                 "round": state.current_round,
                 "pipeline_version": state.pipeline_version,
+                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
             }, sort_keys=True).encode()).hexdigest()
             audit_results = await phase_service.execute_phase(
                 db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
@@ -584,6 +588,7 @@ async def run_task(task_id: str):
                 "surviving_gap_ids": sorted(state.surviving_gap_ids),
                 "contract_id": state.contract_id,
                 "pipeline_version": state.pipeline_version,
+                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
             }, sort_keys=True).encode()).hexdigest()
             interventions = await phase_service.execute_phase(
                 db, task_id, "generate_interventions", _generate_interventions_op,
@@ -615,6 +620,7 @@ async def run_task(task_id: str):
                 "intervention_ids": sorted(passed_intervention_ids),
                 "contract_id": state.contract_id,
                 "pipeline_version": state.pipeline_version,
+                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
             }, sort_keys=True).encode()).hexdigest()
             experiment_result = await phase_service.execute_phase(
                 db, task_id, "generate_minimal_experiments", _minimal_experiments_op,

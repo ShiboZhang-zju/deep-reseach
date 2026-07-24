@@ -791,6 +791,7 @@ class GapCandidate(Base):
 
     # Mining context
     mining_round = Column(Integer, nullable=False, default=0)
+    mining_policy_version = Column(Text, default="")
 
     # Assessment (populated in Phase 3C audit)
     novelty_score = Column(Float)

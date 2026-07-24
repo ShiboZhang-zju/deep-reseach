@@ -95,11 +95,11 @@ async def test_opportunity_pipeline_is_lineage_safe_and_idempotent(temp_db):
     db.add(question)
     db.add(TaskPaper(task_id=task.id, paper_id=paper.id, discovered_round=1, priority="high", final_score=0.9))
     db.flush()
-    evidence = EvidenceUnit(task_id=task.id, paper_id=paper.id, evidence_type="limitation", normalized_claim="State changes are not evaluated.", verification_status="verified", extraction_confidence=0.9)
+    evidence = EvidenceUnit(task_id=task.id, paper_id=paper.id, evidence_type="limitation", normalized_claim="State changes are not evaluated.", original_span="We do not evaluate memory under changing user states.", section="Limitations", page_number=8, page_start=8, page_end=8, span_start=120, span_end=176, source_chunk_hash="e2e-fulltext-chunk-hash", verification_status="verified", extraction_confidence=0.9)
     second_paper = Paper(title="Supporting Paper", abstract="Reports state-change limitation")
     db.add_all([evidence, second_paper])
     db.flush()
-    second_evidence = EvidenceUnit(task_id=task.id, paper_id=second_paper.id, evidence_type="comparison", normalized_claim="Existing evaluations omit state-change boundary.", verification_status="verified", extraction_confidence=0.9)
+    second_evidence = EvidenceUnit(task_id=task.id, paper_id=second_paper.id, evidence_type="comparison", normalized_claim="Existing evaluations omit state-change boundary.", verification_status="abstract_only", extraction_confidence=0.9)
     db.add(second_evidence)
     db.flush()
     db.add_all([

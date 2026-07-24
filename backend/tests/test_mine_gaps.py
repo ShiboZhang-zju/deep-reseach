@@ -36,7 +36,7 @@ class FakeGapLLM:
         from app.schemas.schemas import GapCandidateList, GapCandidateSchema
 
         question_id = next(line.split(": ", 1)[1] for line in messages[1]["content"].splitlines() if "Question ID:" in line)
-        evidence_id = next(line.split(": ", 1)[1] for line in messages[1]["content"].splitlines() if "Evidence ID:" in line)
+        evidence_ids = [line.split(": ", 1)[1] for line in messages[1]["content"].splitlines() if "Evidence ID:" in line]
         return GapCandidateList(gaps=[GapCandidateSchema(
             gap_type="boundary_gap",
             description="现有固定预算记忆方法在状态变化场景下缺少明确边界评测。",
@@ -48,7 +48,7 @@ class FakeGapLLM:
             testable_hypothesis="状态变化场景的性能低于稳定事实场景。",
             falsification_condition="近邻论文已在相同预算和场景下完成该评测。",
             question_ids=[question_id],
-            supporting_evidence_ids=[evidence_id],
+            supporting_evidence_ids=evidence_ids,
         )])
 
 
@@ -56,7 +56,7 @@ class FakeGapLLM:
 async def test_mine_gap_creates_traceable_candidate(temp_db):
     from app.agent.state import ResearchState
     from app.agent.steps.mine_gaps import mine_gap_candidates
-    from app.db.models import EvidenceUnit, ResearchContract, ResearchQuestion, ResearchTask
+    from app.db.models import EvidenceUnit, Paper, QuestionEvidenceLink, ResearchContract, ResearchQuestion, ResearchTask
     from app.db.repositories import gap_repo
 
     db = temp_db()
@@ -77,17 +77,28 @@ async def test_mine_gap_creates_traceable_candidate(temp_db):
     )
     db.add(question)
     db.flush()
+    first_paper = Paper(title="Evidence Paper A")
+    second_paper = Paper(title="Evidence Paper B")
+    db.add_all([first_paper, second_paper])
+    db.flush()
     evidence = EvidenceUnit(
-        task_id=task.id,
-        paper_id="paper-1",
-        evidence_type="limitation",
+        task_id=task.id, paper_id=first_paper.id, evidence_type="limitation",
         normalized_claim="在状态变化后，固定预算记忆会遗漏关键历史证据。",
-        verification_status="abstract_only",
-        extraction_confidence=0.8,
+        original_span="状态变化后会遗漏关键证据", section="Limitations", page_number=8,
+        span_start=10, span_end=22, source_chunk_hash="test-fulltext",
+        verification_status="verified", extraction_confidence=0.8,
     )
-    db.add(evidence)
+    second_evidence = EvidenceUnit(
+        task_id=task.id, paper_id=second_paper.id, evidence_type="comparison",
+        normalized_claim="现有评测未覆盖状态变化边界。", verification_status="abstract_only",
+    )
+    db.add_all([evidence, second_evidence])
+    db.flush()
+    db.add_all([
+        QuestionEvidenceLink(question_id=question.id, evidence_id=evidence.id, relation_type="supports", relevance_score=0.9),
+        QuestionEvidenceLink(question_id=question.id, evidence_id=second_evidence.id, relation_type="supports", relevance_score=0.9),
+    ])
     db.commit()
-
     state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=2)
     gaps = await mine_gap_candidates(db, state, FakeGapLLM(), task.id)
 
@@ -98,8 +109,8 @@ async def test_mine_gap_creates_traceable_candidate(temp_db):
     assert gap.provenance_status == "complete"
     assert state.active_gap_ids == [gap.id]
     links = gap_repo.list_gap_evidence(db, gap.id)
-    assert len(links) == 1
-    assert links[0].evidence_id == evidence.id
+    assert len(links) == 2
+    assert {link.evidence_id for link in links} == {evidence.id, second_evidence.id}
     db.close()
 
 
@@ -107,7 +118,7 @@ async def test_mine_gap_creates_traceable_candidate(temp_db):
 async def test_mine_gap_rejects_hallucinated_ids(temp_db):
     from app.agent.state import ResearchState
     from app.agent.steps.mine_gaps import mine_gap_candidates
-    from app.db.models import EvidenceUnit, ResearchContract, ResearchQuestion, ResearchTask
+    from app.db.models import EvidenceUnit, Paper, QuestionEvidenceLink, ResearchContract, ResearchQuestion, ResearchTask
     from app.schemas.schemas import GapCandidateList, GapCandidateSchema
 
     class BadLLM:
@@ -140,3 +151,64 @@ async def test_mine_gap_rejects_hallucinated_ids(temp_db):
     gaps = await mine_gap_candidates(db, ResearchState(task_id=task.id, contract_id=contract.id), BadLLM(), task.id)
     assert gaps == []
     db.close()
+
+@pytest.mark.asyncio
+async def test_mine_gap_without_links_never_calls_llm(temp_db):
+    from app.agent.state import ResearchState
+    from app.agent.steps.mine_gaps import mine_gap_candidates
+    from app.db.models import EvidenceUnit, Paper, ResearchContract, ResearchQuestion, ResearchTask
+
+    class FailingIfCalledLLM:
+        async def chat_json(self, messages, schema):
+            raise AssertionError("LLM must not be called")
+
+    db = temp_db()
+    task = ResearchTask(user_input="test")
+    db.add(task)
+    db.flush()
+    contract = ResearchContract(task_id=task.id, topic="test", status="active", version=1, input_hash="v1")
+    paper = Paper(title="Unlinked Paper")
+    db.add_all([contract, paper])
+    db.flush()
+    db.add_all([
+        ResearchQuestion(task_id=task.id, contract_id=contract.id, question="question", question_type="failure", status="open"),
+        EvidenceUnit(task_id=task.id, paper_id=paper.id, evidence_type="limitation", normalized_claim="unlinked evidence", verification_status="verified"),
+    ])
+    db.commit()
+    result = await mine_gap_candidates(db, ResearchState(task_id=task.id, contract_id=contract.id), FailingIfCalledLLM(), task.id)
+    assert result == []
+    db.close()
+
+
+def test_admission_rejects_single_paper_and_missing_span():
+    from types import SimpleNamespace
+    from app.agent.steps.mine_gaps import evaluate_gap_mining_admission
+
+    question = SimpleNamespace(id="q", status="open")
+    evidence = SimpleNamespace(id="e", paper_id="p", evidence_type="limitation", verification_status="abstract_only")
+    link = SimpleNamespace(evidence_id="e", relation_type="supports", relevance_score=0.9)
+    result = evaluate_gap_mining_admission(question, [link], {"e": evidence})
+    assert result.status == "UNKNOWN"
+    assert "INSUFFICIENT_INDEPENDENT_PAPERS" in result.reason_codes
+    assert "NO_FULLTEXT_LOCATABLE_EVIDENCE" in result.reason_codes
+
+
+def test_admission_blocks_verified_contradiction():
+    from types import SimpleNamespace
+    from app.agent.steps.mine_gaps import evaluate_gap_mining_admission
+
+    question = SimpleNamespace(id="q", status="open")
+    fulltext = lambda item_id, paper_id, kind: SimpleNamespace(
+        id=item_id, paper_id=paper_id, evidence_type=kind, verification_status="verified",
+        original_span="span", source_chunk_hash="hash", page_number=1, page_start=1,
+        span_start=0, span_end=4,
+    )
+    evidence = {"a": fulltext("a", "p1", "limitation"), "b": fulltext("b", "p2", "comparison"), "c": fulltext("c", "p3", "comparison")}
+    links = [
+        SimpleNamespace(evidence_id="a", relation_type="supports", relevance_score=0.9),
+        SimpleNamespace(evidence_id="b", relation_type="supports", relevance_score=0.9),
+        SimpleNamespace(evidence_id="c", relation_type="contradicts", relevance_score=0.9),
+    ]
+    result = evaluate_gap_mining_admission(question, links, evidence)
+    assert result.status == "UNKNOWN"
+    assert "UNRESOLVED_VERIFIED_CONTRADICTION" in result.reason_codes
