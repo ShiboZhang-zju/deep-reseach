@@ -5,10 +5,10 @@
 
 const BEIJING_TZ = 'Asia/Shanghai';
 
-export function formatDateTime(iso: string): string {
+export function formatDateTime(iso: string | number): string {
   return new Date(iso).toLocaleString('zh-CN', { timeZone: BEIJING_TZ });
 }
 
-export function formatTime(iso: string): string {
+export function formatTime(iso: string | number): string {
   return new Date(iso).toLocaleTimeString('zh-CN', { timeZone: BEIJING_TZ });
 }
