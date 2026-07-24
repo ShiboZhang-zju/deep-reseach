@@ -40,6 +40,7 @@ from app.agent.steps import (
     decompose_research_space,
     extract_evidence_units,
     update_coverage_matrix,
+    mine_gap_candidates,
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.llm.factory import get_llm
@@ -510,19 +511,41 @@ async def run_task(task_id: str):
         emit_event(task_id, "status", {"status": "reporting"})
         await generate_report(db, state, llm, cluster_list)
 
-        # === 5. Ideas generation ===
-        # Phase 2.1 (#20): Pipeline V2 does NOT call old generate_and_score_ideas
-        # until Phase 3 (Gap Mining) + Phase 4 (Idea Synthesis) are implemented.
-        # For now, go to waiting_for_user_review with evidence/coverage summary.
+        # === 5. Lightweight evidence-grounded opportunity discovery ===
         if state.pipeline_version >= 2:
-            logger.info("Task %s: Pipeline V2 — evidence/coverage complete, "
-                       "skipping old idea pipeline (Phase 3-4 not yet implemented)", task_id[:8])
+            logger.info("Task %s: mining evidence-backed gap candidates...", task_id[:8])
+            task_repo.update_status(db, task_id, "mining_gaps")
+            db.commit()
+            emit_event(task_id, "status", {"status": "mining_gaps"})
+            gap_input_version = hashlib.sha256(json.dumps({
+                "contract_id": state.contract_id,
+                "round": state.current_round,
+                "pipeline_version": state.pipeline_version,
+            }, sort_keys=True).encode()).hexdigest()
+
+            async def _mine_gaps_op(db):
+                return await mine_gap_candidates(db, state, llm, task_id)
+
+            gaps = await phase_service.execute_phase(
+                db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
+            )
+            if gaps is None:
+                from app.db.repositories import gap_repo
+                gaps = gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
+            state = task_repo.get_state(db, task_id)
+            if not gaps:
+                task_repo.update_status(db, task_id, "more_research_required")
+                task_repo.update_stop_reason(db, task_id, "no_evidence_backed_gap_candidates")
+                emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_evidence_backed_gap_candidates"})
+                db.commit()
+                return
+
             task_repo.update_status(db, task_id, "waiting_for_user_review")
-            task_repo.update_stop_reason(db, task_id, "pipeline_v2_evidence_coverage_done")
+            task_repo.update_stop_reason(db, task_id, "gap_candidates_ready_for_audit")
             emit_event(task_id, "status", {
                 "status": "waiting_for_user_review",
-                "reason": "pipeline_v2_phase2_complete",
-                "note": "Gap Mining (Phase 3) and Idea Synthesis (Phase 4) not yet implemented"
+                "reason": "gap_candidates_ready_for_audit",
+                "gap_count": len(gaps),
             })
             db.commit()
         else:
