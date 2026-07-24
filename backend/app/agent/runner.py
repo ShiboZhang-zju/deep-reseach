@@ -42,6 +42,7 @@ from app.agent.steps import (
     update_coverage_matrix,
     mine_gap_candidates,
     audit_gap_candidates,
+    generate_interventions,
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.llm.factory import get_llm
@@ -566,12 +567,35 @@ async def run_task(task_id: str):
                 db.commit()
                 return
 
+            task_repo.update_status(db, task_id, "synthesizing_ideas")
+            db.commit()
+            emit_event(task_id, "status", {"status": "synthesizing_ideas"})
+
+            async def _generate_interventions_op(db):
+                return await generate_interventions(db, state, llm, task_id)
+
+            intervention_input_version = hashlib.sha256(json.dumps({
+                "surviving_gap_ids": sorted(state.surviving_gap_ids),
+                "contract_id": state.contract_id,
+                "pipeline_version": state.pipeline_version,
+            }, sort_keys=True).encode()).hexdigest()
+            interventions = await phase_service.execute_phase(
+                db, task_id, "generate_interventions", _generate_interventions_op,
+                input_version=intervention_input_version
+            )
+            if not interventions or not interventions.passed_intervention_ids:
+                task_repo.update_status(db, task_id, "more_research_required")
+                task_repo.update_stop_reason(db, task_id, "no_intervention_passed_hard_gates")
+                emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_intervention_passed_hard_gates"})
+                db.commit()
+                return
+
             task_repo.update_status(db, task_id, "waiting_for_user_review")
-            task_repo.update_stop_reason(db, task_id, "surviving_gaps_ready_for_intervention")
+            task_repo.update_stop_reason(db, task_id, "interventions_ready_for_minimal_experiment")
             emit_event(task_id, "status", {
                 "status": "waiting_for_user_review",
-                "reason": "surviving_gaps_ready_for_intervention",
-                "gap_count": len(state.surviving_gap_ids),
+                "reason": "interventions_ready_for_minimal_experiment",
+                "intervention_count": len(interventions.passed_intervention_ids),
             })
             db.commit()
         else:

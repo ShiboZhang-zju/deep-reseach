@@ -811,6 +811,37 @@ class GapCandidate(Base):
     )
 
 
+class InterventionCandidate(Base):
+    """A proposed mechanism that addresses one surviving gap."""
+    __tablename__ = "intervention_candidates"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+    intervention_type = Column(Text, nullable=False)
+    failure_mechanism = Column(Text, nullable=False)
+    proposed_intervention = Column(Text, nullable=False)
+    intermediate_effect = Column(Text, nullable=False)
+    measurable_outcome = Column(Text, nullable=False)
+    required_components_json = Column(Text, default="[]")
+    dependency_paper_ids_json = Column(Text, default="[]")
+    implementation_cost = Column(Text)
+    mechanism_confidence = Column(Float)
+    evidence_gate = Column(Text, default="UNKNOWN")
+    novelty_gate = Column(Text, default="UNKNOWN")
+    feasibility_gate = Column(Text, default="UNKNOWN")
+    gate_rationale_json = Column(Text, default="{}")
+    status = Column(Text, default="candidate")
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        Index("idx_ic_task", "task_id"),
+        Index("idx_ic_gap", "gap_id"),
+        Index("idx_ic_status", "status"),
+    )
+
+
 class GapEvidenceLink(Base):
     """Links a GapCandidate to EvidenceUnit with a relationship type.
 
