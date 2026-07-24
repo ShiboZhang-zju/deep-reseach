@@ -43,6 +43,7 @@ from app.agent.steps import (
     mine_gap_candidates,
     audit_gap_candidates,
     generate_interventions,
+    generate_minimal_experiments,
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.llm.factory import get_llm
@@ -590,12 +591,35 @@ async def run_task(task_id: str):
                 db.commit()
                 return
 
+            task_repo.update_status(db, task_id, "generating_experiment")
+            db.commit()
+            emit_event(task_id, "status", {"status": "generating_experiment"})
+
+            async def _minimal_experiments_op(db):
+                return await generate_minimal_experiments(db, state, llm, task_id)
+
+            experiment_input_version = hashlib.sha256(json.dumps({
+                "intervention_ids": sorted(interventions.passed_intervention_ids),
+                "contract_id": state.contract_id,
+                "pipeline_version": state.pipeline_version,
+            }, sort_keys=True).encode()).hexdigest()
+            experiment_result = await phase_service.execute_phase(
+                db, task_id, "generate_minimal_experiments", _minimal_experiments_op,
+                input_version=experiment_input_version
+            )
+            if not experiment_result or not experiment_result.idea_ids:
+                task_repo.update_status(db, task_id, "abstained")
+                task_repo.update_stop_reason(db, task_id, "no_minimal_experiment_generated")
+                emit_event(task_id, "status", {"status": "abstained", "reason": "no_minimal_experiment_generated"})
+                db.commit()
+                return
+
             task_repo.update_status(db, task_id, "waiting_for_user_review")
-            task_repo.update_stop_reason(db, task_id, "interventions_ready_for_minimal_experiment")
+            task_repo.update_stop_reason(db, task_id, "evidence_grounded_ideas_ready")
             emit_event(task_id, "status", {
                 "status": "waiting_for_user_review",
-                "reason": "interventions_ready_for_minimal_experiment",
-                "intervention_count": len(interventions.passed_intervention_ids),
+                "reason": "evidence_grounded_ideas_ready",
+                "idea_count": len(experiment_result.idea_ids),
             })
             db.commit()
         else:
