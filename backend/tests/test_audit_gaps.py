@@ -102,6 +102,7 @@ def _seed_gap(db):
         testable_hypothesis="状态变化性能较低",
         falsification_condition="已有同设置边界评测",
         status="candidate",
+        mining_policy_version="evidence-admission-v1",
     )
     db.add(gap)
     db.flush()
@@ -118,7 +119,7 @@ async def test_confirmed_audit_creates_comparison_and_survives(temp_db):
 
     db = temp_db()
     task, gap, _ = _seed_gap(db)
-    state = ResearchState(task_id=task.id, current_round=2)
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
     results = await audit_gap_candidates(db, state, ConfirmingAuditLLM(), task.id, perform_search=False)
 
     assert results[0].audit_result == "confirmed"
@@ -137,7 +138,7 @@ async def test_uncertain_audit_never_survives(temp_db):
 
     db = temp_db()
     task, gap, _ = _seed_gap(db)
-    state = ResearchState(task_id=task.id, current_round=2)
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
     await audit_gap_candidates(db, state, UncertainAuditLLM(), task.id, perform_search=False)
 
     assert state.surviving_gap_ids == []

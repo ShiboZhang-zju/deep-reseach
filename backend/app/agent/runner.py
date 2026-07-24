@@ -549,7 +549,7 @@ async def run_task(task_id: str):
             emit_event(task_id, "status", {"status": "auditing_gaps", "gap_count": len(gaps)})
 
             async def _audit_gaps_op(db):
-                return await audit_gap_candidates(db, state, llm, task_id)
+                return await audit_gap_candidates(db, state, llm, task_id, gap_ids=[gap.id for gap in gaps])
 
             audit_input_version = hashlib.sha256(json.dumps({
                 "gap_ids": sorted(gap.id for gap in gaps),
@@ -560,15 +560,17 @@ async def run_task(task_id: str):
             audit_results = await phase_service.execute_phase(
                 db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
             )
-            if audit_results is None:
-                from app.db.models import GapCandidate
-                state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
-                    GapCandidate.task_id == task_id,
-                    GapCandidate.contract_id == state.contract_id,
-                    GapCandidate.status == "surviving",
-                ).all()]
-                task_repo.save_state(db, task_id, state)
-                db.commit()
+            from app.db.models import GapCandidate
+            current_gap_ids = [gap.id for gap in gaps]
+            state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
+                GapCandidate.task_id == task_id,
+                GapCandidate.contract_id == state.contract_id,
+                GapCandidate.id.in_(current_gap_ids),
+                GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
+                GapCandidate.status == "surviving",
+            ).all()]
+            task_repo.save_state(db, task_id, state)
+            db.commit()
             state = task_repo.get_state(db, task_id)
             if not state.surviving_gap_ids:
                 task_repo.update_status(db, task_id, "more_research_required")

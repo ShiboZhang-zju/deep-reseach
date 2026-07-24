@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from app.agent.state import ResearchState
 from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
+from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
 from app.db.models import GapCandidate, Paper, TaskPaper
 from app.db.repositories import gap_repo, paper_repo, task_repo
 from app.db.repositories.search_query_repo import save_search_query
@@ -108,20 +109,26 @@ async def audit_gap_candidates(
     state: ResearchState,
     llm,
     task_id: str,
+    gap_ids: list[str] | None = None,
     perform_search: bool = True,
 ) -> list[GapAuditResult]:
-    """Audit active gap candidates and map decisions to the existing status lifecycle."""
-    gaps = [
-        gap for gap in gap_repo.list_active_gaps_for_task(db, task_id)
-        if gap.status in {"candidate", "auditing", "audited"}
-    ]
+    """Audit only current-contract, current-policy gap candidates."""
+    query = db.query(GapCandidate).filter(
+        GapCandidate.task_id == task_id,
+        GapCandidate.contract_id == state.contract_id,
+        GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
+        GapCandidate.status.in_(["candidate", "auditing", "audited"]),
+    )
+    if gap_ids is not None:
+        query = query.filter(GapCandidate.id.in_(gap_ids))
+    gaps = query.all()
     results = []
     for gap in gaps:
-        result = await audit_gap_candidate(db, state, llm, task_id, gap, perform_search)
-        results.append(result)
+        results.append(await audit_gap_candidate(db, state, llm, task_id, gap, perform_search))
     state.surviving_gap_ids = [result.gap_id for result in results if result.audit_result == "confirmed"]
+    task_repo.save_state(db, task_id, state)
+    db.commit()
     return results
-
 
 async def audit_gap_candidate(
     db,

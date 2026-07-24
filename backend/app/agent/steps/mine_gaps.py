@@ -130,7 +130,9 @@ async def mine_gap_candidates(
         return []
 
     existing = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, contract.id)
-                if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
+                if gap.mining_policy_version == GAP_MINING_POLICY_VERSION
+                and gap.mining_round == state.current_round
+                and gap.status not in {"rejected", "superseded"}]
     if existing:
         state.active_gap_ids = [gap.id for gap in existing if gap.status != "rejected"]
         return existing
@@ -209,6 +211,7 @@ async def mine_gap_candidates(
         if candidate.gap_type not in _SUPPORTED_GAP_TYPES: reason = "UNSUPPORTED_GAP_TYPE"
         elif not candidate_question_ids or not candidate_question_ids.issubset(passed_admissions): reason = "UNKNOWN_QUESTION_ID"
         elif not candidate.supporting_evidence_ids or not set(candidate.supporting_evidence_ids).issubset(allowed_for_candidate): reason = "UNKNOWN_EVIDENCE_ID"
+        elif candidate.contradicting_evidence_ids: reason = "UNEXPECTED_CONTRADICTING_EVIDENCE"
         elif None in support or len({item.paper_id for item in support}) < 2: reason = "INSUFFICIENT_CANDIDATE_PAPER_SUPPORT"
         elif not any(_is_fulltext_locatable(item) for item in support): reason = "CANDIDATE_LACKS_FULLTEXT_EVIDENCE"
         elif not any(item.evidence_type in _LIMITATION_SIGNAL_TYPES for item in support): reason = "CANDIDATE_LACKS_LIMITATION_SIGNAL"
