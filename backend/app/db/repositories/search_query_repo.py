@@ -18,8 +18,11 @@ def _normalize(text: str) -> str:
 
 def save_search_query(db: Session, task_id: str, query_text: str, intent: str,
                       target_question_id: str | None, expected_evidence_type: str | None,
-                      round_number: int) -> SearchQueryRecord:
-    """Save a structured search query with normalized_query_text."""
+                      round_number: int, target_gap_id: str | None = None) -> SearchQueryRecord:
+    """Save a structured search query with normalized_query_text.
+
+    Phase 3A: target_gap_id parameter added for gap-driven query binding.
+    """
     normalized = _normalize(query_text)
 
     # Check for existing (idempotent)
@@ -41,6 +44,7 @@ def save_search_query(db: Session, task_id: str, query_text: str, intent: str,
         expected_evidence_type=expected_evidence_type,
         round_number=round_number,
         status="pending",
+        target_gap_id=target_gap_id,
     )
     db.add(record)
     db.flush()
@@ -74,6 +78,13 @@ def get_queries_for_question(db: Session, question_id: str) -> list[SearchQueryR
     """Get all search queries targeting a specific question."""
     return db.query(SearchQueryRecord).filter(
         SearchQueryRecord.target_question_id == question_id,
+    ).all()
+
+
+def get_queries_for_gap(db: Session, gap_id: str) -> list[SearchQueryRecord]:
+    """Phase 3A: Get all search queries targeting a specific gap."""
+    return db.query(SearchQueryRecord).filter(
+        SearchQueryRecord.target_gap_id == gap_id,
     ).all()
 
 

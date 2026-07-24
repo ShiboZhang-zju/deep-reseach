@@ -596,3 +596,83 @@ class PaperRoleClassificationSchema(BaseModel):
     roles: list[PaperRoleType] = Field(default_factory=list)
     confidence: float = Field(0.5, ge=0, le=1)
     reason: str = ""
+
+
+# === Phase 3A: Gap Control Plane schemas ===
+
+GapType = Literal[
+    "coverage_gap", "contradiction", "missing_method",
+    "missing_dataset", "missing_evaluation", "boundary_gap",
+]
+
+GapStatus = Literal[
+    "candidate", "audited", "survived", "rejected", "superseded",
+]
+
+GapAuditResult = Literal[
+    "pending", "confirmed", "partially_closed", "closed", "uncertain",
+]
+
+
+class GapCandidateOut(BaseModel):
+    """Gap candidate for API response."""
+    id: str
+    task_id: str
+    contract_id: str | None = None
+    gap_type: str
+    description: str
+    question_ids: list[str] = Field(default_factory=list)
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    contradicting_evidence_ids: list[str] = Field(default_factory=list)
+    mining_round: int = 0
+    novelty_score: float | None = None
+    feasibility_score: float | None = None
+    significance_score: float | None = None
+    risk_score: float | None = None
+    status: str = "candidate"
+    version: int = 1
+    created_at: str
+    updated_at: str
+
+
+class GapCandidateSchema(BaseModel):
+    """LLM output schema for gap mining (Phase 3B — defined now for forward compat)."""
+    gap_type: GapType = Field(..., description="Gap 类型")
+    description: str = Field(..., min_length=10, description="Gap 描述（中文，具体且可操作）")
+    question_ids: list[str] = Field(default_factory=list, description="关联的 ResearchQuestion ID 列表")
+    supporting_evidence_ids: list[str] = Field(default_factory=list, description="支撑此 Gap 的 Evidence ID 列表")
+    contradicting_evidence_ids: list[str] = Field(default_factory=list, description="产生矛盾的 Evidence ID 列表")
+    novelty_score: float = Field(0.5, ge=0, le=1, description="新颖性")
+    feasibility_score: float = Field(0.5, ge=0, le=1, description="可行性")
+    significance_score: float = Field(0.5, ge=0, le=1, description="重要性")
+
+
+class GapCandidateList(BaseModel):
+    """LLM output for gap mining — list of gap candidates."""
+    gaps: list[GapCandidateSchema] = Field(default_factory=list)
+
+
+class GapAuditOut(BaseModel):
+    """Gap audit for API response."""
+    id: str
+    gap_id: str
+    task_id: str
+    audit_result: str = "pending"
+    nearest_neighbor_summary: str | None = None
+    differentiation_summary: str | None = None
+    neighbor_paper_ids: list[str] = Field(default_factory=list)
+    audit_round: int = 0
+    created_at: str
+
+
+class NeighborComparisonOut(BaseModel):
+    """Neighbor comparison for API response."""
+    id: str
+    gap_id: str
+    paper_id: str
+    task_id: str
+    similarity_score: float = 0.0
+    shared_aspects: list[str] = Field(default_factory=list)
+    differentiating_aspects: list[str] = Field(default_factory=list)
+    overlap_risk: float = 0.0
+    created_at: str

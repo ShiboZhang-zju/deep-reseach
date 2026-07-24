@@ -662,6 +662,9 @@ class SearchQueryRecord(Base):
     status = Column(Text, default="pending")
     # pending / completed / failed
 
+    # Phase 3A: Gap-driven query binding
+    target_gap_id = Column(String, ForeignKey("gap_candidates.id"))
+
     result_count = Column(Integer, default=0)
     new_paper_count = Column(Integer, default=0)
     evidence_unit_count = Column(Integer, default=0)
@@ -701,4 +704,192 @@ class SearchQueryPaper(Base):
         Index("idx_sqp_query", "query_id"),
         Index("idx_sqp_paper", "paper_id"),
         Index("idx_sqp_unique", "query_id", "paper_id", "source", unique=True),
+    )
+
+
+# === Phase 3A: Gap Control Plane ===
+
+class GapCandidate(Base):
+    """A candidate research gap identified from the Coverage Matrix.
+
+    Phase 3A: Data model only — mining logic is Phase 3B.
+
+    A gap represents an under-explored area where existing evidence is
+    insufficient or contradictory, making it a candidate for new research.
+
+    gap_type:
+    - coverage_gap: A research question with low coverage score
+    - contradiction: Evidence units conflict with each other
+    - missing_method: No method evidence found for a question
+    - missing_dataset: No dataset/benchmark evidence found
+    - missing_evaluation: No evaluation/metric evidence found
+    - boundary_gap: Edge of current knowledge, unexplored combination
+
+    status:
+    - candidate: Newly identified, not yet audited
+    - audited: Has been through adversarial audit (Phase 3C)
+    - survived: Passed audit, eligible for feasibility gate (Phase 4)
+    - rejected: Failed audit or feasibility gate
+    - superseded: Replaced by a newer version (contract change)
+    """
+    __tablename__ = "gap_candidates"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    contract_id = Column(String, ForeignKey("research_contracts.id"))
+
+    # Gap identification
+    gap_type = Column(String, nullable=False)
+    # coverage_gap / contradiction / missing_method / missing_dataset /
+    # missing_evaluation / boundary_gap
+
+    description = Column(Text, nullable=False)
+    # What is the gap? (Chinese, specific and actionable)
+
+    # Linkage to research questions
+    question_ids_json = Column(Text, default="[]")
+    # JSON array of ResearchQuestion IDs this gap relates to
+
+    # Evidence context
+    supporting_evidence_ids_json = Column(Text, default="[]")
+    # Evidence IDs that hint at this gap (e.g., contradictions, limitations)
+    contradicting_evidence_ids_json = Column(Text, default="[]")
+    # Evidence IDs that create the contradiction
+
+    # Mining context
+    mining_round = Column(Integer, nullable=False, default=0)
+    # Which search round was this gap identified in?
+
+    # Assessment (populated in Phase 3C audit)
+    novelty_score = Column(Float)        # 0-1, how novel is this gap?
+    feasibility_score = Column(Float)   # 0-1, how feasible to address?
+    significance_score = Column(Float)   # 0-1, how significant?
+    risk_score = Column(Float)           # 0-1, risk of being non-novel
+
+    # Status
+    status = Column(Text, nullable=False, default="candidate")
+    # candidate / audited / survived / rejected / superseded
+
+    # Versioning
+    version = Column(Integer, nullable=False, default=1)
+    superseded_at = Column(DateTime)
+
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        Index("idx_gc_task", "task_id"),
+        Index("idx_gc_contract", "contract_id"),
+        Index("idx_gc_status", "status"),
+        Index("idx_gc_task_status", "task_id", "status"),
+    )
+
+
+class GapEvidenceLink(Base):
+    """Links a GapCandidate to EvidenceUnit with a relationship type.
+
+    Supports provenance: each gap must be traceable to specific evidence.
+    """
+    __tablename__ = "gap_evidence_links"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+    evidence_id = Column(String, ForeignKey("evidence_units.id"), nullable=False)
+    relation_type = Column(Text, default="suggests")
+    # suggests / contradicts / limits / motivates / background
+
+    relevance_score = Column(Float, default=0.5)
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_gel_gap", "gap_id"),
+        Index("idx_gel_evidence", "evidence_id"),
+        Index("idx_gel_unique", "gap_id", "evidence_id", unique=True),
+    )
+
+
+class GapAudit(Base):
+    """Adversarial audit result for a GapCandidate.
+
+    Phase 3C: After mining gaps (3B), each gap undergoes adversarial audit:
+    - Search for papers that might already address this gap
+    - Compare with nearest neighbors
+    - Determine if the gap is truly novel
+
+    audit_result:
+    - confirmed: Gap is genuine — no existing work fully addresses it
+    - partially_closed: Some existing work partially addresses it
+    - closed: Existing work already addresses it — reject
+    - uncertain: Insufficient evidence to determine
+    """
+    __tablename__ = "gap_audits"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+
+    # Audit queries
+    adversarial_queries_json = Column(Text, default="[]")
+    # Queries used to search for existing work that might close this gap
+
+    # Audit result
+    audit_result = Column(Text, nullable=False, default="pending")
+    # pending / confirmed / partially_closed / closed / uncertain
+
+    nearest_neighbor_summary = Column(Text)
+    # Summary of the closest existing work found during audit
+
+    differentiation_summary = Column(Text)
+    # What specifically differentiates this gap from existing work?
+
+    # Nearest neighbor papers
+    neighbor_paper_ids_json = Column(Text, default="[]")
+    # Paper IDs of nearest neighbors found during audit
+
+    # Audit metadata
+    audit_round = Column(Integer, nullable=False, default=0)
+    # Which search round was the audit performed in?
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_ga_gap", "gap_id"),
+        Index("idx_ga_task", "task_id"),
+        Index("idx_ga_result", "audit_result"),
+    )
+
+
+class NeighborComparison(Base):
+    """Detailed comparison between a GapCandidate and a neighboring paper.
+
+    Phase 3C: For each nearest neighbor found during audit, records
+    the specific similarities and differences.
+    """
+    __tablename__ = "neighbor_comparisons"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+    paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+
+    # Comparison
+    similarity_score = Column(Float, default=0.0)
+    # 0-1, how similar is this paper to the gap's proposed direction
+
+    shared_aspects_json = Column(Text, default="[]")
+    # JSON array of aspects shared with this paper
+
+    differentiating_aspects_json = Column(Text, default="[]")
+    # JSON array of aspects where the gap differs from this paper
+
+    overlap_risk = Column(Float, default=0.0)
+    # 0-1, risk that this paper already covers the gap
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_nc_gap", "gap_id"),
+        Index("idx_nc_paper", "paper_id"),
+        Index("idx_nc_unique", "gap_id", "paper_id", unique=True),
     )

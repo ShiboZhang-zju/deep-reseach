@@ -32,6 +32,8 @@ class SearchQueryExecution:
     intent: str
     target_question_id: str
     expected_evidence_type: str | None
+    # Phase 3A: Gap-driven query binding (None for discovery queries, set for gap audit queries)
+    target_gap_id: str | None = None
 
 
 async def generate_queries(db, state: ResearchState, llm) -> list[SearchQueryExecution]:

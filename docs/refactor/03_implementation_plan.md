@@ -46,25 +46,44 @@
 | 2.10 | coverage-driven stop | policy.py (重构) |
 | 2.11 | Evidence API routes | api/routes/ |
 
-### Phase 3: Gap Mining + Audit
+### Phase 3A: Gap 控制面骨架（当前阶段）
+
+**目标**：建立 Gap 数据模型、migration、ResearchState 扩展、PhaseRun 契约和 Query 绑定。
+不实现 Gap Mining 和 Gap Audit 的业务逻辑——仅搭建控制面骨架，为 3B/3C 铺路。
+
+| # | 任务 | 文件 | 状态 |
+|---|------|------|------|
+| 3A.1 | GapCandidate + GapEvidenceLink + GapAudit + NeighborComparison 模型 | models.py | 待实施 |
+| 3A.2 | Pydantic schemas (GapCandidateOut, GapCandidateSchema) | schemas.py | 待实施 |
+| 3A.3 | Alembic migration 0010_gap_tables | alembic/versions/ | 待实施 |
+| 3A.4 | ResearchState 扩展 (active_gap_ids, surviving_gap_ids) | state.py | 待实施 |
+| 3A.5 | PhaseRun 契约 (mining_gaps, auditing_gaps phase names + _INTERRUPTED_STATUSES) | runner.py | 待实施 |
+| 3A.6 | generate_queries 绑定 target_gap_id (SearchQueryRecord + SearchQueryExecution) | generate_queries.py, search_query_repo.py | 待实施 |
+| 3A.7 | 测试 + 验证 | tests/ | 待实施 |
+
+### Phase 3B: Gap Mining（待实施，Phase 3A 验收后）
 
 | # | 任务 | 文件 |
 |---|------|------|
-| 3.1 | GapCandidate 模型 + schema | models.py, schemas.py |
-| 3.2 | GapAudit + NeighborComparison 模型 | models.py |
-| 3.3 | Alembic migration 0005 | alembic/versions/ |
-| 3.4 | mine_gaps step | steps/mine_gaps.py |
-| 3.5 | generate_adversarial_queries | steps/audit_gaps.py |
-| 3.6 | audit_gaps step | steps/audit_gaps.py |
-| 3.7 | Gap API routes | api/routes/ |
+| 3B.1 | mine_gaps step — 从 Coverage Matrix 挖掘 Gap | steps/mine_gaps.py |
+| 3B.2 | Gap API routes | api/routes/gaps.py |
+| 3B.3 | Gap Mining 测试 | tests/ |
 
-### Phase 4: Feasibility Gate + Idea
+### Phase 3C: Gap Audit（待实施，Phase 3B 验收后）
+
+| # | 任务 | 文件 |
+|---|------|------|
+| 3C.1 | generate_adversarial_queries | steps/audit_gaps.py |
+| 3C.2 | audit_gaps step — 近邻审计 | steps/audit_gaps.py |
+| 3C.3 | Gap Audit 测试 | tests/ |
+
+### Phase 4: Feasibility Gate + Idea（禁止进入，直到 Phase 3 完整通过）
 
 | # | 任务 | 文件 |
 |---|------|------|
 | 4.1 | GapGateResult 模型 + schema | models.py |
 | 4.2 | IdeaJudgment 模型 + schema | models.py |
-| 4.3 | Alembic migration 0006 | alembic/versions/ |
+| 4.3 | Alembic migration 0011 | alembic/versions/ |
 | 4.4 | run_feasibility_gates step | steps/run_feasibility_gates.py |
 | 4.5 | synthesize_ideas step (重写) | steps/synthesize_ideas.py |
 | 4.6 | judge_ideas step (独立) | steps/judge_ideas.py |

@@ -36,6 +36,10 @@ class ResearchState:
     contract_id: str | None = None
     active_question_ids: list[str] = field(default_factory=list)
 
+    # Phase 3A: Gap control plane state
+    active_gap_ids: list[str] = field(default_factory=list)
+    surviving_gap_ids: list[str] = field(default_factory=list)
+
     # Pipeline orchestration
     current_phase: str = "pending"
     pipeline_version: int = 2

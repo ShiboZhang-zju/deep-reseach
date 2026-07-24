@@ -143,6 +143,7 @@ export const STATUS_LABELS: Record<string, string> = {
   // Phase 0: New statuses
   insufficient_evidence: '证据不足',
   more_research_required: '需补充检索',
+  mining_gaps: '挖掘 Gap',
   auditing_gaps: 'Gap 审计中',
   checking_feasibility: '可行性检查',
   synthesizing_ideas: '合成 Ideas',
@@ -166,6 +167,7 @@ export const STATUS_COLORS: Record<string, string> = {
   // Phase 0: New statuses
   insufficient_evidence: 'bg-orange-100 text-orange-700',
   more_research_required: 'bg-amber-100 text-amber-700',
+  mining_gaps: 'bg-purple-100 text-purple-700',
   auditing_gaps: 'bg-purple-100 text-purple-700',
   checking_feasibility: 'bg-purple-100 text-purple-700',
   synthesizing_ideas: 'bg-purple-100 text-purple-700',
