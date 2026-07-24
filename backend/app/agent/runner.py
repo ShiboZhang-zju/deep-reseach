@@ -404,22 +404,78 @@ async def run_task(task_id: str):
         db = SessionLocal()
         state = task_repo.get_state(db, task_id)
 
-        # Phase 2.1: Evidence/Coverage now happens PER ROUND in the search loop.
-        # Check that at least some evidence was extracted.
-        from app.db.models import EvidenceUnit
-        evidence_count = db.query(EvidenceUnit).filter(
-            EvidenceUnit.task_id == task_id,
-        ).count()
+        # Phase 2.2A Final Closure (#4): Formal readiness gate replaces
+        # the ad-hoc evidence_count > 0 check.
+        from app.agent.steps.readiness_gate import evaluate_phase2_readiness
+        readiness = evaluate_phase2_readiness(db, task_id, state.contract_id)
+        logger.info("Task %s: readiness gate — status=%s, reason=%s, "
+                    "active_q=%d, high_imp_q=%d, high_imp_covered=%d, "
+                    "evidence=%d, latest_round=%d",
+                    task_id[:8], readiness.status, readiness.reason,
+                    readiness.active_question_count,
+                    readiness.high_importance_question_count,
+                    readiness.high_importance_covered_count,
+                    readiness.valid_evidence_count, readiness.latest_round)
 
-        if state.pipeline_version >= 2 and evidence_count == 0:
-            logger.error("Task %s: no evidence units extracted after search, blocking pipeline", task_id[:8])
+        # Save readiness result to AgentTrace for auditability
+        try:
+            from app.db.models import AgentTrace
+            import json as _trace_json
+            trace = AgentTrace(
+                task_id=task_id,
+                step_name="phase2_readiness_gate",
+                step_type="decision",
+                input_json=_trace_json.dumps({"contract_id": state.contract_id or ""},
+                                             ensure_ascii=False),
+                output_json=_trace_json.dumps({
+                    "ready": readiness.ready,
+                    "status": readiness.status,
+                    "reason": readiness.reason,
+                    "active_question_count": readiness.active_question_count,
+                    "questions_with_latest_snapshot": readiness.questions_with_latest_snapshot,
+                    "high_importance_question_count": readiness.high_importance_question_count,
+                    "high_importance_covered_count": readiness.high_importance_covered_count,
+                    "evidence_count": readiness.evidence_count,
+                    "valid_evidence_count": readiness.valid_evidence_count,
+                    "latest_round": readiness.latest_round,
+                    "missing_question_ids": readiness.missing_question_ids,
+                    "unresolved_question_ids": readiness.unresolved_question_ids,
+                }, ensure_ascii=False),
+            )
+            db.add(trace)
+            db.commit()
+        except Exception as trace_err:
+            logger.warning("Task %s: failed to save readiness trace (non-fatal): %s",
+                          task_id[:8], trace_err)
+
+        if readiness.status == "failed":
+            logger.error("Task %s: readiness gate FAILED — %s", task_id[:8], readiness.reason)
             task_repo.update_status(db, task_id, "failed")
-            task_repo.update_stop_reason(db, task_id, "no_evidence_extracted")
-            emit_event(task_id, "error", {"message": "No evidence units extracted"})
+            task_repo.update_stop_reason(db, task_id, f"readiness_failed: {readiness.reason}")
+            emit_event(task_id, "error", {
+                "message": f"Phase 2 readiness gate failed: {readiness.reason}",
+                "missing_questions": readiness.missing_question_ids,
+            })
             db.commit()
             return
 
-        logger.info("Task %s: %d evidence units available, proceeding", task_id[:8], evidence_count)
+        if readiness.status == "more_research_required":
+            logger.warning("Task %s: readiness gate — more research required — %s",
+                          task_id[:8], readiness.reason)
+            task_repo.update_status(db, task_id, "more_research_required")
+            task_repo.update_stop_reason(db, task_id, f"readiness_more_research: {readiness.reason}")
+            emit_event(task_id, "status", {
+                "status": "more_research_required",
+                "reason": readiness.reason,
+                "unresolved_questions": readiness.unresolved_question_ids,
+            })
+            db.commit()
+            return
+
+        if not readiness.ready:
+            raise RuntimeError(f"Invalid readiness result: status={readiness.status}")
+
+        logger.info("Task %s: readiness gate PASSED — proceeding to analysis", task_id[:8])
 
         # === 2.5. RAG: Download PDFs and index high-priority papers ===
         # P1-17: RAG indexing disabled on Windows due to PyTorch segfault.
@@ -507,7 +563,12 @@ async def run_experiment_generation(task_id: str, idea_ids: list[str]):
 # === Phase implementations ===
 
 async def _run_clarification_phase(db, state: ResearchState, llm, task_id: str):
-    """Phase 1: Topic clarification."""
+    """Phase 1: Topic clarification.
+
+    Phase 2.2A Final Closure (#6): Adds clarify PhaseRun for control-plane
+    consistency. Clarify input_version includes user_input hash + clarification
+    feedback hash + pipeline_version.
+    """
     task_repo.update_status(db, task_id, "clarifying")
     emit_event(task_id, "status", {"status": "clarifying"})
 
@@ -527,19 +588,62 @@ async def _run_clarification_phase(db, state: ResearchState, llm, task_id: str):
         logger.info("Clarified (with answers): %s", state.normalized_topic[:80])
         return
 
-    clarity = await clarify_topic(db, state, llm)
+    # Compute clarify input_version for PhaseRun
+    clarify_input_version = hashlib.sha256(json.dumps({
+        "user_input": state.user_input,
+        "clarification_questions": state.clarification_questions,
+        "pipeline_version": state.pipeline_version,
+    }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
-    if not clarity.is_clear:
-        # Phase 2.2A: Only write clarification_questions, NOT research_questions
-        state.clarification_questions = clarity.questions
+    async def _clarify_op(db):
+        clarity = await clarify_topic(db, state, llm)
+        if not clarity.is_clear:
+            return {
+                "status": "waiting_for_clarification",
+                "questions": clarity.questions,
+            }
+        return {
+            "status": "clarified",
+            "normalized_topic": clarity.normalized_topic or state.user_input,
+            "keywords": clarity.keywords,
+        }
+
+    try:
+        clarity_result = await phase_service.execute_phase(
+            db, task_id, "clarify", _clarify_op,
+            input_version=clarify_input_version,
+        )
+    except Exception as e:
+        logger.warning("Task %s: clarify phase failed (non-fatal, using fallback): %s",
+                      task_id[:8], e)
+        clarity_result = None
+
+    if clarity_result and clarity_result.get("status") == "waiting_for_clarification":
+        questions = clarity_result["questions"]
+        state.clarification_questions = questions
         task_repo.save_state(db, task_id, state)
         task_repo.update_status(db, task_id, "waiting_for_clarification")
-        emit_event(task_id, "clarification_needed", {"questions": clarity.questions})
+        emit_event(task_id, "clarification_needed", {"questions": questions})
         db.commit()
         return  # Wait for user to answer
 
-    state.normalized_topic = clarity.normalized_topic or state.user_input
-    state.keywords = clarity.keywords
+    if clarity_result and clarity_result.get("status") == "clarified":
+        state.normalized_topic = clarity_result.get("normalized_topic", state.user_input)
+        state.keywords = clarity_result.get("keywords", [])
+    else:
+        # Fallback: call clarify_topic directly (no PhaseRun)
+        clarity = await clarify_topic(db, state, llm)
+        if not clarity.is_clear:
+            state.clarification_questions = clarity.questions
+            task_repo.save_state(db, task_id, state)
+            task_repo.update_status(db, task_id, "waiting_for_clarification")
+            emit_event(task_id, "clarification_needed", {"questions": clarity.questions})
+            db.commit()
+            return
+
+        state.normalized_topic = clarity.normalized_topic or state.user_input
+        state.keywords = clarity.keywords
+
     task_repo.update_normalized_topic(db, task_id, state.normalized_topic)
     task_repo.save_state(db, task_id, state)
     db.commit()

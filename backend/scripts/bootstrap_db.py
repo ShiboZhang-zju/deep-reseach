@@ -75,9 +75,31 @@ def detect_schema_revision(engine) -> str | None:
     elif has_phase_runs:
         return '0002_phase_runs'
     elif has_base_tables:
-        # Verify it looks like a real pre-Phase-1 schema
-        # Must have at least research_tasks, papers, task_papers
-        return '0001_baseline'
+        # Phase 2.2A Final Closure: Verify minimum column manifest before
+        # stamping 0001_baseline. Don't trust table names alone — verify
+        # that critical columns exist so ORM reads won't crash.
+        required_manifest = {
+            'research_tasks': {'id', 'user_input', 'status'},
+            'papers': {'id', 'title'},
+            'task_papers': {'id', 'task_id', 'paper_id', 'discovered_round'},
+        }
+        manifest_ok = True
+        for tbl, required_cols in required_manifest.items():
+            if tbl not in tables:
+                manifest_ok = False
+                break
+            actual_cols = {c['name'] for c in inspector.get_columns(tbl)}
+            missing = required_cols - actual_cols
+            if missing:
+                print(f"  Manifest check failed: {tbl} missing columns: {missing}")
+                manifest_ok = False
+                break
+
+        if manifest_ok:
+            return '0001_baseline'
+        else:
+            # Unknown schema — base tables exist but columns don't match
+            return None
     else:
         # (#11) Unknown schema — cannot safely identify
         return None

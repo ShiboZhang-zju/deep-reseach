@@ -453,12 +453,19 @@ async def test_coverage_fail_once_then_success(temp_db):
     db = Session()
     task_id, llm = await _setup_task_with_contract(db, Session)
 
+    # Set max_rounds=1 to prevent loop from continuing after coverage retry
+    from app.db.models import ResearchTask
+    task = db.query(ResearchTask).filter(ResearchTask.id == task_id).first()
+    task.max_rounds = 1
+    db.commit()
+
     # Configure LLM to fail coverage on first call, succeed after
     llm.set_coverage_fail_count(1)
 
     fake_search = FakeSearchService()
 
-    with patch("app.agent.steps.search_papers.search_service", fake_search), \
+    with patch("app.agent.policy.settings.max_rounds", 1), \
+         patch("app.agent.steps.search_papers.search_service", fake_search), \
          patch("app.services.rag_service.download_pdf_multi_source",
                new_callable=AsyncMock, return_value=b"fake pdf"), \
          patch("app.agent.runner.extract_evidence_units",
@@ -479,16 +486,62 @@ async def test_coverage_fail_once_then_success(temp_db):
             state = task_repo.get_state(db, task_id)
             result = await _run_search_loop(db, state, llm, task_id)
 
-    # Search service should be called fewer times than without skip
-    # (search_round_1 PhaseRun completed on attempt 1, should be reused)
-    # But execute_phase may not skip if state changes between attempts
-    assert fake_search.search_call_count > 0, "Search should be called at least once"
+    # Search service should be called exactly 3 times (3 queries, search phase reused on coverage retry)
+    assert fake_search.search_call_count == 3, \
+        f"Expected 3 search calls (search phase reused on coverage retry), got {fake_search.search_call_count}"
 
     # Round should eventually succeed
-    assert result.completed_rounds >= 1, "Round should complete after coverage succeeds on retry"
+    assert result.completed_rounds == 1, \
+        f"Expected 1 completed round, got {result.completed_rounds}"
 
-    # duplicate_rate must be defined (no UnboundLocalError)
-    # If we got here, the function didn't crash
+    # Assert SearchQueryRecord count == 3
+    from app.db.models import SearchQueryRecord
+    sqr_count = db.query(SearchQueryRecord).filter(
+        SearchQueryRecord.task_id == task_id,
+    ).count()
+    assert sqr_count == 3, f"Expected 3 SearchQueryRecords, got {sqr_count}"
+
+    # Assert ResearchRound count == 1
+    from app.db.models import ResearchRound
+    round_count = db.query(ResearchRound).filter(
+        ResearchRound.task_id == task_id,
+        ResearchRound.round_number == 1,
+    ).count()
+    assert round_count == 1, f"Expected 1 ResearchRound for round 1, got {round_count}"
+
+    # Assert PhaseRun statuses
+    from app.db.models import PhaseRun
+    search_phases = db.query(PhaseRun).filter(
+        PhaseRun.task_id == task_id,
+        PhaseRun.phase_name == "search_round_1",
+        PhaseRun.status == "completed",
+    ).all()
+    assert len(search_phases) == 1, \
+        f"Expected 1 completed search_round_1 PhaseRun, got {len(search_phases)}"
+
+    cov_phases = db.query(PhaseRun).filter(
+        PhaseRun.task_id == task_id,
+        PhaseRun.phase_name == "update_coverage_round_1",
+    ).all()
+    failed_cov = [p for p in cov_phases if p.status == "failed"]
+    completed_cov = [p for p in cov_phases if p.status == "completed"]
+    assert len(failed_cov) == 1, f"Expected 1 failed coverage attempt, got {len(failed_cov)}"
+    assert len(completed_cov) == 1, f"Expected 1 completed coverage attempt, got {len(completed_cov)}"
+
+    # Verify RoundSearchResult can be restored from PhaseRun.output_json
+    from app.agent.runner import RoundSearchResult
+    from app.db.repositories import phase_repo
+    search_pr = search_phases[0]
+    restored_payload = phase_repo.get_completed_phase_output(
+        db, task_id, "search_round_1", search_pr.input_version
+    )
+    assert restored_payload is not None, "PhaseRun output_json should be restorable"
+    restored = RoundSearchResult.from_phase_payload(restored_payload)
+    # Verify key fields are present and non-zero
+    assert len(restored.query_ids) == 3
+    assert len(restored.query_texts) == 3
+    assert restored.papers_found > 0
+    assert restored.new_high_priority_count >= 0  # exact value depends on scoring
 
     db.close()
 
