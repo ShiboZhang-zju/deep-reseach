@@ -730,14 +730,15 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
                 new_paper_ids = search_result.new_paper_ids
                 papers_found = search_result.papers_found
                 duplicate_rate = search_result.duplicate_rate
-                new_high = search_result.new_high_priority_count
+                round_new_high = search_result.new_high_priority_count
 
                 logger.info("Round %d: %d high-priority (%d new), total high=%d",
-                            round_num, new_high, new_high, len(state.high_priority_paper_ids))
-                if new_high == 0:
-                    no_new_high_priority_count += 1
-                else:
-                    no_new_high_priority_count = 0
+                            round_num, round_new_high, round_new_high,
+                            len(state.high_priority_paper_ids))
+
+                # NOTE: no_new_high_priority_count is updated AFTER evidence/coverage
+                # succeeds, not here — retry within the same round must not pollute
+                # the cross-round termination counter.
 
                 # Phase 2.2A: Extract evidence + update coverage PER ROUND
                 if state.pipeline_version >= 2:
@@ -846,7 +847,15 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
                     if ec_result.evidence_status == "failed" or ec_result.coverage_status == "failed":
                         raise RoundEvidenceCoverageError(ec_result.reason or "evidence/coverage failed")
 
-                # Check early termination (only after evidence+coverage succeed)
+                # Phase 2.2A Final Closure (#1): no_new_high_priority_count is
+                # only updated AFTER the entire round (search + evidence + coverage)
+                # succeeds. Retry within the same round does NOT pollute this counter.
+                if round_new_high == 0:
+                    no_new_high_priority_count += 1
+                else:
+                    no_new_high_priority_count = 0
+
+                # Check early termination (only after full round succeeds)
                 et_stop, et_reason = early_termination_check(state, no_new_high_priority_count, duplicate_rate)
                 if et_stop:
                     state.stop_reason = et_reason
