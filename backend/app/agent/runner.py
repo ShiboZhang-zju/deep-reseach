@@ -76,6 +76,41 @@ class RoundSearchResult:
     round_summary: str
     knowledge_gaps: list[str]
 
+    def to_phase_payload(self) -> dict:
+        """Serialize to a stable dict for PhaseRun.output_json."""
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_phase_payload(cls, payload: dict) -> "RoundSearchResult":
+        """Deserialize from PhaseRun.output_json payload.
+
+        Raises TypeError if required fields are missing or wrong type.
+        """
+        expected = {
+            "query_ids", "query_texts", "papers_found", "deduped_count",
+            "new_paper_ids", "duplicate_rate", "high_priority_before",
+            "high_priority_after", "new_high_priority_count",
+            "round_summary", "knowledge_gaps",
+        }
+        missing = expected - set(payload.keys())
+        if missing:
+            raise TypeError(
+                f"RoundSearchResult.from_phase_payload: missing fields: {missing}"
+            )
+        return cls(
+            query_ids=list(payload["query_ids"]),
+            query_texts=list(payload["query_texts"]),
+            papers_found=int(payload["papers_found"]),
+            deduped_count=int(payload["deduped_count"]),
+            new_paper_ids=list(payload["new_paper_ids"]),
+            duplicate_rate=float(payload["duplicate_rate"]),
+            high_priority_before=int(payload["high_priority_before"]),
+            high_priority_after=int(payload["high_priority_after"]),
+            new_high_priority_count=int(payload["new_high_priority_count"]),
+            round_summary=str(payload["round_summary"]),
+            knowledge_gaps=list(payload["knowledge_gaps"]),
+        )
+
 
 @dataclass
 class RoundEvidenceCoverageResult:
@@ -681,9 +716,11 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
                 # Reload state after search phase
                 state = task_repo.get_state(db, task_id)
 
-                # (#5) Recover RoundSearchResult from DB if phase was skipped
+                # (#5) Recover RoundSearchResult from PhaseRun.output_json
                 if search_result is None:
-                    search_result = _recover_round_search_result(db, task_id, round_num)
+                    search_result = _recover_round_search_result(
+                        db, task_id, round_num, round_input_version
+                    )
                     if search_result is None:
                         raise RuntimeError(
                             f"search_round_{round_num} was skipped but no previous output found in DB"
@@ -887,8 +924,34 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
                             completed_rounds=completed_rounds, failed_attempts=total_failed_rounds)
 
 
-def _recover_round_search_result(db, task_id: str, round_num: int) -> RoundSearchResult | None:
-    """(#5) Recover full RoundSearchResult from DB when search phase was skipped."""
+def _recover_round_search_result(db, task_id: str, round_num: int,
+                                  round_input_version: str = "") -> RoundSearchResult | None:
+    """Phase 2.2A Final Closure: Recover RoundSearchResult from PhaseRun.output_json.
+
+    Primary path: Read complete output_json from the completed PhaseRun.
+    Legacy fallback: Approximate reconstruction from secondary tables.
+
+    If output_json is unavailable and legacy fallback cannot produce
+    a precise result (new_high_priority_count is unknown), raises
+    RuntimeError instead of returning a fake result with new_high=0.
+    """
+    # Primary path: exact restoration from PhaseRun.output_json
+    if round_input_version:
+        payload = phase_repo.get_completed_phase_output(
+            db, task_id, f"search_round_{round_num}", round_input_version
+        )
+        if payload is not None:
+            try:
+                result = RoundSearchResult.from_phase_payload(payload)
+                logger.info("Task %s: round %d recovered from PhaseRun.output_json (new_high=%d)",
+                           task_id[:8], round_num, result.new_high_priority_count)
+                return result
+            except (TypeError, ValueError) as e:
+                logger.warning("Task %s: round %d output_json deserialization failed: %s, "
+                              "trying legacy fallback",
+                              task_id[:8], round_num, e)
+
+    # Legacy fallback: approximate reconstruction (no output_json)
     from app.db.models import (
         ResearchRound as _RR, SearchQueryRecord as _SQR,
         TaskPaper as _TP,
@@ -900,44 +963,29 @@ def _recover_round_search_result(db, task_id: str, round_num: int) -> RoundSearc
     if not rr:
         return None
 
-    # Recover queries
     queries = db.query(_SQR).filter(
         _SQR.task_id == task_id, _SQR.round_number == round_num
     ).all()
     query_ids = [q.id for q in queries]
     query_texts = [q.query_text for q in queries]
 
-    # Recover new papers for this round
     round_tps = db.query(_TP).filter(
         _TP.task_id == task_id, _TP.discovered_round == round_num
     ).all()
     new_paper_ids = [tp.paper_id for tp in round_tps]
 
-    # Recover gaps from ResearchRound
-    import json as _json
-    gaps = _json.loads(rr.knowledge_gaps_json) if rr.knowledge_gaps_json else []
+    gaps = json.loads(rr.knowledge_gaps_json) if rr.knowledge_gaps_json else []
 
     papers_found = rr.papers_found or 0
     new_papers = rr.new_papers or 0
     duplicate_rate = rr.duplicate_rate or 0.0
 
-    # high_priority counts cannot be exactly recovered, use 0 as safe default
-    high_priority_before = 0
-    high_priority_after = 0
-    new_high = 0
-
-    return RoundSearchResult(
-        query_ids=query_ids,
-        query_texts=query_texts,
-        papers_found=papers_found,
-        deduped_count=new_papers,
-        new_paper_ids=new_paper_ids,
-        duplicate_rate=duplicate_rate,
-        high_priority_before=high_priority_before,
-        high_priority_after=high_priority_after,
-        new_high_priority_count=new_high,
-        round_summary=rr.summary or "",
-        knowledge_gaps=gaps,
+    # Cannot determine high_priority_before/after/new_high from secondary tables
+    raise RuntimeError(
+        f"Cannot precisely recover RoundSearchResult for round {round_num}: "
+        f"PhaseRun.output_json is NULL or not found, and secondary tables "
+        f"do not contain high_priority_before/after/new_high_priority_count. "
+        f"Refusing to return a fake result with new_high=0."
     )
 
 

@@ -393,7 +393,8 @@ class PhaseRun(Base):
 
     error_message = Column(Text)
     round_number = Column(Integer)  # for search rounds
-    output_summary = Column(Text)  # brief JSON summary of outputs
+    output_summary = Column(Text)  # brief JSON summary of outputs (truncated)
+    output_json = Column(Text)  # Phase 2.2A: complete output payload (untruncated)
 
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

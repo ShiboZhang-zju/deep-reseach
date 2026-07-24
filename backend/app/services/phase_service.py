@@ -88,10 +88,19 @@ async def execute_phase(db, task_id: str, phase_name: str, operation,
     try:
         result = await operation(db)
         output_ver = compute_output_version(result)
-        summary = json.dumps(stable_phase_payload(result), ensure_ascii=False, default=str)[:500]
+        payload = stable_phase_payload(result)
+        output_json_str = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        summary = output_json_str[:500]
         phase_repo.complete_phase(db, pr.id,
                                   output_version=output_ver,
-                                  output_summary=summary)
+                                  output_summary=summary,
+                                  output_json=output_json_str)
         db.commit()
         return result
     except Exception as e:

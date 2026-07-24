@@ -46,14 +46,20 @@ def start_phase(db: Session, task_id: str, phase_name: str,
 
 
 def complete_phase(db: Session, phase_run_id: str, output_version: str = "",
-                   output_summary: str = ""):
-    """Mark a PhaseRun as completed."""
+                   output_summary: str = "", output_json: str = ""):
+    """Mark a PhaseRun as completed.
+
+    Phase 2.2A Final Closure:
+    - output_json: complete untruncated JSON payload (may be large)
+    - output_summary: truncated version for quick inspection
+    """
     pr = db.get(PhaseRun, phase_run_id)
     if pr:
         pr.status = "completed"
         pr.completed_at = _utcnow()
         pr.output_version = output_version
         pr.output_summary = output_summary
+        pr.output_json = output_json
         db.flush()
 
 
@@ -128,3 +134,36 @@ def get_all_phases(db: Session, task_id: str) -> list[PhaseRun]:
     return db.query(PhaseRun).filter(
         PhaseRun.task_id == task_id,
     ).order_by(PhaseRun.created_at).all()
+
+
+def get_completed_phase_output(
+    db: Session,
+    task_id: str,
+    phase_name: str,
+    input_version: str,
+) -> dict | None:
+    """Phase 2.2A Final Closure: Read the complete output_json of a completed phase.
+
+    Returns the deserialized JSON payload if found, or None if:
+    - No matching completed PhaseRun exists
+    - output_json is NULL or empty (legacy PhaseRun without output_json)
+    """
+    pr = db.query(PhaseRun).filter(
+        PhaseRun.task_id == task_id,
+        PhaseRun.phase_name == phase_name,
+        PhaseRun.input_version == input_version,
+        PhaseRun.status == "completed",
+        PhaseRun.output_json.isnot(None),
+    ).order_by(
+        PhaseRun.attempt_count.desc(),
+        PhaseRun.created_at.desc(),
+    ).first()
+
+    if not pr or not pr.output_json:
+        return None
+
+    import json
+    try:
+        return json.loads(pr.output_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
