@@ -30,10 +30,18 @@ class SearchQueryExecution:
     query_id: str
     query_text: str
     intent: str
-    target_question_id: str
+    target_question_id: str | None
     expected_evidence_type: str | None
     # Phase 3A: Gap-driven query binding (None for discovery queries, set for gap audit queries)
     target_gap_id: str | None = None
+
+    def __post_init__(self):
+        """Phase 3A Closure: target_question_id and target_gap_id cannot both be None."""
+        if not self.target_question_id and not self.target_gap_id:
+            raise ValueError(
+                "SearchQueryExecution requires at least one of "
+                "target_question_id or target_gap_id to be non-None"
+            )
 
 
 async def generate_queries(db, state: ResearchState, llm) -> list[SearchQueryExecution]:
@@ -196,7 +204,7 @@ async def _generate_legacy_queries(db, state: ResearchState, llm) -> list[Search
                                         None, None, state.current_round)
             executions.append(SearchQueryExecution(
                 query_id=record.id, query_text=q.query_text,
-                intent="survey", target_question_id="",
+                intent="survey", target_question_id="legacy",
                 expected_evidence_type=None,
             ))
         state.used_queries.extend(eq.query_text for eq in executions)

@@ -53,13 +53,13 @@
 
 | # | 任务 | 文件 | 状态 |
 |---|------|------|------|
-| 3A.1 | GapCandidate + GapEvidenceLink + GapAudit + NeighborComparison 模型 | models.py | 待实施 |
-| 3A.2 | Pydantic schemas (GapCandidateOut, GapCandidateSchema) | schemas.py | 待实施 |
-| 3A.3 | Alembic migration 0010_gap_tables | alembic/versions/ | 待实施 |
-| 3A.4 | ResearchState 扩展 (active_gap_ids, surviving_gap_ids) | state.py | 待实施 |
-| 3A.5 | PhaseRun 契约 (mining_gaps, auditing_gaps phase names + _INTERRUPTED_STATUSES) | runner.py | 待实施 |
-| 3A.6 | generate_queries 绑定 target_gap_id (SearchQueryRecord + SearchQueryExecution) | generate_queries.py, search_query_repo.py | 待实施 |
-| 3A.7 | 测试 + 验证 | tests/ | 待实施 |
+| 3A.1 | GapCandidate + GapEvidenceLink + GapAudit + NeighborComparison 模型 | models.py | ✅ |
+| 3A.2 | Pydantic schemas (GapCandidateOut, GapCandidateSchema) | schemas.py | ✅ |
+| 3A.3 | Alembic migration 0010_gap_tables + 0011_gap_control_plane_fix | alembic/versions/ | ✅ |
+| 3A.4 | ResearchState 扩展 (active_gap_ids, surviving_gap_ids) | state.py | ✅ |
+| 3A.5 | PhaseRun 契约 (mining_gaps, auditing_gaps phase names + _INTERRUPTED_STATUSES) | runner.py | ✅ |
+| 3A.6 | generate_queries 绑定 target_gap_id (SearchQueryRecord + SearchQueryExecution) | generate_queries.py, search_query_repo.py | ✅ |
+| 3A.7 | gap_repo.py + 只读 Gap API + 测试 | gap_repo.py, api/routes/gaps.py, tests/ | ✅ |
 
 ### Phase 3B: Gap Mining（待实施，Phase 3A 验收后）
 
@@ -83,7 +83,7 @@
 |---|------|------|
 | 4.1 | GapGateResult 模型 + schema | models.py |
 | 4.2 | IdeaJudgment 模型 + schema | models.py |
-| 4.3 | Alembic migration 0011 | alembic/versions/ |
+| 4.3 | Alembic migration 0012 | alembic/versions/ |
 | 4.4 | run_feasibility_gates step | steps/run_feasibility_gates.py |
 | 4.5 | synthesize_ideas step (重写) | steps/synthesize_ideas.py |
 | 4.6 | judge_ideas step (独立) | steps/judge_ideas.py |

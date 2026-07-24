@@ -606,11 +606,19 @@ GapType = Literal[
 ]
 
 GapStatus = Literal[
-    "candidate", "audited", "survived", "rejected", "superseded",
+    "candidate", "auditing", "audited", "surviving", "rejected", "superseded",
 ]
 
 GapAuditResult = Literal[
     "pending", "confirmed", "partially_closed", "closed", "uncertain",
+]
+
+GapRecommendedAction = Literal[
+    "continue", "narrow", "more_search", "reject",
+]
+
+GapProvenanceStatus = Literal[
+    "complete", "partial", "invalid",
 ]
 
 
@@ -621,7 +629,17 @@ class GapCandidateOut(BaseModel):
     contract_id: str | None = None
     gap_type: str
     description: str
+    # Phase 3A Closure: structured fields
+    target_setting: str | None = None
+    observed_problem: str | None = None
+    existing_coverage: str | None = None
+    missing_capability: str | None = None
+    claimed_delta: str | None = None
+    testable_hypothesis: str | None = None
+    falsification_condition: str | None = None
+    provenance_status: str = "partial"
     question_ids: list[str] = Field(default_factory=list)
+    # DEPRECATED snapshots — use gap_evidence_links as authoritative source
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     contradicting_evidence_ids: list[str] = Field(default_factory=list)
     mining_round: int = 0
@@ -636,11 +654,22 @@ class GapCandidateOut(BaseModel):
 
 
 class GapCandidateSchema(BaseModel):
-    """LLM output schema for gap mining (Phase 3B — defined now for forward compat)."""
+    """LLM output schema for gap mining (Phase 3B — defined now for forward compat).
+
+    Phase 3A Closure: Structured falsifiable contract — each gap must have
+    a testable hypothesis and falsification condition, not just a description.
+    """
     gap_type: GapType = Field(..., description="Gap 类型")
-    description: str = Field(..., min_length=10, description="Gap 描述（中文，具体且可操作）")
-    question_ids: list[str] = Field(default_factory=list, description="关联的 ResearchQuestion ID 列表")
-    supporting_evidence_ids: list[str] = Field(default_factory=list, description="支撑此 Gap 的 Evidence ID 列表")
+    description: str = Field(..., min_length=10, description="Gap 描述（中文，人类可读摘要）")
+    target_setting: str = Field(..., description="目标场景（中文）")
+    observed_problem: str = Field(..., description="在证据中观察到的具体问题（中文）")
+    existing_coverage: str = Field(..., description="现有论文已覆盖的内容（中文）")
+    missing_capability: str = Field(..., description="缺失的具体能力/方法/数据集（中文）")
+    claimed_delta: str = Field(..., description="与现有工作的声称差异（中文）")
+    testable_hypothesis: str = Field(..., description="可检验假设（中文，可被实验验证或证伪）")
+    falsification_condition: str = Field(..., description="证伪条件（中文，什么证据能证明此 Gap 不成立）")
+    question_ids: list[str] = Field(..., min_length=1, description="关联的 ResearchQuestion ID 列表（至少 1 个）")
+    supporting_evidence_ids: list[str] = Field(..., min_length=1, description="支撑此 Gap 的 Evidence ID 列表（至少 1 个）")
     contradicting_evidence_ids: list[str] = Field(default_factory=list, description="产生矛盾的 Evidence ID 列表")
     novelty_score: float = Field(0.5, ge=0, le=1, description="新颖性")
     feasibility_score: float = Field(0.5, ge=0, le=1, description="可行性")
@@ -661,6 +690,14 @@ class GapAuditOut(BaseModel):
     nearest_neighbor_summary: str | None = None
     differentiation_summary: str | None = None
     neighbor_paper_ids: list[str] = Field(default_factory=list)
+    # Phase 3A Closure: Decision fields
+    evidence_for_gap: list[str] = Field(default_factory=list)
+    evidence_against_gap: list[str] = Field(default_factory=list)
+    remaining_delta: str | None = None
+    novelty_confidence: float | None = None
+    audit_confidence: float | None = None
+    recommended_action: str = "continue"
+    rejection_reason: str | None = None
     audit_round: int = 0
     created_at: str
 
@@ -672,7 +709,25 @@ class NeighborComparisonOut(BaseModel):
     paper_id: str
     task_id: str
     similarity_score: float = 0.0
+    # DEPRECATED
     shared_aspects: list[str] = Field(default_factory=list)
     differentiating_aspects: list[str] = Field(default_factory=list)
     overlap_risk: float = 0.0
+    # Phase 3A Closure: Structured fields
+    shared_problem: str | None = None
+    shared_mechanism: str | None = None
+    shared_evaluation: str | None = None
+    covered_claims: list[str] = Field(default_factory=list)
+    uncovered_claims: list[str] = Field(default_factory=list)
+    overlap_ratio: float = 0.0
+    created_at: str
+
+
+class GapEvidenceLinkOut(BaseModel):
+    """Gap-evidence link for API response."""
+    id: str
+    gap_id: str
+    evidence_id: str
+    relation_type: str = "suggests"
+    relevance_score: float = 0.5
     created_at: str

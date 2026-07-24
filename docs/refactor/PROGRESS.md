@@ -65,18 +65,77 @@
 
 **最终结果：PHASE_2_2A_PASS**
 
-## Phase 3A — Gap 控制面骨架（进行中）
+## Phase 3A — Gap 控制面骨架 + 闭包（✅ 已完成）
 
-**目标**：建立 Gap 相关数据模型、migration、ResearchState 扩展、PhaseRun 契约和 Query 绑定。
-不实现 Gap Mining 和 Gap Audit 的业务逻辑——仅搭建控制面骨架。
+**目标**：建立 Gap 数据模型、migration、ResearchState 扩展、PhaseRun 契约和 Query 绑定。
+不实现 Gap Mining 和 Gap Audit 的业务逻辑——仅搭建控制面骨架并关闭契约。
 
-- [ ] GapCandidate + GapEvidenceLink + GapAudit + NeighborComparison 数据模型
-- [ ] Pydantic schemas (GapCandidateOut, GapCandidateSchema for LLM)
-- [ ] Alembic migration 0010_gap_tables
-- [ ] ResearchState 扩展 (active_gap_ids, surviving_gap_ids)
-- [ ] PhaseRun 契约 (mining_gaps, auditing_gaps phase names)
-- [ ] generate_queries 绑定 target_gap_id (query → gap 关联)
-- [ ] 测试 + 验证
+### 3A.1 数据模型（✅）
+- [x] GapCandidate + GapEvidenceLink + GapAudit + NeighborComparison 模型
+- [x] GapCandidate 结构化可证伪字段: target_setting, observed_problem, existing_coverage,
+      missing_capability, claimed_delta, testable_hypothesis, falsification_condition,
+      provenance_status
+- [x] GapAudit 决策字段: evidence_for/against_gap_json, remaining_delta, novelty/audit_confidence,
+      recommended_action (continue/narrow/more_search/reject), rejection_reason
+- [x] NeighborComparison 结构化字段: shared_problem/mechanism/evaluation,
+      covered/uncovered_claims_json, overlap_ratio
+- [x] Status enum 冻结: candidate/auditing/audited/surviving/rejected/superseded
+
+### 3A.2 Pydantic schemas（✅）
+- [x] GapCandidateSchema 要求: falsification_condition, testable_hypothesis, claimed_delta,
+      missing_capability, existing_coverage, observed_problem, target_setting,
+      ≥1 question_id, ≥1 supporting_evidence_id
+- [x] GapCandidateOut, GapAuditOut, NeighborComparisonOut, GapEvidenceLinkOut
+
+### 3A.3 Alembic migrations（✅）
+- [x] 0010_gap_tables (已发布): 创建 4 个 Gap 表 + search_query_records.target_gap_id 列
+- [x] 0011_gap_control_plane_fix: FK 修复 + 结构化字段 + 两个 partial unique indexes
+
+### 3A.4 ResearchState 扩展（✅）
+- [x] active_gap_ids, surviving_gap_ids
+
+### 3A.5 PhaseRun 契约（✅）
+- [x] _INTERRUPTED_STATUSES 已包含 mining_gaps, auditing_gaps 等
+- [x] 前端 STATUS_LABELS/COLORS 包含 mining_gaps
+
+### 3A.6 Query 绑定（✅）
+- [x] SearchQueryRecord.target_gap_id (FK to gap_candidates)
+- [x] SearchQueryExecution.__post_init__: question_id 和 gap_id 不能同时为空
+- [x] save_search_query 幂等包含 target_gap_id
+- [x] 两个 partial unique indexes (discovery + gap)
+- [x] get_queries_for_gap()
+
+### 3A.7 Evidence 单一真相源（✅）
+- [x] gap_evidence_links 是 Gap↔Evidence 的唯一业务真相
+- [x] supporting/contradicting_evidence_ids_json 标记为 deprecated snapshot
+- [x] API 从 gap_evidence_links 返回 Evidence
+
+### 3A.8 gap_repo（✅）
+- [x] create/get/list/supersede gap candidates
+- [x] create/list/replace gap evidence links (跨 task 校验)
+- [x] create/list gap audits (跨 task 校验)
+- [x] create/list neighbor comparisons (跨 task 校验)
+- [x] CrossTaskValidationError 阻断跨 task 关联
+
+### 3A.9 只读 Gap API（✅）
+- [x] GET /tasks/{task_id}/gaps
+- [x] GET /gaps/{gap_id}
+- [x] GET /gaps/{gap_id}/evidence
+- [x] GET /gaps/{gap_id}/audits
+- [x] GET /gaps/{gap_id}/neighbors
+- [x] 默认排除 superseded gaps
+
+### 3A.10 测试（✅）
+- [x] 29 个 Phase 3A 测试 (12 基础 + 17 闭包)
+- [x] FK 存在、migration roundtrip、ORM-Alembic 一致性
+- [x] Query 不跨 Gap 串线、幂等
+- [x] 跨 task 拒绝 (Contract/Evidence/Audit/NeighborComparison)
+- [x] GapEvidenceLink 是 API Evidence 来源
+- [x] Schema 缺 falsification_condition 失败
+- [x] 5 个只读 API 测试
+- [x] superseded gap 默认不出现
+- [x] 153 tests total pass (136 old + 17 new)
+- [x] PHASE3A_FK_OK + PHASE3A_ROUNDTRIP_MIGRATION_OK
 
 ## Phase 3B — Gap Mining（待实施）
 

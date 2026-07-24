@@ -317,13 +317,21 @@ def test_save_search_query_with_gap_id(temp_db):
 # === Test 10: Pydantic schemas ===
 
 def test_gap_candidate_schema():
-    """GapCandidateSchema validates correctly."""
+    """GapCandidateSchema validates correctly with all required fields."""
     from app.schemas.schemas import GapCandidateSchema, GapCandidateList
 
     gap = GapCandidateSchema(
         gap_type="coverage_gap",
         description="This is a test gap description that is long enough",
+        target_setting="LLM Agent systems",
+        observed_problem="No method addresses temporal state under fixed budget",
+        existing_coverage="Existing work uses compression OR retrieval, not both",
+        missing_capability="A method combining compression and retrieval under budget",
+        claimed_delta="Our approach uses both compression and retrieval simultaneously",
+        testable_hypothesis="Combining compression and retrieval improves accuracy under fixed token budget",
+        falsification_condition="If existing work already combines both approaches with comparable or better accuracy",
         question_ids=["q1"],
+        supporting_evidence_ids=["e1"],
         novelty_score=0.8,
         feasibility_score=0.6,
         significance_score=0.7,
@@ -393,11 +401,11 @@ def test_gap_status_lifecycle(temp_db):
     gap.status = "audited"
     db.commit()
 
-    # audited → survived
-    gap.status = "survived"
+    # audited → surviving
+    gap.status = "surviving"
     db.commit()
 
-    # survived → rejected (if feasibility gate fails)
+    # surviving → rejected (if feasibility gate fails)
     gap.status = "rejected"
     db.commit()
 

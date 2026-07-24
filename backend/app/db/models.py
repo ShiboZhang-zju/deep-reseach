@@ -678,9 +678,17 @@ class SearchQueryRecord(Base):
         Index("idx_sqr_intent", "intent"),
         Index("idx_sqr_round", "round_number"),
         Index("idx_sqr_question", "target_question_id"),
-        # Phase 2.2A: Unique constraint
-        Index("idx_sqr_unique", "task_id", "round_number",
-              "normalized_query_text", "target_question_id", unique=True),
+        Index("idx_sqr_gap", "target_gap_id"),
+        # Phase 3A Closure: Two partial unique indexes replace the old
+        # single unique index to support gap-driven queries.
+        # Discovery queries (target_gap_id IS NULL):
+        Index("idx_sqr_unique_discovery", "task_id", "round_number",
+              "normalized_query_text", "target_question_id", unique=True,
+              sqlite_where=text("target_gap_id IS NULL")),
+        # Gap queries (target_gap_id IS NOT NULL):
+        Index("idx_sqr_unique_gap", "task_id", "round_number",
+              "normalized_query_text", "target_gap_id", unique=True,
+              sqlite_where=text("target_gap_id IS NOT NULL")),
     )
 
 
@@ -712,10 +720,7 @@ class SearchQueryPaper(Base):
 class GapCandidate(Base):
     """A candidate research gap identified from the Coverage Matrix.
 
-    Phase 3A: Data model only — mining logic is Phase 3B.
-
-    A gap represents an under-explored area where existing evidence is
-    insufficient or contradictory, making it a candidate for new research.
+    Phase 3A Closure: Structured falsifiable contract fields added.
 
     gap_type:
     - coverage_gap: A research question with low coverage score
@@ -725,12 +730,21 @@ class GapCandidate(Base):
     - missing_evaluation: No evaluation/metric evidence found
     - boundary_gap: Edge of current knowledge, unexplored combination
 
-    status:
+    status (frozen enum):
     - candidate: Newly identified, not yet audited
+    - auditing: Adversarial audit in progress
     - audited: Has been through adversarial audit (Phase 3C)
-    - survived: Passed audit, eligible for feasibility gate (Phase 4)
+    - surviving: Passed audit, eligible for feasibility gate (Phase 4)
     - rejected: Failed audit or feasibility gate
     - superseded: Replaced by a newer version (contract change)
+
+    provenance_status:
+    - complete: All structured fields populated with evidence backing
+    - partial: Some fields populated, some evidence missing
+    - invalid: Structured fields inconsistent with evidence
+
+    NOTE: supporting_evidence_ids_json and contradicting_evidence_ids_json
+    are DEPRECATED snapshots. The authoritative source is gap_evidence_links.
     """
     __tablename__ = "gap_candidates"
 
@@ -740,35 +754,47 @@ class GapCandidate(Base):
 
     # Gap identification
     gap_type = Column(String, nullable=False)
-    # coverage_gap / contradiction / missing_method / missing_dataset /
-    # missing_evaluation / boundary_gap
-
     description = Column(Text, nullable=False)
-    # What is the gap? (Chinese, specific and actionable)
+    # description is a human-readable summary; structured fields below are the
+    # authoritative contract for Phase 3B/3C business logic.
 
-    # Linkage to research questions
+    # Phase 3A Closure: Structured falsifiable contract
+    target_setting = Column(Text)
+    # What setting/scenario does this gap apply to?
+    observed_problem = Column(Text)
+    # What specific problem was observed in the evidence?
+    existing_coverage = Column(Text)
+    # What do existing papers already cover?
+    missing_capability = Column(Text)
+    # What specific capability/method/dataset is missing?
+    claimed_delta = Column(Text)
+    # What is the claimed improvement/difference from existing work?
+    testable_hypothesis = Column(Text)
+    # A falsifiable hypothesis that, if true, confirms the gap is real
+    falsification_condition = Column(Text)
+    # What evidence would falsify this gap (prove it's not a real gap)?
+    provenance_status = Column(Text, default="partial")
+    # complete / partial / invalid
+
+    # Linkage to research questions (DEPRECATED — use gap_evidence_links for evidence)
     question_ids_json = Column(Text, default="[]")
-    # JSON array of ResearchQuestion IDs this gap relates to
 
-    # Evidence context
+    # DEPRECATED snapshots — use gap_evidence_links as authoritative source
     supporting_evidence_ids_json = Column(Text, default="[]")
-    # Evidence IDs that hint at this gap (e.g., contradictions, limitations)
     contradicting_evidence_ids_json = Column(Text, default="[]")
-    # Evidence IDs that create the contradiction
 
     # Mining context
     mining_round = Column(Integer, nullable=False, default=0)
-    # Which search round was this gap identified in?
 
     # Assessment (populated in Phase 3C audit)
-    novelty_score = Column(Float)        # 0-1, how novel is this gap?
-    feasibility_score = Column(Float)   # 0-1, how feasible to address?
-    significance_score = Column(Float)   # 0-1, how significant?
-    risk_score = Column(Float)           # 0-1, risk of being non-novel
+    novelty_score = Column(Float)
+    feasibility_score = Column(Float)
+    significance_score = Column(Float)
+    risk_score = Column(Float)
 
-    # Status
+    # Status (frozen enum)
     status = Column(Text, nullable=False, default="candidate")
-    # candidate / audited / survived / rejected / superseded
+    # candidate / auditing / audited / surviving / rejected / superseded
 
     # Versioning
     version = Column(Integer, nullable=False, default=1)
@@ -812,16 +838,26 @@ class GapEvidenceLink(Base):
 class GapAudit(Base):
     """Adversarial audit result for a GapCandidate.
 
-    Phase 3C: After mining gaps (3B), each gap undergoes adversarial audit:
-    - Search for papers that might already address this gap
-    - Compare with nearest neighbors
-    - Determine if the gap is truly novel
+    Phase 3A Closure: Added decision fields and recommended_action enum.
 
     audit_result:
+    - pending: Audit not yet started
     - confirmed: Gap is genuine — no existing work fully addresses it
     - partially_closed: Some existing work partially addresses it
     - closed: Existing work already addresses it — reject
     - uncertain: Insufficient evidence to determine
+
+    recommended_action (frozen enum):
+    - continue: Gap confirmed, proceed to feasibility gate → surviving
+    - narrow: Gap partially closed, needs narrowing → audited
+    - more_search: Insufficient evidence, need more adversarial search → auditing
+    - reject: Gap is closed or invalid → rejected
+
+    State mapping (Phase 3C business logic, NOT implemented here):
+    - continue → surviving
+    - narrow → audited
+    - more_search → auditing
+    - reject → rejected
     """
     __tablename__ = "gap_audits"
 
@@ -831,25 +867,32 @@ class GapAudit(Base):
 
     # Audit queries
     adversarial_queries_json = Column(Text, default="[]")
-    # Queries used to search for existing work that might close this gap
 
     # Audit result
     audit_result = Column(Text, nullable=False, default="pending")
-    # pending / confirmed / partially_closed / closed / uncertain
 
     nearest_neighbor_summary = Column(Text)
-    # Summary of the closest existing work found during audit
-
     differentiation_summary = Column(Text)
-    # What specifically differentiates this gap from existing work?
-
-    # Nearest neighbor papers
     neighbor_paper_ids_json = Column(Text, default="[]")
-    # Paper IDs of nearest neighbors found during audit
+
+    # Phase 3A Closure: Decision fields
+    evidence_for_gap_json = Column(Text, default="[]")
+    # Evidence IDs supporting the gap's existence
+    evidence_against_gap_json = Column(Text, default="[]")
+    # Evidence IDs suggesting the gap is already addressed
+    remaining_delta = Column(Text)
+    # After audit, what delta remains between the gap and existing work?
+    novelty_confidence = Column(Float)
+    # 0-1, confidence that the gap is truly novel
+    audit_confidence = Column(Float)
+    # 0-1, confidence in the audit result itself
+    recommended_action = Column(Text, default="continue")
+    # continue / narrow / more_search / reject
+    rejection_reason = Column(Text)
+    # If recommended_action == reject, why?
 
     # Audit metadata
     audit_round = Column(Integer, nullable=False, default=0)
-    # Which search round was the audit performed in?
 
     created_at = Column(DateTime, default=_utcnow)
 
@@ -863,8 +906,9 @@ class GapAudit(Base):
 class NeighborComparison(Base):
     """Detailed comparison between a GapCandidate and a neighboring paper.
 
-    Phase 3C: For each nearest neighbor found during audit, records
-    the specific similarities and differences.
+    Phase 3A Closure: Added structured comparison fields.
+    shared_aspects_json and differentiating_aspects_json are kept for backward
+    compatibility, but Phase 3C's formal judgment uses structured fields below.
     """
     __tablename__ = "neighbor_comparisons"
 
@@ -875,16 +919,26 @@ class NeighborComparison(Base):
 
     # Comparison
     similarity_score = Column(Float, default=0.0)
-    # 0-1, how similar is this paper to the gap's proposed direction
 
+    # DEPRECATED: use structured fields below
     shared_aspects_json = Column(Text, default="[]")
-    # JSON array of aspects shared with this paper
-
     differentiating_aspects_json = Column(Text, default="[]")
-    # JSON array of aspects where the gap differs from this paper
 
     overlap_risk = Column(Float, default=0.0)
-    # 0-1, risk that this paper already covers the gap
+
+    # Phase 3A Closure: Structured comparison fields
+    shared_problem = Column(Text)
+    # What problem does this paper share with the gap?
+    shared_mechanism = Column(Text)
+    # What mechanism/method is shared?
+    shared_evaluation = Column(Text)
+    # What evaluation approach is shared?
+    covered_claims_json = Column(Text, default="[]")
+    # JSON array of gap claims that this paper already covers
+    uncovered_claims_json = Column(Text, default="[]")
+    # JSON array of gap claims that this paper does NOT cover
+    overlap_ratio = Column(Float, default=0.0)
+    # 0-1, ratio of gap claims covered by this paper
 
     created_at = Column(DateTime, default=_utcnow)
 

@@ -21,17 +21,27 @@ def save_search_query(db: Session, task_id: str, query_text: str, intent: str,
                       round_number: int, target_gap_id: str | None = None) -> SearchQueryRecord:
     """Save a structured search query with normalized_query_text.
 
-    Phase 3A: target_gap_id parameter added for gap-driven query binding.
+    Phase 3A Closure: Idempotency now includes target_gap_id in the check.
+    Two different gaps using the same query text will produce two separate records.
     """
     normalized = _normalize(query_text)
 
-    # Check for existing (idempotent)
-    existing = db.query(SearchQueryRecord).filter(
+    # Check for existing (idempotent) — includes target_gap_id in match
+    query = db.query(SearchQueryRecord).filter(
         SearchQueryRecord.task_id == task_id,
         SearchQueryRecord.round_number == round_number,
         SearchQueryRecord.normalized_query_text == normalized,
-        SearchQueryRecord.target_question_id == target_question_id,
-    ).first()
+    )
+    if target_gap_id is not None:
+        query = query.filter(SearchQueryRecord.target_gap_id == target_gap_id)
+    else:
+        query = query.filter(SearchQueryRecord.target_gap_id.is_(None))
+    if target_question_id is not None:
+        query = query.filter(SearchQueryRecord.target_question_id == target_question_id)
+    else:
+        query = query.filter(SearchQueryRecord.target_question_id.is_(None))
+
+    existing = query.first()
     if existing:
         return existing
 
