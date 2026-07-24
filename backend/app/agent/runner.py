@@ -500,19 +500,17 @@ async def run_task(task_id: str):
         except Exception as e:
             logger.warning("Task %s: paper analysis failed (non-fatal, continuing): %s", task_id[:8], e)
 
-        # === 2.6. LLM Wiki: Ingest papers into wiki knowledge base ===
-        await _run_wiki_ingest(db, task_id, llm)
-
-        # === 3. Build clusters once (used by both report and ideas) ===
-        logger.info("Task %s: building clusters...", task_id[:8])
-        cluster_list = await build_paper_clusters(db, state, llm, task_id)
-
-        # === 4. Generate report ONCE ===
-        logger.info("Task %s: generating report...", task_id[:8])
-        task_repo.update_status(db, task_id, "reporting")
-        db.commit()
-        emit_event(task_id, "status", {"status": "reporting"})
-        await generate_report(db, state, llm, cluster_list)
+        # Wiki, clustering, and reports are optional presentation features for Pipeline V2.
+        # They must not determine whether an evidence-grounded opportunity is found.
+        if state.pipeline_version < 2:
+            await _run_wiki_ingest(db, task_id, llm)
+            logger.info("Task %s: building clusters...", task_id[:8])
+            cluster_list = await build_paper_clusters(db, state, llm, task_id)
+            logger.info("Task %s: generating report...", task_id[:8])
+            task_repo.update_status(db, task_id, "reporting")
+            db.commit()
+            emit_event(task_id, "status", {"status": "reporting"})
+            await generate_report(db, state, llm, cluster_list)
 
         # === 5. Lightweight evidence-grounded opportunity discovery ===
         if state.pipeline_version >= 2:
@@ -559,7 +557,13 @@ async def run_task(task_id: str):
                 db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
             )
             if audit_results is None:
-                audit_results = []
+                from app.db.models import GapCandidate
+                state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
+                    GapCandidate.task_id == task_id,
+                    GapCandidate.status == "surviving",
+                ).all()]
+                task_repo.save_state(db, task_id, state)
+                db.commit()
             state = task_repo.get_state(db, task_id)
             if not state.surviving_gap_ids:
                 task_repo.update_status(db, task_id, "more_research_required")
@@ -584,7 +588,13 @@ async def run_task(task_id: str):
                 db, task_id, "generate_interventions", _generate_interventions_op,
                 input_version=intervention_input_version
             )
-            if not interventions or not interventions.passed_intervention_ids:
+            if interventions is None:
+                from app.db.repositories import intervention_repo
+                recovered_interventions = intervention_repo.list_interventions_for_task(db, task_id)
+                passed_intervention_ids = [item.id for item in recovered_interventions if item.status == "passed"]
+            else:
+                passed_intervention_ids = interventions.passed_intervention_ids
+            if not passed_intervention_ids:
                 task_repo.update_status(db, task_id, "more_research_required")
                 task_repo.update_stop_reason(db, task_id, "no_intervention_passed_hard_gates")
                 emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_intervention_passed_hard_gates"})
@@ -599,7 +609,7 @@ async def run_task(task_id: str):
                 return await generate_minimal_experiments(db, state, llm, task_id)
 
             experiment_input_version = hashlib.sha256(json.dumps({
-                "intervention_ids": sorted(interventions.passed_intervention_ids),
+                "intervention_ids": sorted(passed_intervention_ids),
                 "contract_id": state.contract_id,
                 "pipeline_version": state.pipeline_version,
             }, sort_keys=True).encode()).hexdigest()
@@ -607,7 +617,16 @@ async def run_task(task_id: str):
                 db, task_id, "generate_minimal_experiments", _minimal_experiments_op,
                 input_version=experiment_input_version
             )
-            if not experiment_result or not experiment_result.idea_ids:
+            if experiment_result is None:
+                from app.db.models import ResearchIdea
+                idea_ids = [idea.id for idea in db.query(ResearchIdea).filter(
+                    ResearchIdea.task_id == task_id,
+                    ResearchIdea.decision == "go",
+                    ResearchIdea.idea_status == "active",
+                ).all()]
+            else:
+                idea_ids = experiment_result.idea_ids
+            if not idea_ids:
                 task_repo.update_status(db, task_id, "abstained")
                 task_repo.update_stop_reason(db, task_id, "no_minimal_experiment_generated")
                 emit_event(task_id, "status", {"status": "abstained", "reason": "no_minimal_experiment_generated"})
@@ -619,7 +638,7 @@ async def run_task(task_id: str):
             emit_event(task_id, "status", {
                 "status": "waiting_for_user_review",
                 "reason": "evidence_grounded_ideas_ready",
-                "idea_count": len(experiment_result.idea_ids),
+                "idea_count": len(idea_ids),
             })
             db.commit()
         else:

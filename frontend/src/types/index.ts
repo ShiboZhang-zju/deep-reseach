@@ -147,6 +147,7 @@ export const STATUS_LABELS: Record<string, string> = {
   auditing_gaps: 'Gap 审计中',
   checking_feasibility: '可行性检查',
   synthesizing_ideas: '合成 Ideas',
+  abstained: '暂不输出 Idea',
 };
 
 export const STATUS_COLORS: Record<string, string> = {
@@ -171,4 +172,5 @@ export const STATUS_COLORS: Record<string, string> = {
   auditing_gaps: 'bg-purple-100 text-purple-700',
   checking_feasibility: 'bg-purple-100 text-purple-700',
   synthesizing_ideas: 'bg-purple-100 text-purple-700',
+  abstained: 'bg-gray-100 text-gray-700',
 };

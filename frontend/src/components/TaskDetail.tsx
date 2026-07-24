@@ -32,12 +32,17 @@ const TABS: { key: Tab; label: string; icon: string }[] = [
 
 const RUNNING_STATUSES = [
   'clarifying',
+  'building_contract',
+  'decomposing',
   'searching',
   'summarizing',
   'reporting',
   'generating_ideas',
   'judging_ideas',
   'generating_experiment',
+  'mining_gaps',
+  'auditing_gaps',
+  'synthesizing_ideas',
   'waiting_for_clarification',
   'waiting_for_user_review',
 ];
