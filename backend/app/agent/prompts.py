@@ -822,6 +822,18 @@ CRITICAL RULES:
 4. Each evidence unit should be a single, atomic claim
 5. Write normalized_claim IN CHINESE, but keep original_span in the original language
 
+O6 — LIMITATION / BOUNDARY PRIORITY:
+Research-gap discovery depends heavily on limitation and negative-result evidence.
+When the section is a Discussion, Limitations, Threats to Validity, or Future Work section,
+you MUST actively extract every stated boundary of the work, including:
+- explicit failure conditions, settings where the method does not work, or degraded regimes
+- assumptions that restrict applicability ("we assume ...", "our approach requires ...")
+- untested / unevaluated conditions the authors acknowledge
+- future-work statements that reveal what is currently missing
+Classify these as evidence_type "limitation", "negative_result", or "future_work" accordingly.
+Each such unit still requires a concrete original_span — never fabricate a limitation that is
+not written in the text. If the section states no boundary, extract nothing rather than inventing one.
+
 Output as JSON matching EvidenceExtractionList."""
 
 

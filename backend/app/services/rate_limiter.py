@@ -78,9 +78,9 @@ class RateLimiterRegistry:
             rate = self._default_rate
             name_lower = source_name.lower()
             if "semantic" in name_lower or "s2" in name_lower:
-                rate = settings.rate_limit_s2_per_min
+                rate = settings.effective_s2_rate_per_min
             elif "openalex" in name_lower:
-                rate = settings.rate_limit_openalex_per_min
+                rate = settings.effective_openalex_rate_per_min
             # arXiv, Crossref, IEEE, CORE use default
             self._buckets[source_name] = TokenBucket(rate_per_min=rate)
             logger.info("Rate limiter for '%s': %d req/min", source_name, rate)

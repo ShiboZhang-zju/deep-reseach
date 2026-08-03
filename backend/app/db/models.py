@@ -670,6 +670,8 @@ class SearchQueryRecord(Base):
 
     # Phase 3A: Gap-driven query binding
     target_gap_id = Column(String, ForeignKey("gap_candidates.id"))
+    query_family = Column(Text, default="")
+    search_policy_version = Column(Text, default="")
 
     result_count = Column(Integer, default=0)
     new_paper_count = Column(Integer, default=0)
@@ -907,6 +909,10 @@ class GapAudit(Base):
 
     # Audit queries
     adversarial_queries_json = Column(Text, default="[]")
+    search_policy_version = Column(Text, default="")
+    search_admission_status = Column(Text, default="UNKNOWN")
+    search_admission_reasons_json = Column(Text, default="[]")
+    search_query_ids_json = Column(Text, default="[]")
 
     # Audit result
     audit_result = Column(Text, nullable=False, default="pending")

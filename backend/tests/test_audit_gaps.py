@@ -120,7 +120,7 @@ async def test_confirmed_audit_creates_comparison_and_survives(temp_db):
     db = temp_db()
     task, gap, _ = _seed_gap(db)
     state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
-    results = await audit_gap_candidates(db, state, ConfirmingAuditLLM(), task.id, perform_search=False)
+    results = await audit_gap_candidates(db, state, ConfirmingAuditLLM(), task.id, perform_search=True)
 
     assert results[0].audit_result == "confirmed"
     assert state.surviving_gap_ids == [gap.id]

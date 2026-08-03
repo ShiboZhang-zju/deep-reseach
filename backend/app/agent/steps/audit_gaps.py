@@ -3,6 +3,7 @@
 import json
 import logging
 from dataclasses import dataclass
+from collections import defaultdict
 
 from pydantic import BaseModel, Field
 
@@ -10,13 +11,14 @@ from app.agent.state import ResearchState
 from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
-from app.db.models import GapCandidate, Paper, TaskPaper
+from app.db.models import EvidenceUnit, GapCandidate, Paper, SearchQueryPaper, SearchQueryRecord, TaskPaper
 from app.db.repositories import gap_repo, paper_repo, task_repo
 from app.db.repositories.search_query_repo import save_search_query
 
 logger = logging.getLogger(__name__)
 
 _MAX_NEIGHBORS = 5
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v1"
 
 _AUDIT_SYSTEM = """You are conducting an adversarial research-gap audit.
 Your job is to find whether the supplied neighboring papers already close the candidate gap.
@@ -91,18 +93,87 @@ class GapAuditResult:
         }
 
 
-def build_adversarial_queries(gap: GapCandidate) -> list[str]:
-    """Build the MVP's required direct, synonym, and falsification queries."""
-    terms = " ".join(filter(None, [gap.target_setting, gap.missing_capability, gap.claimed_delta]))
-    problem = " ".join(filter(None, [gap.observed_problem, gap.missing_capability]))
-    queries = [
-        terms,
-        problem,
-        f"{gap.missing_capability or gap.description} evaluation limitation",
+@dataclass(frozen=True)
+class AdversarialQuerySpec:
+    family: str
+    query_text: str
+
+@dataclass(frozen=True)
+class GapSearchAdmission:
+    gap_id: str
+    status: str
+    reason_codes: list[str]
+    query_ids: list[str]
+    completed_query_ids: list[str]
+    failed_query_ids: list[str]
+    completed_families: list[str]
+    source_count: int
+    candidate_paper_ids: list[str]
+    external_neighbor_ids: list[str]
+
+def build_adversarial_queries(gap: GapCandidate) -> list[AdversarialQuerySpec]:
+    specs = [
+        AdversarialQuerySpec("exact_gap", " ".join(filter(None, [gap.target_setting, gap.missing_capability, gap.claimed_delta]))),
+        AdversarialQuerySpec("alternative_coverage", " ".join(filter(None, [gap.observed_problem, "method evaluation benchmark"]))),
+        AdversarialQuerySpec("claim_falsification", gap.falsification_condition or gap.description),
     ]
     seen = set()
-    return [query for query in queries if query and not (query.lower() in seen or seen.add(query.lower()))]
+    return [spec for spec in specs if spec.query_text and not (spec.query_text.lower() in seen or seen.add(spec.query_text.lower()))]
 
+def evaluate_gap_search_admission(db, gap, query_ids):
+    queries = db.query(SearchQueryRecord).filter(
+        SearchQueryRecord.id.in_(query_ids),
+        SearchQueryRecord.target_gap_id == gap.id,
+        SearchQueryRecord.search_policy_version == GAP_SEARCH_POLICY_VERSION,
+    ).all()
+    reasons = []
+    if not queries:
+        return GapSearchAdmission(gap.id, "UNKNOWN", ["NO_GAP_QUERIES"], [], [], [], [], 0, [], [])
+    completed = [item for item in queries if item.status == "completed"]
+    failed = [item for item in queries if item.status == "failed"]
+    families = sorted({item.query_family for item in completed if item.query_family})
+    if len(completed) < 2: reasons.append("INSUFFICIENT_COMPLETED_QUERIES")
+    if len(families) < 2: reasons.append("INSUFFICIENT_QUERY_FAMILIES")
+    if len(completed) / max(len(queries), 1) < 0.5: reasons.append("SEARCH_SUCCESS_RATE_TOO_LOW")
+    mappings = db.query(SearchQueryPaper).filter(SearchQueryPaper.query_id.in_([item.id for item in completed])).all()
+    paper_ids = sorted({item.paper_id for item in mappings})
+    sources = {item.source for item in mappings if item.source and item.source != "unknown"}
+    if not sources: reasons.append("NO_SUCCESSFUL_SOURCE")
+    if len(paper_ids) < 3: reasons.append("INSUFFICIENT_GAP_SPECIFIC_PAPERS")
+    support_papers = {db.get(EvidenceUnit, link.evidence_id).paper_id for link in gap_repo.list_gap_evidence(db, gap.id) if link.relation_type == "suggests" and db.get(EvidenceUnit, link.evidence_id)}
+    external = [item for item in paper_ids if item not in support_papers]
+    if not external: reasons.append("NO_EXTERNAL_NEIGHBOR")
+    return GapSearchAdmission(gap.id, "PASS" if not reasons else "UNKNOWN", reasons, [item.id for item in queries], [item.id for item in completed], [item.id for item in failed], families, len(sources), paper_ids, external)
+
+def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS):
+    mappings = db.query(SearchQueryPaper).filter(SearchQueryPaper.query_id.in_(query_ids)).all()
+    query_family = {item.id: item.query_family for item in db.query(SearchQueryRecord).filter(SearchQueryRecord.id.in_(query_ids)).all()}
+    stats = defaultdict(lambda: {"hits": 0, "families": set(), "sources": set(), "best_rank": 10**6})
+    for mapping in mappings:
+        item = stats[mapping.paper_id]
+        item["hits"] += 1
+        item["families"].add(query_family.get(mapping.query_id, ""))
+        item["sources"].add(mapping.source)
+        item["best_rank"] = min(item["best_rank"], mapping.rank)
+    ranked = []
+    for paper_id, item in stats.items():
+        paper = db.get(Paper, paper_id)
+        if not paper: continue
+        tp = db.query(TaskPaper).filter(TaskPaper.task_id == gap.task_id, TaskPaper.paper_id == paper_id).first()
+        score = 0.4 * item["hits"] + 0.3 * len(item["families"]) + 0.2 / (item["best_rank"] + 1) + 0.1 * len(item["sources"]) + 0.1 * (tp.final_score or 0 if tp else 0)
+        ranked.append((score, paper))
+    return [paper for _, paper in sorted(ranked, key=lambda item: item[0], reverse=True)[:limit]]
+
+def _save_search_admission_trace(db, task_id, admission):
+    paper_repo.save_trace(db, task_id, "gap_search_admission", "decision", output_data={
+        "gap_id": admission.gap_id, "search_policy_version": GAP_SEARCH_POLICY_VERSION,
+        "query_ids": admission.query_ids, "query_families": admission.completed_families,
+        "completed_query_count": len(admission.completed_query_ids), "failed_query_count": len(admission.failed_query_ids),
+        "success_rate": len(admission.completed_query_ids) / max(len(admission.query_ids), 1),
+        "source_count": admission.source_count, "candidate_paper_count": len(admission.candidate_paper_ids),
+        "external_neighbor_count": len(admission.external_neighbor_ids), "status": admission.status,
+        "reason_codes": admission.reason_codes,
+    })
 
 async def audit_gap_candidates(
     db,
@@ -144,33 +215,43 @@ async def audit_gap_candidate(
 
     gap.status = "auditing"
     audit_round = state.current_round + 1
-    queries = build_adversarial_queries(gap)
+    query_specs = build_adversarial_queries(gap)
+    queries = [spec.query_text for spec in query_specs]
     executions = []
-    for query in queries:
+    for spec in query_specs:
         record = save_search_query(
-            db, task_id, query, "gap_falsification", None, None,
-            audit_round, target_gap_id=gap.id,
+            db, task_id, spec.query_text, f"gap_{spec.family}", None, None, audit_round,
+            target_gap_id=gap.id, query_family=spec.family,
+            search_policy_version=GAP_SEARCH_POLICY_VERSION,
         )
         executions.append(SearchQueryExecution(
-            query_id=record.id,
-            query_text=query,
-            intent="gap_falsification",
-            target_question_id=None,
-            expected_evidence_type=None,
-            target_gap_id=gap.id,
+            query_id=record.id, query_text=spec.query_text, intent=f"gap_{spec.family}",
+            target_question_id=None, expected_evidence_type=None, target_gap_id=gap.id,
         ))
     db.commit()
-
     if perform_search and executions:
-        await search_and_save_papers(db, state, executions, task_id, audit_round)
-
-    neighbors = _select_neighbors(db, task_id)
+        try:
+            await search_and_save_papers(db, state, executions, task_id, audit_round)
+        except RuntimeError as exc:
+            logger.info("Gap %s search admission deferred: %s", gap.id[:8], exc)
+    admission = evaluate_gap_search_admission(db, gap, [item.query_id for item in executions])
+    _save_search_admission_trace(db, task_id, admission)
+    if admission.status != "PASS":
+        gap.status = "auditing"
+        gap_repo.create_gap_audit(
+            db, gap_id=gap.id, task_id=task_id, adversarial_queries=queries,
+            audit_result="uncertain", neighbor_paper_ids=admission.candidate_paper_ids,
+            recommended_action="more_search", audit_round=audit_round,
+            search_policy_version=GAP_SEARCH_POLICY_VERSION, search_admission_status=admission.status,
+            search_admission_reasons=admission.reason_codes, search_query_ids=admission.query_ids,
+        )
+        db.commit()
+        return GapAuditResult(gap.id, "uncertain", "more_search", "")
+    neighbors = select_gap_specific_neighbors(db, gap, admission.completed_query_ids)
     decision = await llm.chat_json([
         {"role": "system", "content": _AUDIT_SYSTEM},
         {"role": "user", "content": _AUDIT_USER.format(
-            gap_id=gap.id,
-            gap_type=gap.gap_type,
-            target_setting=gap.target_setting or "(not specified)",
+            gap_id=gap.id, gap_type=gap.gap_type, target_setting=gap.target_setting or "(not specified)",
             observed_problem=gap.observed_problem or "(not specified)",
             existing_coverage=gap.existing_coverage or "(not specified)",
             missing_capability=gap.missing_capability or "(not specified)",
@@ -229,6 +310,10 @@ async def audit_gap_candidate(
         recommended_action=action,
         rejection_reason=decision.rejection_reason or None,
         audit_round=audit_round,
+        search_policy_version=GAP_SEARCH_POLICY_VERSION,
+        search_admission_status=admission.status,
+        search_admission_reasons=admission.reason_codes,
+        search_query_ids=admission.query_ids,
     )
     paper_repo.save_trace(db, task_id, "audit_gap_candidate", "decision", output_data={
         "gap_id": gap.id,

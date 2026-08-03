@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 # Importance threshold for "high importance" questions
 HIGH_IMPORTANCE_THRESHOLD = 0.7
 
+# O3: Minimum fraction of high-importance questions that must have a latest
+# coverage snapshot for the pipeline to proceed. Below this, we do NOT hard-fail
+# the whole task — we downgrade to more_research_required so the task can still
+# surface a landscape brief and (optionally) trigger targeted follow-up search.
+MIN_HIGH_IMPORTANCE_SNAPSHOT_RATIO = 0.6
+
 
 @dataclass
 class Phase2ReadinessResult:
@@ -161,10 +167,22 @@ def evaluate_phase2_readiness(db, task_id: str,
     missing_snapshot_ids = [q.id for q in high_importance_qs
                             if q.id not in latest_cov]
 
-    if missing_snapshot_ids:
+    # O3: Do NOT hard-fail on any single missing snapshot. Only fail when the
+    # control plane is genuinely broken (no high-importance question has any
+    # snapshot at all). When coverage is partial, downgrade to
+    # more_research_required so the task can still emit a landscape brief and
+    # optionally trigger targeted follow-up search — instead of dying.
+    if high_importance_qs:
+        snapshot_ratio = (len(high_importance_qs) - len(missing_snapshot_ids)) / len(high_importance_qs)
+    else:
+        snapshot_ratio = 1.0
+
+    if missing_snapshot_ids and snapshot_ratio == 0.0:
+        # Total control-plane failure: not a single high-importance question
+        # produced a coverage snapshot.
         return Phase2ReadinessResult(
             ready=False, status="failed",
-            reason=f"high_importance_questions_missing_coverage_snapshot ({len(missing_snapshot_ids)})",
+            reason=f"no_high_importance_question_has_coverage_snapshot ({len(missing_snapshot_ids)})",
             active_question_count=len(active_questions),
             questions_with_latest_snapshot=len(latest_cov),
             high_importance_question_count=len(high_importance_qs),
@@ -174,6 +192,26 @@ def evaluate_phase2_readiness(db, task_id: str,
             latest_round=max((r.round_number for r in latest_cov.values()), default=0),
             missing_question_ids=missing_snapshot_ids,
         )
+
+    if missing_snapshot_ids and snapshot_ratio < MIN_HIGH_IMPORTANCE_SNAPSHOT_RATIO:
+        # Partial coverage below the acceptable ratio: recoverable, not fatal.
+        return Phase2ReadinessResult(
+            ready=False, status="more_research_required",
+            reason=(f"high_importance_coverage_below_ratio "
+                    f"({snapshot_ratio:.2f} < {MIN_HIGH_IMPORTANCE_SNAPSHOT_RATIO})"),
+            active_question_count=len(active_questions),
+            questions_with_latest_snapshot=len(latest_cov),
+            high_importance_question_count=len(high_importance_qs),
+            high_importance_covered_count=len(high_importance_qs) - len(missing_snapshot_ids),
+            evidence_count=len(all_evidence),
+            valid_evidence_count=len(all_evidence),
+            latest_round=max((r.round_number for r in latest_cov.values()), default=0),
+            missing_question_ids=missing_snapshot_ids,
+            unresolved_question_ids=missing_snapshot_ids,
+        )
+    # else: snapshot_ratio >= MIN ratio (or nothing missing) — proceed, the
+    # remaining questions without snapshots are simply treated as uncovered
+    # in the downstream coverage check below.
 
     # --- 5. Check if high-importance questions have any coverage ---
     high_covered = 0

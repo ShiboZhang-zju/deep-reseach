@@ -352,14 +352,36 @@ async def _upgrade_abstract_evidence(db, paper, task_id):
 
 
 async def _llm_extract_evidence(llm, paper, text_chunk, section):
-    """Call LLM to extract evidence units from a text chunk."""
+    """Call LLM to extract evidence units from a text chunk.
+
+    O6: For abstract-only extraction, add an explicit instruction to surface
+    implicit capability boundaries (scope statements like "we focus on X"
+    imply "non-X is not covered"), which are a key source of gap signals when
+    full text is unavailable. These are still tied to a concrete original_span.
+    """
+    section_hint = ""
+    if section == "abstract":
+        section_hint = (
+            "\n\nNote: This is an abstract. In addition to explicit claims, surface any "
+            "implicit capability boundary the abstract states — e.g. a scope restriction "
+            "(\"we focus on ...\", \"limited to ...\", \"for the setting of ...\") implies the "
+            "complementary setting is NOT addressed. Only do this when the scope wording is "
+            "actually present in the text; classify such units as evidence_type \"limitation\"."
+        )
+    elif section == "conclusion":
+        section_hint = (
+            "\n\nNote: This section aggregates Discussion / Limitations / Threats to Validity / "
+            "Future Work. Prioritize extracting every stated boundary, failure condition, "
+            "assumption, and acknowledged untested setting as evidence_type "
+            "\"limitation\", \"negative_result\", or \"future_work\"."
+        )
     messages = [
         {"role": "system", "content": EVIDENCE_EXTRACT_SYSTEM},
         {"role": "user", "content": EVIDENCE_EXTRACT_USER.format(
             title=paper.title or "",
             section=section,
             text_chunk=text_chunk[:CHUNK_SIZE],
-        )},
+        ) + section_hint},
     ]
     return await llm.chat_json(messages, EvidenceExtractionList)
 

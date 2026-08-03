@@ -18,7 +18,8 @@ def _normalize(text: str) -> str:
 
 def save_search_query(db: Session, task_id: str, query_text: str, intent: str,
                       target_question_id: str | None, expected_evidence_type: str | None,
-                      round_number: int, target_gap_id: str | None = None) -> SearchQueryRecord:
+                      round_number: int, target_gap_id: str | None = None,
+                      query_family: str = "", search_policy_version: str = "") -> SearchQueryRecord:
     """Save a structured search query with normalized_query_text.
 
     Phase 3A Closure: Idempotency now includes target_gap_id in the check.
@@ -31,6 +32,8 @@ def save_search_query(db: Session, task_id: str, query_text: str, intent: str,
         SearchQueryRecord.task_id == task_id,
         SearchQueryRecord.round_number == round_number,
         SearchQueryRecord.normalized_query_text == normalized,
+        SearchQueryRecord.query_family == query_family,
+        SearchQueryRecord.search_policy_version == search_policy_version,
     )
     if target_gap_id is not None:
         query = query.filter(SearchQueryRecord.target_gap_id == target_gap_id)
@@ -55,6 +58,8 @@ def save_search_query(db: Session, task_id: str, query_text: str, intent: str,
         round_number=round_number,
         status="pending",
         target_gap_id=target_gap_id,
+        query_family=query_family,
+        search_policy_version=search_policy_version,
     )
     db.add(record)
     db.flush()

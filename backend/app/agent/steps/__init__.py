@@ -23,6 +23,7 @@ from app.agent.steps.mine_gaps import mine_gap_candidates
 from app.agent.steps.audit_gaps import audit_gap_candidates
 from app.agent.steps.generate_interventions import generate_interventions
 from app.agent.steps.generate_minimal_experiments import generate_minimal_experiments
+from app.agent.steps.generate_landscape_brief import generate_landscape_brief
 
 __all__ = [
     "clarify_topic",
@@ -46,4 +47,5 @@ __all__ = [
     "audit_gap_candidates",
     "generate_interventions",
     "generate_minimal_experiments",
+    "generate_landscape_brief",
 ]

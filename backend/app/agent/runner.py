@@ -44,6 +44,7 @@ from app.agent.steps import (
     audit_gap_candidates,
     generate_interventions,
     generate_minimal_experiments,
+    generate_landscape_brief,
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
@@ -467,6 +468,8 @@ async def run_task(task_id: str):
         if readiness.status == "more_research_required":
             logger.warning("Task %s: readiness gate — more research required — %s",
                           task_id[:8], readiness.reason)
+            await generate_landscape_brief(db, state, task_id,
+                                           "more_research_required", f"readiness_more_research: {readiness.reason}")
             task_repo.update_status(db, task_id, "more_research_required")
             task_repo.update_stop_reason(db, task_id, f"readiness_more_research: {readiness.reason}")
             emit_event(task_id, "status", {
@@ -538,6 +541,8 @@ async def run_task(task_id: str):
                         if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
             state = task_repo.get_state(db, task_id)
             if not gaps:
+                await generate_landscape_brief(db, state, task_id,
+                                               "more_research_required", "no_evidence_backed_gap_candidates")
                 task_repo.update_status(db, task_id, "more_research_required")
                 task_repo.update_stop_reason(db, task_id, "no_evidence_backed_gap_candidates")
                 emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_evidence_backed_gap_candidates"})
@@ -573,6 +578,8 @@ async def run_task(task_id: str):
             db.commit()
             state = task_repo.get_state(db, task_id)
             if not state.surviving_gap_ids:
+                await generate_landscape_brief(db, state, task_id,
+                                               "more_research_required", "no_surviving_gap_after_audit")
                 task_repo.update_status(db, task_id, "more_research_required")
                 task_repo.update_stop_reason(db, task_id, "no_surviving_gap_after_audit")
                 emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_surviving_gap_after_audit"})
@@ -605,6 +612,8 @@ async def run_task(task_id: str):
             else:
                 passed_intervention_ids = interventions.passed_intervention_ids
             if not passed_intervention_ids:
+                await generate_landscape_brief(db, state, task_id,
+                                               "more_research_required", "no_intervention_passed_hard_gates")
                 task_repo.update_status(db, task_id, "more_research_required")
                 task_repo.update_stop_reason(db, task_id, "no_intervention_passed_hard_gates")
                 emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_intervention_passed_hard_gates"})
@@ -641,12 +650,16 @@ async def run_task(task_id: str):
             else:
                 idea_ids = experiment_result.idea_ids
             if not idea_ids:
+                await generate_landscape_brief(db, state, task_id,
+                                               "abstained", "no_minimal_experiment_generated")
                 task_repo.update_status(db, task_id, "abstained")
                 task_repo.update_stop_reason(db, task_id, "no_minimal_experiment_generated")
                 emit_event(task_id, "status", {"status": "abstained", "reason": "no_minimal_experiment_generated"})
                 db.commit()
                 return
 
+            await generate_landscape_brief(db, state, task_id,
+                                           "waiting_for_user_review", "evidence_grounded_ideas_ready")
             task_repo.update_status(db, task_id, "waiting_for_user_review")
             task_repo.update_stop_reason(db, task_id, "evidence_grounded_ideas_ready")
             emit_event(task_id, "status", {

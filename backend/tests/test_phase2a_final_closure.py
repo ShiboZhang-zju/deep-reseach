@@ -392,8 +392,10 @@ def _create_readiness_test_data(db, task_id, contract_id, question_count=3,
 
 
 def test_readiness_gate_missing_snapshot(temp_db):
-    """Active Contract, 3 active Questions, 1 high-importance question
-    missing CoverageRecord → status == failed.
+    """O3: Active Contract, 3 active Questions, 1 of 2 high-importance questions
+    missing CoverageRecord (snapshot_ratio = 0.5 < 0.6) → downgraded to
+    more_research_required (NOT a hard failure). This is the O3 fix: a single
+    missing snapshot must not kill the whole task.
     """
     engine, Session = temp_db
     db = Session()
@@ -413,9 +415,9 @@ def test_readiness_gate_missing_snapshot(temp_db):
     from app.agent.steps.readiness_gate import evaluate_phase2_readiness
     result = evaluate_phase2_readiness(db, task.id, contract.id)
 
-    assert result.status == "failed", \
-        f"Expected 'failed' (missing snapshot), got '{result.status}'"
-    assert "missing_coverage_snapshot" in result.reason
+    assert result.status == "more_research_required", \
+        f"Expected 'more_research_required' (partial snapshot below ratio), got '{result.status}'"
+    assert "coverage_below_ratio" in result.reason
     assert len(result.missing_question_ids) == 1
 
     db.close()
@@ -559,10 +561,11 @@ def test_superseded_contract_isolation(temp_db):
 
     result = evaluate_phase2_readiness(db, task.id, "contract-v2")
 
-    # Should be "failed" because v2's questions have no coverage snapshots
+    # Should be "failed" because ALL of v2's high-importance questions have no
+    # coverage snapshot (snapshot_ratio == 0.0 → total control-plane failure).
     assert result.status == "failed", \
-        f"Expected 'failed' (v2 missing coverage), got '{result.status}'"
-    assert "missing_coverage_snapshot" in result.reason
+        f"Expected 'failed' (v2 missing all coverage), got '{result.status}'"
+    assert "no_high_importance_question_has_coverage_snapshot" in result.reason
 
     # Verify it's using v2's questions, not v1's
     assert result.active_question_count == 3

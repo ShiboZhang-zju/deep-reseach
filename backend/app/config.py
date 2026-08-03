@@ -72,6 +72,35 @@ class Settings(BaseSettings):
     # Authentication (P0-4): if set, POST/PUT/DELETE on /api/tasks require X-API-Key header
     api_key: str = ""
 
+    # O4: When an API key/email is configured, the source allows much higher
+    # throughput. These "effective" rates are auto-selected so users do not
+    # have to hand-tune rate_limit_* values in .env after obtaining a key.
+    # A user-supplied override (rate_limit_s2_per_min raised above the no-key
+    # default) is always respected.
+    s2_rate_with_key: int = 5000        # S2 with API key: 1 req/s sustained, bursts higher
+    openalex_rate_with_key: int = 100   # OpenAlex with polite-pool email/key
+
+    @property
+    def effective_s2_rate_per_min(self) -> int:
+        """S2 rate: high when a key is present, else the conservative no-key value.
+
+        If the user explicitly raised rate_limit_s2_per_min in .env, honor it.
+        """
+        if self.rate_limit_s2_per_min > 20:
+            return self.rate_limit_s2_per_min  # explicit user override
+        if self.semantic_scholar_api_key.strip():
+            return self.s2_rate_with_key
+        return self.rate_limit_s2_per_min
+
+    @property
+    def effective_openalex_rate_per_min(self) -> int:
+        """OpenAlex rate: high when an email/key is present (polite pool)."""
+        if self.rate_limit_openalex_per_min > 10:
+            return self.rate_limit_openalex_per_min  # explicit user override
+        if self.openalex_email.strip() or self.openalex_api_key.strip():
+            return self.openalex_rate_with_key
+        return self.rate_limit_openalex_per_min
+
     model_config = SettingsConfigDict(
         env_file=str(_env_file),
         env_file_encoding="utf-8",

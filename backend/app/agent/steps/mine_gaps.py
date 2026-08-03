@@ -29,6 +29,14 @@ class QuestionEvidenceAdmission:
     contradicting_evidence_ids: list[str] = field(default_factory=list)
     supporting_paper_ids: list[str] = field(default_factory=list)
     verified_span_count: int = 0
+    # O5(b): evidence confidence tier — "A" when full-text-locatable evidence
+    # backs the gap, "B" when only abstract-strength evidence is available.
+    # B-tier admissions still PASS but produce provenance_status="partial" gaps.
+    evidence_tier: str = "A"
+
+# O5(b): minimum abstract-strength supporting papers required to admit a
+# question at B-tier when no full-text-locatable evidence is present.
+_MIN_ABSTRACT_TIER_PAPERS = 2
 
 def _is_fulltext_locatable(item: EvidenceUnit) -> bool:
     return (
@@ -59,10 +67,31 @@ def evaluate_gap_mining_admission(question, links, evidence_by_id) -> QuestionEv
     limiting = [item for item in supporting if item.evidence_type in _LIMITATION_SIGNAL_TYPES]
     reasons = []
     if len(papers) < 2: reasons.append("INSUFFICIENT_INDEPENDENT_PAPERS")
-    if spans < 1: reasons.append("NO_FULLTEXT_LOCATABLE_EVIDENCE")
     if not limiting: reasons.append("NO_LIMITATION_SIGNAL")
     if contradicting: reasons.append("UNRESOLVED_VERIFIED_CONTRADICTION")
-    return QuestionEvidenceAdmission(question.id, "PASS" if not reasons else "UNKNOWN", reasons, [item.id for item in supporting], [item.id for item in supporting], [item.id for item in limiting], [item.id for item in contradicting], papers, spans)
+
+    # O5(b): full-text is no longer a hard requirement. Determine an evidence
+    # tier instead:
+    #   A-tier: at least one full-text-locatable span  -> high-confidence gap
+    #   B-tier: no full-text, but >= _MIN_ABSTRACT_TIER_PAPERS papers with a
+    #           limitation signal -> admissible but flagged partial (needs
+    #           downstream audit / follow-up to confirm)
+    # Only when neither condition holds do we withhold admission.
+    if spans >= 1:
+        evidence_tier = "A"
+    elif len(papers) >= _MIN_ABSTRACT_TIER_PAPERS and limiting:
+        evidence_tier = "B"
+    else:
+        evidence_tier = "B"
+        reasons.append("NO_FULLTEXT_LOCATABLE_EVIDENCE")
+
+    status = "PASS" if not reasons else "UNKNOWN"
+    return QuestionEvidenceAdmission(
+        question.id, status, reasons,
+        [item.id for item in supporting], [item.id for item in supporting],
+        [item.id for item in limiting], [item.id for item in contradicting],
+        papers, spans, evidence_tier,
+    )
 
 _GAP_MINING_SYSTEM = """You identify candidate research gaps from supplied paper evidence.
 Return only gaps that are supported by the supplied evidence. A gap is not merely a topic with little evidence.
@@ -213,18 +242,24 @@ async def mine_gap_candidates(
         elif not candidate.supporting_evidence_ids or not set(candidate.supporting_evidence_ids).issubset(allowed_for_candidate): reason = "UNKNOWN_EVIDENCE_ID"
         elif candidate.contradicting_evidence_ids: reason = "UNEXPECTED_CONTRADICTING_EVIDENCE"
         elif None in support or len({item.paper_id for item in support}) < 2: reason = "INSUFFICIENT_CANDIDATE_PAPER_SUPPORT"
-        elif not any(_is_fulltext_locatable(item) for item in support): reason = "CANDIDATE_LACKS_FULLTEXT_EVIDENCE"
         elif not any(item.evidence_type in _LIMITATION_SIGNAL_TYPES for item in support): reason = "CANDIDATE_LACKS_LIMITATION_SIGNAL"
         if reason:
             rejected_candidates.append(reason)
             continue
+
+        # O5(b): full-text presence sets provenance tier rather than rejecting.
+        # A-tier (complete) has a full-text-locatable span; B-tier (partial)
+        # is abstract-strength only and must be confirmed by the downstream
+        # adversarial audit before it can survive.
+        has_fulltext = any(_is_fulltext_locatable(item) for item in support if item)
+        provenance_status = "complete" if has_fulltext else "partial"
         gap = gap_repo.create_gap_candidate(
             db, task_id=task_id, contract_id=contract.id, gap_type=candidate.gap_type,
             description=candidate.description, target_setting=candidate.target_setting,
             observed_problem=candidate.observed_problem, existing_coverage=candidate.existing_coverage,
             missing_capability=candidate.missing_capability, claimed_delta=candidate.claimed_delta,
             testable_hypothesis=candidate.testable_hypothesis,
-            falsification_condition=candidate.falsification_condition, provenance_status="complete",
+            falsification_condition=candidate.falsification_condition, provenance_status=provenance_status,
             question_ids=candidate.question_ids, mining_round=state.current_round,
             novelty_score=candidate.novelty_score, feasibility_score=candidate.feasibility_score,
             significance_score=candidate.significance_score,

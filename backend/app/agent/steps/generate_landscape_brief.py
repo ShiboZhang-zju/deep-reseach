@@ -1,0 +1,247 @@
+"""Step: Generate a Research Landscape Brief (O9).
+
+This brief is produced regardless of whether the pipeline ultimately yields
+credible research ideas. Its purpose is to guarantee the user always receives
+a valuable, evidence-grounded deliverable — a map of the research landscape —
+plus an honest explanation of why (if applicable) no credible idea was produced
+and what targeted follow-up would help.
+
+Design principles:
+- Built ONLY from already-collected structured data (questions, coverage,
+  paper roles, limitation evidence, gaps and their audit status). It never
+  invents facts.
+- Deterministic core: the brief is assembled from DB rows without requiring an
+  LLM call, so it works even when the LLM is unavailable or the run terminated
+  early. An optional LLM pass may polish the prose but its failure is non-fatal.
+- Saved as a standard Report row so the existing report API/UI surfaces it.
+"""
+
+import json
+import logging
+from collections import Counter
+
+from app.agent.state import ResearchState
+from app.db.models import (
+    ResearchContract,
+    ResearchQuestion,
+    CoverageRecord,
+    EvidenceUnit,
+    PaperRole,
+    Paper,
+    TaskPaper,
+    GapCandidate,
+)
+from app.db.repositories import gap_repo, paper_repo
+from sqlalchemy import func
+
+logger = logging.getLogger(__name__)
+
+_LIMITATION_TYPES = {"limitation", "negative_result", "future_work"}
+
+
+def _latest_coverage_per_question(db, task_id, question_ids):
+    if not question_ids:
+        return {}
+    max_round_subq = db.query(
+        CoverageRecord.question_id.label("q_id"),
+        func.max(CoverageRecord.round_number).label("max_round"),
+    ).filter(
+        CoverageRecord.task_id == task_id,
+        CoverageRecord.question_id.in_(question_ids),
+    ).group_by(CoverageRecord.question_id).subquery()
+    records = db.query(CoverageRecord).join(
+        max_round_subq,
+        (CoverageRecord.question_id == max_round_subq.c.q_id)
+        & (CoverageRecord.round_number == max_round_subq.c.max_round)
+        & (CoverageRecord.task_id == task_id),
+    ).all()
+    return {r.question_id: r for r in records}
+
+
+def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
+                                   terminal_status: str = "",
+                                   terminal_reason: str = "") -> str:
+    """Assemble the landscape brief deterministically from DB rows."""
+    lines: list[str] = ["# 研究态势简报 (Research Landscape Brief)\n"]
+
+    contract = db.get(ResearchContract, contract_id) if contract_id else None
+    topic = contract.topic if contract else ""
+    lines.append(f"> 研究方向：{topic or '(未指定)'}\n")
+
+    # --- 1. Terminal status & honest explanation ---
+    if terminal_status:
+        lines.append("## 本次运行结果\n")
+        explanation = _explain_terminal(terminal_status, terminal_reason)
+        lines.append(explanation + "\n")
+
+    # --- 2. Research question tree + coverage ---
+    questions = db.query(ResearchQuestion).filter(
+        ResearchQuestion.task_id == task_id,
+        ResearchQuestion.contract_id == contract_id,
+    ).order_by(ResearchQuestion.importance.desc().nullslast()).all() if contract_id else []
+    latest_cov = _latest_coverage_per_question(db, task_id, [q.id for q in questions])
+
+    lines.append("## 研究问题与覆盖度\n")
+    if not questions:
+        lines.append("(尚未分解出研究问题)\n")
+    else:
+        lines.append("| 研究问题 | 重要性 | 状态 | 最新覆盖度 |")
+        lines.append("|---|---|---|---|")
+        for q in questions:
+            cov = latest_cov.get(q.id)
+            cov_txt = f"{cov.coverage_score:.2f}" if cov and cov.coverage_score is not None else "—"
+            if cov and not cov.coverage_score and cov.unavailable_reason:
+                cov_txt = f"不可得({cov.unavailable_reason[:20]})"
+            imp = f"{q.importance:.2f}" if q.importance is not None else "—"
+            qtext = (q.question or "")[:60].replace("|", "/")
+            lines.append(f"| {qtext} | {imp} | {q.status or '—'} | {cov_txt} |")
+        lines.append("")
+
+    # --- 3. Paper role distribution ---
+    roles = db.query(PaperRole.role, func.count(PaperRole.id)).filter(
+        PaperRole.task_id == task_id,
+    ).group_by(PaperRole.role).all()
+    total_papers = db.query(func.count(TaskPaper.id)).filter(
+        TaskPaper.task_id == task_id,
+    ).scalar() or 0
+    high_papers = db.query(func.count(TaskPaper.id)).filter(
+        TaskPaper.task_id == task_id, TaskPaper.priority == "high",
+    ).scalar() or 0
+
+    lines.append("## 论文概览\n")
+    lines.append(f"共收集论文 {total_papers} 篇，其中高优先级 {high_papers} 篇。\n")
+    if roles:
+        lines.append("论文角色分布：" + "，".join(f"{role}: {cnt}" for role, cnt in roles) + "。\n")
+
+    # --- 4. Known limitations (the gap fuel) ---
+    limitation_evidence = db.query(EvidenceUnit).filter(
+        EvidenceUnit.task_id == task_id,
+        EvidenceUnit.evidence_type.in_(list(_LIMITATION_TYPES)),
+        ~EvidenceUnit.verification_status.in_(["rejected", "conflicted"]),
+    ).limit(30).all()
+
+    lines.append("## 已知局限与研究空白线索\n")
+    if not limitation_evidence:
+        lines.append("(尚未从文献中抽取到明确的局限/负面结果信号 — 这通常意味着需要下载更多论文全文，"
+                     "或针对性检索 \"limitations of ...\" / \"failure cases of ...\"。)\n")
+    else:
+        for ev in limitation_evidence[:15]:
+            claim = (ev.normalized_claim or "")[:150].replace("\n", " ")
+            lines.append(f"- [{ev.evidence_type}] {claim}")
+        lines.append("")
+
+    # --- 5. Candidate gaps and audit status ---
+    gaps = [g for g in gap_repo.list_gaps_for_contract(db, task_id, contract_id)] if contract_id else []
+    lines.append("## 候选研究空白 (Gap) 与审计状态\n")
+    if not gaps:
+        lines.append("(本次运行未挖掘出可入库的候选 Gap。)\n")
+    else:
+        surviving = [g for g in gaps if g.status == "surviving"]
+        rejected = [g for g in gaps if g.status == "rejected"]
+        other = [g for g in gaps if g.status not in ("surviving", "rejected")]
+        lines.append(f"候选 Gap 共 {len(gaps)} 个：存活 {len(surviving)}，被驳回 {len(rejected)}，"
+                     f"待定/审计中 {len(other)}。\n")
+        for g in gaps[:12]:
+            tier = "A(全文支撑)" if g.provenance_status == "complete" else "B(摘要级)"
+            desc = (g.description or g.missing_capability or "")[:120].replace("\n", " ")
+            lines.append(f"- [{g.status}][{tier}] {desc}")
+        lines.append("")
+
+    # --- 6. Recommended next steps ---
+    lines.append("## 建议的下一步\n")
+    for step in _recommend_next_steps(db, task_id, questions, latest_cov,
+                                      limitation_evidence, gaps, terminal_status):
+        lines.append(f"- {step}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _explain_terminal(status: str, reason: str) -> str:
+    mapping = {
+        "more_research_required": (
+            "本次运行判定证据尚不足以形成可信的研究空白，需要补充检索。"
+            "这是一个诚实的中间结果，而非失败 — 下方给出了具体的补充方向。"
+        ),
+        "insufficient_evidence": (
+            "在现有证据下未能产出达到可信标准的研究想法。系统坚持不编造 Idea，"
+            "因此以 insufficient_evidence 结束，并保留了完整的领域地图供人工判断。"
+        ),
+        "abstained": (
+            "通过了 Gap 审计但未能生成合格的最小实验方案，系统选择弃权（abstain）而非硬凑。"
+        ),
+        "failed": (
+            "控制面数据不完整导致本次运行失败。通常是检索限流或 PDF 全文抽取失败所致，"
+            "建议配置 Semantic Scholar API key 后重试。"
+        ),
+        "waiting_for_user_review": (
+            "已产出证据支撑的研究方向，等待用户查看与选择。"
+        ),
+    }
+    base = mapping.get(status, f"运行状态：{status}。")
+    if reason:
+        base += f"（原因：{reason}）"
+    return base
+
+
+def _recommend_next_steps(db, task_id, questions, latest_cov,
+                          limitation_evidence, gaps, terminal_status) -> list[str]:
+    steps: list[str] = []
+
+    # Low-coverage high-importance questions
+    low_cov_high_imp = [
+        q for q in questions
+        if (q.importance or 0) >= 0.7
+        and (q.id not in latest_cov or (latest_cov[q.id].coverage_score or 0) < 0.3)
+    ]
+    if low_cov_high_imp:
+        names = "; ".join((q.question or "")[:40] for q in low_cov_high_imp[:3])
+        steps.append(f"针对覆盖不足的高重要性问题做定向检索：{names}")
+
+    if not limitation_evidence:
+        steps.append("检索并下载核心论文全文，或用 \"limitations of <方法>\"、\"failure cases\"、"
+                     "\"threats to validity\" 等 query 补充局限性证据（Gap 挖掘依赖这些信号）。")
+
+    b_tier_gaps = [g for g in gaps if g.provenance_status != "complete"]
+    if b_tier_gaps:
+        steps.append(f"有 {len(b_tier_gaps)} 个 B 档（仅摘要级证据）候选 Gap，"
+                     "建议补充这些方向论文的全文以升级为 A 档并通过审计。")
+
+    if terminal_status in ("more_research_required", "insufficient_evidence"):
+        steps.append("配置 Semantic Scholar API key（免费）以消除 429 限流，提升经典论文与近邻审计的覆盖。")
+
+    if not steps:
+        steps.append("当前领域覆盖较为充分，可进入用户选择与实验方案环节。")
+    return steps
+
+
+async def generate_landscape_brief(db, state: ResearchState, task_id: str,
+                                   terminal_status: str = "",
+                                   terminal_reason: str = "") -> str:
+    """Generate and persist the Research Landscape Brief.
+
+    Idempotent-friendly: always writes a fresh Report row (history preserved).
+    Deterministic; never raises on missing data — returns whatever can be built.
+    """
+    try:
+        markdown = build_landscape_brief_markdown(
+            db, task_id, state.contract_id, terminal_status, terminal_reason
+        )
+        content_json = json.dumps({
+            "type": "landscape_brief",
+            "terminal_status": terminal_status,
+            "terminal_reason": terminal_reason,
+        }, ensure_ascii=False)
+        paper_repo.save_report(db, task_id, markdown, content_json)
+        paper_repo.save_trace(db, task_id, "generate_landscape_brief", "action",
+                              output_data={"terminal_status": terminal_status,
+                                           "chars": len(markdown)})
+        db.commit()
+        logger.info("Task %s: landscape brief generated (%d chars, status=%s)",
+                    task_id[:8], len(markdown), terminal_status)
+        return markdown
+    except Exception as e:
+        logger.warning("Task %s: landscape brief generation failed (non-fatal): %s",
+                       task_id[:8], e)
+        db.rollback()
+        return ""
