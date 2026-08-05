@@ -1,4 +1,4 @@
-import type { Task, Paper, Round, Report, Idea, Experiment, Trace } from '../types';
+import type { Task, Paper, Round, Report, Idea, Experiment, Trace, Gap } from '../types';
 
 const BASE = '/api';
 
@@ -62,6 +62,9 @@ export const api = {
   // Ideas
   getIdeas: (taskId: string) =>
     fetchJSON<Idea[]>(`${BASE}/tasks/${taskId}/ideas`),
+
+  getGaps: (taskId: string) =>
+    fetchJSON<Gap[]>(`${BASE}/tasks/${taskId}/gaps`),
 
   selectIdeas: (taskId: string, ideaIds: string[]) =>
     fetchJSON<{ status: string }>(`${BASE}/tasks/${taskId}/ideas/select`, {

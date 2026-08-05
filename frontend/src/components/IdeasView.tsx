@@ -177,6 +177,20 @@ export function IdeasView({ taskId, status }: Props) {
                         {idx + 1}. {idea.title || '未命名'}
                       </h3>
                       <div className="flex items-center gap-2 shrink-0">
+                        {idea.confidence_tier && (
+                          <span
+                            className={`px-2 py-0.5 rounded text-xs font-medium ${
+                              idea.confidence_tier === 'A'
+                                ? 'bg-emerald-100 text-emerald-700'
+                                : idea.confidence_tier === 'B'
+                                ? 'bg-amber-100 text-amber-700'
+                                : 'bg-gray-100 text-gray-500'
+                            }`}
+                            title="A=证据充分通过全部闸门；B=部分待确认；C=推测性"
+                          >
+                            {idea.confidence_tier} 档
+                          </span>
+                        )}
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${dec.class}`}>
                           {dec.label}
                         </span>

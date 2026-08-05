@@ -100,6 +100,7 @@ class IdeaOut(BaseModel):
     final_score: float | None = None
     decision: str | None = None
     related_paper_ids_json: str | None = None
+    confidence_tier: str | None = None  # O1: A / B / C graded output
     user_selected: bool = False
     idea_status: str = "active"  # P1-5: active / superseded
     created_at: str

@@ -140,20 +140,24 @@ def ensure_paper_embedding(paper_id: str, title: str, abstract: str, chunks: lis
     except Exception as e:
         logger.debug("ChromaDB check for paper %s failed: %s", paper_id[:8], e)
 
-    model = get_embedding_model()
+    from app.services.embedding_service import embed_texts
 
     if chunks:
         # Mean of chunk embeddings (better quality)
         chunk_texts = [c.text if hasattr(c, 'text') else c.get("text", "") for c in chunks]
         if chunk_texts:
-            chunk_embeddings = model.encode(chunk_texts, show_progress_bar=False)
-            paper_embedding = chunk_embeddings.mean(axis=0).tolist()
+            chunk_embeddings = embed_texts(chunk_texts)
+            dim = len(chunk_embeddings[0]) if chunk_embeddings else 0
+            paper_embedding = [
+                sum(vec[i] for vec in chunk_embeddings) / len(chunk_embeddings)
+                for i in range(dim)
+            ] if dim else embed_texts([f"{title} {abstract}"])[0]
         else:
-            paper_embedding = model.encode([f"{title} {abstract}"], show_progress_bar=False).tolist()[0]
+            paper_embedding = embed_texts([f"{title} {abstract}"])[0]
     else:
         # Embed title + abstract
         text = f"{title} {abstract or ''}"
-        paper_embedding = model.encode([text], show_progress_bar=False).tolist()[0]
+        paper_embedding = embed_texts([text])[0]
 
     collection.upsert(
         ids=[paper_id],
@@ -902,11 +906,15 @@ def chunk_from_abstract(paper) -> list[ParsedChunk]:
 # === Phase 3: Embedding + ChromaDB storage ===
 
 def embed_and_store_chunks(paper_id: str, chunks: list[ParsedChunk]) -> None:
-    """Generate embeddings and store in ChromaDB (synchronous)."""
+    """Generate embeddings and store in ChromaDB (synchronous).
+
+    O5a: uses the pluggable embedding_service (API backend by default) instead
+    of a local sentence-transformers model.
+    """
     if not chunks:
         return
 
-    model = get_embedding_model()
+    from app.services.embedding_service import embed_texts
     collection = get_chroma_collection()
 
     # Delete existing chunks for this paper in ChromaDB
@@ -918,12 +926,12 @@ def embed_and_store_chunks(paper_id: str, chunks: list[ParsedChunk]) -> None:
         logger.warning("ChromaDB delete for paper %s failed: %s", paper_id[:8], e)
 
     texts = [c.text for c in chunks]
-    embeddings = model.encode(texts, show_progress_bar=False, batch_size=32)
+    embeddings = embed_texts(texts)
 
     chunk_ids = [f"{paper_id}_chunk_{c.chunk_index}" for c in chunks]
     collection.add(
         ids=chunk_ids,
-        embeddings=embeddings.tolist(),
+        embeddings=embeddings,
         documents=texts,
         metadatas=[
             {
@@ -966,12 +974,16 @@ def rag_retrieve_sync(
 
     Returns list of dicts: {chunk_id, text, section, paper_id, score, image_paths}
 
-    P1-17: RAG retrieval is disabled on Windows due to PyTorch segfault when
-    calling model.encode(). Returns empty list — report/ideas use abstract fallback.
-    To re-enable on Linux: remove the early return below.
+    O5a: full-text RAG is re-enabled on all platforms via the pluggable
+    embedding_service (API backend). If embedding is unavailable or the query
+    fails, returns [] so callers degrade to abstract fallback.
     """
-    # P1-17: Disabled — model.encode() causes segfault on Windows
-    return []
+    from app.services.embedding_service import embed_texts, embedding_enabled
+
+    if not embedding_enabled():
+        return []
+
+    collection = get_chroma_collection()
 
     # Build metadata filter — ChromaDB requires $and when combining multiple filters
     where = None
@@ -985,10 +997,13 @@ def rag_retrieve_sync(
     elif section_filter:
         where = {"section": {"$in": section_filter}}
 
-    # Embed the query with the SAME model used for storage (bge-base, 768 dim)
-    # Do NOT use ChromaDB's built-in query_texts (which uses 384-dim MiniLM)
-    model = get_embedding_model()
-    query_embedding = model.encode([query], show_progress_bar=False).tolist()
+    try:
+        query_embedding = embed_texts([query])
+    except Exception as e:
+        logger.warning("RAG query embedding failed (degrading to []): %s", e)
+        return []
+    if not query_embedding:
+        return []
 
     results = collection.query(
         query_embeddings=query_embedding,
@@ -1039,8 +1054,6 @@ async def rag_retrieve(
     return await asyncio.to_thread(
         rag_retrieve_sync, query, top_k, paper_ids, section_filter
     )
-
-    return retrieved
 
 
 # === Main entry point ===

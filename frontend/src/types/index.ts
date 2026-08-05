@@ -89,8 +89,35 @@ export interface Idea {
   final_score: number | null;
   decision: string | null;
   related_paper_ids_json: string | null;
+  confidence_tier: string | null;
   user_selected: boolean;
   created_at: string;
+}
+
+export interface Gap {
+  id: string;
+  task_id: string;
+  contract_id: string | null;
+  gap_type: string;
+  description: string;
+  target_setting: string | null;
+  observed_problem: string | null;
+  existing_coverage: string | null;
+  missing_capability: string | null;
+  claimed_delta: string | null;
+  testable_hypothesis: string | null;
+  falsification_condition: string | null;
+  provenance_status: string;
+  question_ids: string[];
+  mining_round: number;
+  novelty_score: number | null;
+  feasibility_score: number | null;
+  significance_score: number | null;
+  risk_score: number | null;
+  status: string;
+  version: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Experiment {

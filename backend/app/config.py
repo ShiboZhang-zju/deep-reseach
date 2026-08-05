@@ -41,8 +41,31 @@ class Settings(BaseSettings):
     # Concurrency limits (P0-1: prevent SQLite write contention)
     max_concurrent_agents: int = 2
 
+    # O2: Targeted remediation — when a pipeline gate fails (no gap / no
+    # surviving gap / no intervention / readiness), run up to this many extra
+    # directed-search rounds aimed at the specific failure reason before giving
+    # up and emitting a landscape brief. Set to 0 to disable remediation.
+    max_remediation_attempts: int = 2
+    # Total directed-search rounds allowed across ALL gates for one task —
+    # a global budget so remediation cannot balloon the runtime.
+    max_remediation_rounds_total: int = 3
+
     # RAG / PDF download
     enable_scihub: bool = False  # P0-4: Sci-Hub disabled by default for legal compliance
+
+    # O5a: Embedding backend — pluggable so we can use an OpenAI-compatible
+    # embedding API (Venus / OpenAI) instead of local sentence-transformers,
+    # which segfaults under PyTorch on Windows. Values: "api" | "local".
+    # When "api", RAG full-text retrieval is re-enabled on all platforms.
+    embedding_backend: str = "api"
+    embedding_api_url: str = ""          # OpenAI-compatible embeddings endpoint; empty -> derive from venus_llm_proxy_url
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dim: int = 1536            # dimension of the chosen embedding model
+    embedding_batch_size: int = 64
+    # O7: drop retrieved papers whose title+abstract cosine similarity to the
+    # research topic is below this threshold, before they enter the store.
+    # Set to 0 to disable prefiltering.
+    search_prefilter_min_similarity: float = 0.35
 
     # Scoring weights (P1-7: authority bumped from 0.25 to 0.30)
     score_weight_relevance: float = 0.25
@@ -50,6 +73,11 @@ class Settings(BaseSettings):
     score_weight_recency: float = 0.15
     score_weight_novelty: float = 0.15
     score_weight_idea_potential: float = 0.15
+    # Cross-paper score calibration: when a round scores >= this many papers,
+    # rescale final scores by batch z-score to widen the (historically ~0.05)
+    # priority separation. Set to 0 to disable calibration.
+    score_calibration_min_batch: int = 5
+    score_calibration_strength: float = 0.15  # fraction of z-spread to add
 
     # Rate limiting (P1-9: per-source request budget)
     # S2 无 key 限速 100 req/5min ≈ 20/min；OpenAlex 无 key $0.10/天预算，请求不宜过密

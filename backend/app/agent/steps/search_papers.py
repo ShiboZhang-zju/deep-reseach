@@ -71,6 +71,10 @@ async def search_and_save_papers(db, state: ResearchState,
             logger.info("Round %d query '%s': found %d raw papers",
                         round_num, query_text[:40], raw_count)
 
+            # O7: prefilter by topic similarity before persisting, to keep
+            # off-topic noise out of the evidence/gap pipeline.
+            raw_papers = await _prefilter_by_similarity(raw_papers, state, round_num, query_text)
+
             # Save each paper and create SearchQueryPaper mapping
             new_paper_count_for_query = 0
             for rank, raw in enumerate(raw_papers):
@@ -188,6 +192,60 @@ async def search_and_save_papers(db, state: ResearchState,
         asyncio.create_task(_trigger_metadata_enrichment(list(new_paper_ids)))
 
     return papers_found, len(deduped), new_paper_ids
+
+
+async def _prefilter_by_similarity(raw_papers: list, state: ResearchState,
+                round_num: int, query_text: str) -> list:
+    """O7: drop papers whose title+abstract is semantically far from the topic.
+
+    Uses the pluggable embedding backend. On any failure (embedding disabled,
+    API error) it returns the input unchanged — prefiltering is best-effort and
+    must never drop the whole round. The topic embedding is cached on `state`
+    across queries to avoid recomputation.
+    """
+    threshold = settings.search_prefilter_min_similarity
+    if threshold <= 0 or not raw_papers:
+        return raw_papers
+
+    try:
+        from app.services.embedding_service import (
+            embed_texts, cosine_similarity, embedding_enabled,
+        )
+        import asyncio
+
+        if not embedding_enabled():
+            return raw_papers
+
+        topic = state.normalized_topic or state.user_input or query_text
+
+        def _score() -> list:
+            # Embed topic + all candidate texts in one batched call.
+            texts = [topic]
+            for rp in raw_papers:
+                title = getattr(rp, "title", "") or ""
+                abstract = getattr(rp, "abstract", "") or ""
+                texts.append(f"{title}. {abstract}"[:2000])
+            vecs = embed_texts(texts)
+            if not vecs:
+                return raw_papers
+            topic_vec = vecs[0]
+            kept = []
+            dropped = 0
+            for rp, vec in zip(raw_papers, vecs[1:]):
+                sim = cosine_similarity(topic_vec, vec)
+                if sim >= threshold:
+                    kept.append(rp)
+                else:
+                    dropped += 1
+            if dropped:
+                logger.info("Round %d query '%s': O7 prefilter dropped %d/%d off-topic papers",
+                            round_num, query_text[:40], dropped, len(raw_papers))
+            return kept
+
+        return await asyncio.to_thread(_score)
+    except Exception as e:
+        logger.warning("O7 prefilter failed (non-fatal, keeping all): %s", e)
+        return raw_papers
 
 
 async def _trigger_metadata_enrichment(paper_ids: list[str]):

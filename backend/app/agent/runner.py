@@ -45,6 +45,8 @@ from app.agent.steps import (
     generate_interventions,
     generate_minimal_experiments,
     generate_landscape_brief,
+    run_targeted_research_round,
+    can_remediate,
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
@@ -412,85 +414,90 @@ async def run_task(task_id: str):
 
         # Phase 2.2A Final Closure (#4): Formal readiness gate replaces
         # the ad-hoc evidence_count > 0 check.
+        # O2: wrapped in a loop so a'more_research_required' verdict can trigger
+        # one directed remediation search round and re-evaluate, instead of
+        # terminating immediately.
         from app.agent.steps.readiness_gate import evaluate_phase2_readiness
-        readiness = evaluate_phase2_readiness(db, task_id, state.contract_id)
-        logger.info("Task %s: readiness gate — status=%s, reason=%s, "
-                    "active_q=%d, high_imp_q=%d, high_imp_covered=%d, "
-                    "evidence=%d, latest_round=%d",
-                    task_id[:8], readiness.status, readiness.reason,
-                    readiness.active_question_count,
-                    readiness.high_importance_question_count,
-                    readiness.high_importance_covered_count,
-                    readiness.valid_evidence_count, readiness.latest_round)
+        while True:
+            readiness = evaluate_phase2_readiness(db, task_id, state.contract_id)
+            logger.info("Task %s: readiness gate — status=%s, reason=%s, "
+                        "active_q=%d, high_imp_q=%d, high_imp_covered=%d, "
+                        "evidence=%d, latest_round=%d",
+                        task_id[:8], readiness.status, readiness.reason,
+                        readiness.active_question_count,
+                        readiness.high_importance_question_count,
+                        readiness.high_importance_covered_count,
+                        readiness.valid_evidence_count, readiness.latest_round)
 
-        # Save readiness result to AgentTrace for auditability
-        try:
-            from app.db.models import AgentTrace
-            import json as _trace_json
-            trace = AgentTrace(
-                task_id=task_id,
-                step_name="phase2_readiness_gate",
-                step_type="decision",
-                input_json=_trace_json.dumps({"contract_id": state.contract_id or ""},
-                                             ensure_ascii=False),
-                output_json=_trace_json.dumps({
-                    "ready": readiness.ready,
-                    "status": readiness.status,
-                    "reason": readiness.reason,
-                    "active_question_count": readiness.active_question_count,
-                    "questions_with_latest_snapshot": readiness.questions_with_latest_snapshot,
-                    "high_importance_question_count": readiness.high_importance_question_count,
-                    "high_importance_covered_count": readiness.high_importance_covered_count,
-                    "evidence_count": readiness.evidence_count,
-                    "valid_evidence_count": readiness.valid_evidence_count,
-                    "latest_round": readiness.latest_round,
-                    "missing_question_ids": readiness.missing_question_ids,
-                    "unresolved_question_ids": readiness.unresolved_question_ids,
-                }, ensure_ascii=False),
-            )
-            db.add(trace)
-            db.commit()
-        except Exception as trace_err:
-            logger.warning("Task %s: failed to save readiness trace (non-fatal): %s",
-                          task_id[:8], trace_err)
+            # Save readiness result to AgentTrace for auditability
+            try:
+                from app.db.models import AgentTrace
+                import json as _trace_json
+                trace = AgentTrace(
+                    task_id=task_id,
+                    step_name="phase2_readiness_gate",
+                    step_type="decision",
+                    input_json=_trace_json.dumps({"contract_id": state.contract_id or ""},
+                                                 ensure_ascii=False),
+                    output_json=_trace_json.dumps({
+                        "ready": readiness.ready,
+                        "status": readiness.status,
+                        "reason": readiness.reason,
+                        "active_question_count": readiness.active_question_count,
+                        "questions_with_latest_snapshot": readiness.questions_with_latest_snapshot,
+                        "high_importance_question_count": readiness.high_importance_question_count,
+                        "high_importance_covered_count": readiness.high_importance_covered_count,
+                        "evidence_count": readiness.evidence_count,
+                        "valid_evidence_count": readiness.valid_evidence_count,
+                        "latest_round": readiness.latest_round,
+                        "missing_question_ids": readiness.missing_question_ids,
+                        "unresolved_question_ids": readiness.unresolved_question_ids,
+                    }, ensure_ascii=False),
+                )
+                db.add(trace)
+                db.commit()
+            except Exception as trace_err:
+                logger.warning("Task %s: failed to save readiness trace (non-fatal): %s",
+                              task_id[:8], trace_err)
 
-        if readiness.status == "failed":
-            logger.error("Task %s: readiness gate FAILED — %s", task_id[:8], readiness.reason)
-            task_repo.update_status(db, task_id, "failed")
-            task_repo.update_stop_reason(db, task_id, f"readiness_failed: {readiness.reason}")
-            emit_event(task_id, "error", {
-                "message": f"Phase 2 readiness gate failed: {readiness.reason}",
-                "missing_questions": readiness.missing_question_ids,
-            })
-            db.commit()
-            return
+            if readiness.status == "failed":
+                logger.error("Task %s: readiness gate FAILED — %s", task_id[:8], readiness.reason)
+                task_repo.update_status(db, task_id, "failed")
+                task_repo.update_stop_reason(db, task_id, f"readiness_failed: {readiness.reason}")
+                emit_event(task_id, "error", {
+                    "message": f"Phase 2 readiness gate failed: {readiness.reason}",
+                    "missing_questions": readiness.missing_question_ids,
+                })
+                db.commit()
+                return
 
-        if readiness.status == "more_research_required":
-            logger.warning("Task %s: readiness gate — more research required — %s",
-                          task_id[:8], readiness.reason)
-            await generate_landscape_brief(db, state, task_id,
-                                           "more_research_required", f"readiness_more_research: {readiness.reason}")
-            task_repo.update_status(db, task_id, "more_research_required")
-            task_repo.update_stop_reason(db, task_id, f"readiness_more_research: {readiness.reason}")
-            emit_event(task_id, "status", {
-                "status": "more_research_required",
-                "reason": readiness.reason,
-                "unresolved_questions": readiness.unresolved_question_ids,
-            })
-            db.commit()
-            return
+            if readiness.status == "more_research_required":
+                logger.warning("Task %s: readiness gate — more research required — %s",
+                              task_id[:8], readiness.reason)
+                if await _try_remediate(db, state, llm, task_id, "readiness_more_research"):
+                    state = task_repo.get_state(db, task_id)
+                    continue  # re-evaluate readiness after directed search
+                await _terminate_more_research(
+                    db, state, task_id, "more_research_required",
+                    f"readiness_more_research: {readiness.reason}")
+                return
 
-        if not readiness.ready:
-            raise RuntimeError(f"Invalid readiness result: status={readiness.status}")
+            break  # readiness ready — exit the remediation loop
 
         logger.info("Task %s: readiness gate PASSED — proceeding to analysis", task_id[:8])
 
         # === 2.5. RAG: Download PDFs and index high-priority papers ===
-        # P1-17: RAG indexing disabled on Windows due to PyTorch segfault.
-        # Report/ideas generation uses abstract-only fallback.
-        # To re-enable: await _run_rag_indexing(db, task_id, llm)
-        logger.info("Task %s: skipping RAG indexing (disabled on Windows, using abstract fallback)", task_id[:8])
-        emit_event(task_id, "status", {"status": "indexing_skipped", "reason": "RAG disabled on Windows"})
+        # O5a: RAG indexing re-enabled via the pluggable embedding backend
+        # (API embedding, no local PyTorch → stable on Windows). Falls back to
+        # abstract-only if the embedding backend is unavailable.
+        from app.services.embedding_service import embedding_enabled
+        if embedding_enabled():
+            logger.info("Task %s: RAG indexing enabled (embedding backend=%s)",
+                        task_id[:8], settings.embedding_backend)
+            await _run_rag_indexing(db, task_id, llm)
+        else:
+            logger.info("Task %s: skipping RAG indexing (embedding backend unavailable, using abstract fallback)", task_id[:8])
+            emit_event(task_id, "status", {"status": "indexing_skipped", "reason": "embedding backend unavailable"})
 
         # === 2.5b. Paper Deep Analysis (新增：论文深度分析) ===
         # Download PDFs for high-priority papers, extract text, LLM structured analysis
@@ -518,162 +525,214 @@ async def run_task(task_id: str):
 
         # === 5. Lightweight evidence-grounded opportunity discovery ===
         if state.pipeline_version >= 2:
-            logger.info("Task %s: mining evidence-backed gap candidates...", task_id[:8])
-            task_repo.update_status(db, task_id, "mining_gaps")
-            db.commit()
-            emit_event(task_id, "status", {"status": "mining_gaps"})
-            gap_input_version = hashlib.sha256(json.dumps({
-                "contract_id": state.contract_id,
-                "round": state.current_round,
-                "pipeline_version": state.pipeline_version,
-                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
-            }, sort_keys=True).encode()).hexdigest()
-
-            async def _mine_gaps_op(db):
-                return await mine_gap_candidates(db, state, llm, task_id)
-
-            gaps = await phase_service.execute_phase(
-                db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
-            )
-            if gaps is None:
-                from app.db.repositories import gap_repo
-                gaps = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
-                        if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
-            state = task_repo.get_state(db, task_id)
-            if not gaps:
-                await generate_landscape_brief(db, state, task_id,
-                                               "more_research_required", "no_evidence_backed_gap_candidates")
-                task_repo.update_status(db, task_id, "more_research_required")
-                task_repo.update_stop_reason(db, task_id, "no_evidence_backed_gap_candidates")
-                emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_evidence_backed_gap_candidates"})
-                db.commit()
-                return
-
-            task_repo.update_status(db, task_id, "auditing_gaps")
-            db.commit()
-            emit_event(task_id, "status", {"status": "auditing_gaps", "gap_count": len(gaps)})
-
-            async def _audit_gaps_op(db):
-                return await audit_gap_candidates(db, state, llm, task_id, gap_ids=[gap.id for gap in gaps])
-
-            audit_input_version = hashlib.sha256(json.dumps({
-                "gap_ids": sorted(gap.id for gap in gaps),
-                "round": state.current_round,
-                "pipeline_version": state.pipeline_version,
-                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
-            }, sort_keys=True).encode()).hexdigest()
-            audit_results = await phase_service.execute_phase(
-                db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
-            )
-            from app.db.models import GapCandidate
-            current_gap_ids = [gap.id for gap in gaps]
-            state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
-                GapCandidate.task_id == task_id,
-                GapCandidate.contract_id == state.contract_id,
-                GapCandidate.id.in_(current_gap_ids),
-                GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
-                GapCandidate.status == "surviving",
-            ).all()]
-            task_repo.save_state(db, task_id, state)
-            db.commit()
-            state = task_repo.get_state(db, task_id)
-            if not state.surviving_gap_ids:
-                await generate_landscape_brief(db, state, task_id,
-                                               "more_research_required", "no_surviving_gap_after_audit")
-                task_repo.update_status(db, task_id, "more_research_required")
-                task_repo.update_stop_reason(db, task_id, "no_surviving_gap_after_audit")
-                emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_surviving_gap_after_audit"})
-                db.commit()
-                return
-
-            task_repo.update_status(db, task_id, "synthesizing_ideas")
-            db.commit()
-            emit_event(task_id, "status", {"status": "synthesizing_ideas"})
-
-            async def _generate_interventions_op(db):
-                return await generate_interventions(db, state, llm, task_id)
-
-            intervention_input_version = hashlib.sha256(json.dumps({
-                "surviving_gap_ids": sorted(state.surviving_gap_ids),
-                "contract_id": state.contract_id,
-                "pipeline_version": state.pipeline_version,
-                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
-            }, sort_keys=True).encode()).hexdigest()
-            interventions = await phase_service.execute_phase(
-                db, task_id, "generate_interventions", _generate_interventions_op,
-                input_version=intervention_input_version
-            )
-            if interventions is None:
-                from app.db.repositories import intervention_repo
-                recovered_interventions = intervention_repo.list_interventions_for_task(
-                    db, task_id, contract_id=state.contract_id, gap_ids=state.surviving_gap_ids
-                )
-                passed_intervention_ids = [item.id for item in recovered_interventions if item.status == "passed"]
-            else:
-                passed_intervention_ids = interventions.passed_intervention_ids
-            if not passed_intervention_ids:
-                await generate_landscape_brief(db, state, task_id,
-                                               "more_research_required", "no_intervention_passed_hard_gates")
-                task_repo.update_status(db, task_id, "more_research_required")
-                task_repo.update_stop_reason(db, task_id, "no_intervention_passed_hard_gates")
-                emit_event(task_id, "status", {"status": "more_research_required", "reason": "no_intervention_passed_hard_gates"})
-                db.commit()
-                return
-
-            task_repo.update_status(db, task_id, "generating_experiment")
-            db.commit()
-            emit_event(task_id, "status", {"status": "generating_experiment"})
-
-            async def _minimal_experiments_op(db):
-                return await generate_minimal_experiments(db, state, llm, task_id)
-
-            experiment_input_version = hashlib.sha256(json.dumps({
-                "intervention_ids": sorted(passed_intervention_ids),
-                "contract_id": state.contract_id,
-                "pipeline_version": state.pipeline_version,
-                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
-            }, sort_keys=True).encode()).hexdigest()
-            experiment_result = await phase_service.execute_phase(
-                db, task_id, "generate_minimal_experiments", _minimal_experiments_op,
-                input_version=experiment_input_version
-            )
-            if experiment_result is None:
-                from app.db.models import ResearchIdea
-                idea_ids = [idea.id for idea in db.query(ResearchIdea).filter(
-                    ResearchIdea.task_id == task_id,
-                    ResearchIdea.contract_id == state.contract_id,
-                    ResearchIdea.intervention_id.in_(passed_intervention_ids),
-                    ResearchIdea.pipeline_version == state.pipeline_version,
-                    ResearchIdea.decision == "conditional_go",
-                    ResearchIdea.idea_status == "active",
-                ).all()]
-            else:
-                idea_ids = experiment_result.idea_ids
-            if not idea_ids:
-                await generate_landscape_brief(db, state, task_id,
-                                               "abstained", "no_minimal_experiment_generated")
-                task_repo.update_status(db, task_id, "abstained")
-                task_repo.update_stop_reason(db, task_id, "no_minimal_experiment_generated")
-                emit_event(task_id, "status", {"status": "abstained", "reason": "no_minimal_experiment_generated"})
-                db.commit()
-                return
-
-            await generate_landscape_brief(db, state, task_id,
-                                           "waiting_for_user_review", "evidence_grounded_ideas_ready")
-            task_repo.update_status(db, task_id, "waiting_for_user_review")
-            task_repo.update_stop_reason(db, task_id, "evidence_grounded_ideas_ready")
-            emit_event(task_id, "status", {
-                "status": "waiting_for_user_review",
-                "reason": "evidence_grounded_ideas_ready",
-                "idea_count": len(idea_ids),
-            })
-            db.commit()
+            await _run_opportunity_pipeline(db, state, llm, task_id)
         else:
             # Legacy pipeline: generate ideas directly
             await _run_ideas_loop(db, state, llm, task_id, cluster_list)
 
     finally:
         db.close()
+
+
+async def _terminate_more_research(db, state: ResearchState, task_id: str,
+                                    status: str, reason: str):
+    """Emit landscape brief + set a terminal 'more research' style status.
+
+    Centralizes the 6 former inline termination exits so O2 remediation logic
+    lives in one place.
+    """
+    await generate_landscape_brief(db, state, task_id, status, reason)
+    task_repo.update_status(db, task_id, status)
+    task_repo.update_stop_reason(db, task_id, reason)
+    payload = {"status": status, "reason": reason}
+    emit_event(task_id, "status", payload)
+    db.commit()
+
+
+async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str):
+    """Pipeline V2 opportunity discovery with O2 targeted remediation.
+
+    Sequence: mine_gaps -> audit_gaps -> interventions -> minimal experiments.
+    On each blocking failure, if the reason is remediable and budget remains,
+    runONE directed search round and retry the whole opportunity pipeline
+    instead of terminating. Bounded by settings.max_remediation_rounds_total.
+    """
+    from app.db.repositories import gap_repo
+    from app.db.models import GapCandidate, ResearchIdea
+
+    # The opportunity pipeline is attempted; on a remediable stall we run a
+    # directed search round and loop again. The loop count is bounded by the
+    # global remediation budget (can_remediate checks the counters).
+    max_pipeline_iters = 1 + settings.max_remediation_rounds_total
+    for _iter in range(max_pipeline_iters):
+        state = task_repo.get_state(db, task_id)
+
+        # --- Gap mining ---
+        logger.info("Task %s: mining evidence-backed gap candidates...", task_id[:8])
+        task_repo.update_status(db, task_id, "mining_gaps")
+        db.commit()
+        emit_event(task_id, "status", {"status": "mining_gaps"})
+        gap_input_version = hashlib.sha256(json.dumps({
+            "contract_id": state.contract_id,
+            "round": state.current_round,
+            "pipeline_version": state.pipeline_version,
+            "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+        }, sort_keys=True).encode()).hexdigest()
+
+        async def _mine_gaps_op(db):
+            return await mine_gap_candidates(db, state, llm, task_id)
+
+        gaps = await phase_service.execute_phase(
+            db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
+        )
+        if gaps is None:
+            gaps = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
+                    if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
+        state = task_repo.get_state(db, task_id)
+        if not gaps:
+            if await _try_remediate(db, state, llm, task_id, "no_evidence_backed_gap_candidates"):
+                continue
+            await _terminate_more_research(db, state, task_id,
+                                           "more_research_required", "no_evidence_backed_gap_candidates")
+            return
+
+        # --- Gap audit ---
+        task_repo.update_status(db, task_id, "auditing_gaps")
+        db.commit()
+        emit_event(task_id, "status", {"status": "auditing_gaps", "gap_count": len(gaps)})
+
+        async def _audit_gaps_op(db):
+            return await audit_gap_candidates(db, state, llm, task_id, gap_ids=[gap.id for gap in gaps])
+
+        audit_input_version = hashlib.sha256(json.dumps({
+            "gap_ids": sorted(gap.id for gap in gaps),
+            "round": state.current_round,
+            "pipeline_version": state.pipeline_version,
+            "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+        }, sort_keys=True).encode()).hexdigest()
+        await phase_service.execute_phase(
+            db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
+        )
+        current_gap_ids = [gap.id for gap in gaps]
+        state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
+            GapCandidate.task_id == task_id,
+            GapCandidate.contract_id == state.contract_id,
+            GapCandidate.id.in_(current_gap_ids),
+            GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
+            GapCandidate.status == "surviving",
+        ).all()]
+        task_repo.save_state(db, task_id, state)
+        db.commit()
+        state = task_repo.get_state(db, task_id)
+        if not state.surviving_gap_ids:
+            if await _try_remediate(db, state, llm, task_id, "no_surviving_gap_after_audit"):
+                continue
+            await _terminate_more_research(db, state, task_id,
+                                           "more_research_required", "no_surviving_gap_after_audit")
+            return
+
+        # --- Interventions ---
+        task_repo.update_status(db, task_id, "synthesizing_ideas")
+        db.commit()
+        emit_event(task_id, "status", {"status": "synthesizing_ideas"})
+
+        async def _generate_interventions_op(db):
+            return await generate_interventions(db, state, llm, task_id)
+
+        intervention_input_version = hashlib.sha256(json.dumps({
+            "surviving_gap_ids": sorted(state.surviving_gap_ids),
+            "contract_id": state.contract_id,
+            "pipeline_version": state.pipeline_version,
+            "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+        }, sort_keys=True).encode()).hexdigest()
+        interventions = await phase_service.execute_phase(
+            db, task_id, "generate_interventions", _generate_interventions_op,
+            input_version=intervention_input_version
+        )
+        if interventions is None:
+            from app.db.repositories import intervention_repo
+            recovered_interventions = intervention_repo.list_interventions_for_task(
+                db, task_id, contract_id=state.contract_id, gap_ids=state.surviving_gap_ids
+            )
+            passed_intervention_ids = [item.id for item in recovered_interventions if item.status == "passed"]
+        else:
+            passed_intervention_ids = interventions.passed_intervention_ids
+        if not passed_intervention_ids:
+            if await _try_remediate(db, state, llm, task_id, "no_intervention_passed_hard_gates"):
+                continue
+            await _terminate_more_research(db, state, task_id,
+                                           "more_research_required", "no_intervention_passed_hard_gates")
+            return
+
+        # --- Minimal experiments (final gate — no remediation past this point) ---
+        task_repo.update_status(db, task_id, "generating_experiment")
+        db.commit()
+        emit_event(task_id, "status", {"status": "generating_experiment"})
+
+        async def _minimal_experiments_op(db):
+            return await generate_minimal_experiments(db, state, llm, task_id)
+
+        experiment_input_version = hashlib.sha256(json.dumps({
+            "intervention_ids": sorted(passed_intervention_ids),
+            "contract_id": state.contract_id,
+            "pipeline_version": state.pipeline_version,
+            "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+        }, sort_keys=True).encode()).hexdigest()
+        experiment_result = await phase_service.execute_phase(
+            db, task_id, "generate_minimal_experiments", _minimal_experiments_op,
+            input_version=experiment_input_version
+        )
+        if experiment_result is None:
+            idea_ids = [idea.id for idea in db.query(ResearchIdea).filter(
+                ResearchIdea.task_id == task_id,
+                ResearchIdea.contract_id == state.contract_id,
+                ResearchIdea.intervention_id.in_(passed_intervention_ids),
+                ResearchIdea.pipeline_version == state.pipeline_version,
+                ResearchIdea.decision == "conditional_go",
+                ResearchIdea.idea_status == "active",
+            ).all()]
+        else:
+            idea_ids = experiment_result.idea_ids
+        if not idea_ids:
+            await _terminate_more_research(db, state, task_id,
+                                           "abstained", "no_minimal_experiment_generated")
+            return
+
+        # --- Success ---
+        await generate_landscape_brief(db, state, task_id,
+                                       "waiting_for_user_review", "evidence_grounded_ideas_ready")
+        task_repo.update_status(db, task_id, "waiting_for_user_review")
+        task_repo.update_stop_reason(db, task_id, "evidence_grounded_ideas_ready")
+        emit_event(task_id, "status", {
+            "status": "waiting_for_user_review",
+            "reason": "evidence_grounded_ideas_ready",
+            "idea_count": len(idea_ids),
+        })
+        db.commit()
+        return
+
+    # Budget exhausted without producing ideas — emit brief and stop.
+    state = task_repo.get_state(db, task_id)
+    await _terminate_more_research(db, state, task_id,
+                                   "more_research_required", "remediation_budget_exhausted")
+
+
+async def _try_remediate(db, state: ResearchState, llm, task_id: str, reason: str) -> bool:
+    """Attempt one O2 directed remediation round for `reason`.
+
+    Returns True if a remediation round ran (caller should retry the pipeline),
+    False if remediation is not allowed/exhausted (caller should terminate).
+    """
+    if not can_remediate(state, reason):
+        logger.info("Task %s: no remediation for '%s' (disabled/exhausted)", task_id[:8], reason)
+        return False
+    logger.info("Task %s: O2 remediation triggered for '%s'", task_id[:8], reason)
+    result = await run_targeted_research_round(db, state, llm, task_id, reason)
+    if not result.attempted:
+        return False
+    logger.info("Task %s: remediation added %d papers, %d evidence (exhausted=%s)",
+                task_id[:8], result.new_paper_count, result.new_evidence_count, result.exhausted)
+    return True
 
 
 async def run_experiment_generation(task_id: str, idea_ids: list[str]):

@@ -106,6 +106,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             "intervention_id": intervention.id,
             "pipeline_version": state.pipeline_version,
             "decision": "conditional_go",
+            # O1: inherit the graded confidence tier from the backing
+            # intervention so the user sees A/B ranked directions.
+            "confidence_tier": getattr(intervention, "confidence_tier", "C") or "C",
         })
         steps = [
             *plan.steps,

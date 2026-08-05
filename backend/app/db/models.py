@@ -181,6 +181,10 @@ class ResearchIdea(Base):
     final_score = Column(Float)
     decision = Column(String)
     related_paper_ids_json = Column(Text)
+    # O1: graded output inherited from the backing intervention —
+    # A / B / C confidence tier so users see a ranked list of directions
+    # instead of a binary go/reject.
+    confidence_tier = Column(Text, default="C")
     user_selected = Column(Boolean, default=False)
     # P1-5: soft-delete support for idea retry — 'active' (default) or 'superseded'
     idea_status = Column(String, default="active")
@@ -841,6 +845,10 @@ class InterventionCandidate(Base):
     novelty_gate = Column(Text, default="UNKNOWN")
     feasibility_gate = Column(Text, default="UNKNOWN")
     gate_rationale_json = Column(Text, default="{}")
+    # O1: graded output — A (all gates PASS + full-text gap), B (some gate
+    # UNKNOWN or abstract-only gap; needs human/experiment confirmation),
+    # C (a gate FAILed but the intervention is kept as a speculative direction).
+    confidence_tier = Column(Text, default="C")
     status = Column(Text, default="candidate")
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

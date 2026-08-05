@@ -29,6 +29,7 @@ def create_intervention_candidate(db: Session, task_id: str, gap_id: str, data: 
         novelty_gate=data.get("novelty_gate", "UNKNOWN"),
         feasibility_gate=data.get("feasibility_gate", "UNKNOWN"),
         gate_rationale_json=json.dumps(data.get("gate_rationale", {}), ensure_ascii=False),
+        confidence_tier=data.get("confidence_tier", "C"),
         status=data.get("status", "candidate"),
     )
     db.add(item)

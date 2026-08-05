@@ -24,6 +24,12 @@ from app.agent.steps.audit_gaps import audit_gap_candidates
 from app.agent.steps.generate_interventions import generate_interventions
 from app.agent.steps.generate_minimal_experiments import generate_minimal_experiments
 from app.agent.steps.generate_landscape_brief import generate_landscape_brief
+# O2: Targeted remediation
+from app.agent.steps.targeted_research import (
+    run_targeted_research_round,
+    can_remediate,
+    REMEDIABLE_REASONS,
+)
 
 __all__ = [
     "clarify_topic",
@@ -48,4 +54,8 @@ __all__ = [
     "generate_interventions",
     "generate_minimal_experiments",
     "generate_landscape_brief",
+    # O2: Targeted remediation
+    "run_targeted_research_round",
+    "can_remediate",
+    "REMEDIABLE_REASONS",
 ]

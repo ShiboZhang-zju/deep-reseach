@@ -23,6 +23,31 @@ TOP_VENUE_KEYWORDS = [
 ]
 
 
+def _calibrate_batch_scores(raw_scores: list[float]) -> list[float]:
+    """Widen priority separation via batch z-score, then clamp to [0, 1].
+
+    Historically, per-paper independent LLM scoring produced near-identical
+    final scores (spread ~0.05), making priority tiers meaningless. Here we add
+    a fraction of each paper's deviation from the batch mean to its raw score so
+    that above-average papers move up and below-average papers move down. The
+    batch mean stays stable, so the overall 0.75/0.5 thresholds still apply.
+    Disabled for small batches where a mean is not meaningful.
+    """
+    n = len(raw_scores)
+    if n == 0:
+        return raw_scores
+    if settings.score_calibration_min_batch <= 0 or n < settings.score_calibration_min_batch:
+        return raw_scores
+    mean = sum(raw_scores) / n
+    var = sum((s - mean) ** 2 for s in raw_scores) / n
+    std = var ** 0.5
+    if std == 0:
+        return raw_scores
+    strength = settings.score_calibration_strength
+    # adjusted = s + strength * (s - mean): pulls apart around the mean.
+    return [max(0.0, min(1.0, s + strength * (s - mean))) for s in raw_scores]
+
+
 async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: int):
     """Score new papers from this round (concurrent with semaphore)."""
     # Get unscored task papers from this round
@@ -106,11 +131,12 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
     results = await asyncio.gather(*[score_one(tp_id) for tp_id in paper_map])
 
     # Process results sequentially (DB writes)
-    scored = []
+    # Pass 1: compute raw final scores (no DB write yet) so we can calibrate
+    # across the whole batch before assigning priority tiers.
+    computed = []  # (tp_id, score, final_score)
     for tp_id, score, error in results:
         if score is None:
             continue
-
         tp, paper = paper_map[tp_id]
         authority_adj = score.authority
         # P2: Citation-based authority adjustment with finer granularity
@@ -136,6 +162,16 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
             + settings.score_weight_novelty * score.novelty
             + settings.score_weight_idea_potential * score.idea_potential
         )
+        computed.append((tp_id, score, final_score))
+
+    # Cross-paper calibration: widen separation via batch z-score. Absolute
+    # scores are nudged (not replaced) so downstream 0.75/0.5 thresholds still
+    # apply, but near-tied papers get pulled apart.
+    calibrated = _calibrate_batch_scores([c[2] for c in computed])
+
+    scored = []
+    for (tp_id, score, _raw), final_score in zip(computed, calibrated):
+        tp, paper = paper_map[tp_id]
         priority = "high" if final_score >= 0.75 else ("medium" if final_score >= 0.5 else "low")
 
         paper_repo.update_task_paper_scores(

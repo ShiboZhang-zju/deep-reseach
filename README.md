@@ -1,59 +1,51 @@
 # Deep Research
 
-基于 AI Agent 的自动化研究助手：输入研究方向，自动完成多源论文检索、评分、报告生成、Research Ideas 提出和实验方案设计。
+基于 AI Agent 的证据驱动研究助手：输入研究方向，自动完成研究契约构建、多源论文检索、证据抽取、覆盖度分析、研究缺口挖掘与对抗审计、干预方案生成、以及最小实验设计。
 
-## 系统流程图
+系统的核心目标是**对抗 LLM 幻觉**——不再"检索完让 LLM 凭空编Idea"，而是让每一个研究缺口和研究想法都可回溯到具体论文证据，并通过独立的审计闸门验证。系统允许"零可信 Idea"的诚实结论，任何情况下都至少交付一份领域态势简报（Landscape Brief）。
+
+## 系统流程图（Pipeline V2：证据驱动）
 
 ```mermaid
 flowchart TD
-    A[用户输入研究方向] --> B[理解用户意图]
-    B --> C{方向是否足够明确?}
+    A[用户输入研究方向] --> B[意图澄清]
+    B --> C{方向是否明确?}
+    C -- 否 --> D[生成澄清问题] --> E[用户补充] --> B
+    C -- 是 --> F[构建 Research Contract<br/>结构化研究方向 + 资源约束]
+    F --> G[分解Research Questions<br/>5-12 个可检索问题]
 
-    C -- 否 --> D[生成澄清问题]
-    D --> E[用户补充信息]
-    E --> B
+    G --> H{检索终止条件?}
+    H -- 否 --> I[生成本轮检索 Query]
+    I --> J[多源检索 + 去重 + O7 相似度预过滤]
+    J --> K[保存论文 + 跨论文校准评分]
+    K --> L[抽取 Evidence Units<br/>限定/对比/方法等证据]
+    L --> M[更新 Coverage Matrix<br/>问题-证据覆盖度]
+    M --> H
 
-    C -- 是 --> F[初始化或加载 Research State]
+    H -- 是 --> N{Readiness 闸门}
+    N -- 通过 --> O[挖掘 Gap Candidates<br/>证据支撑的研究缺口]
+    N -- 证据不足 --> R1[O2 定向补检索] --> N
 
-    F --> G{是否达到检索终止条件?}
+    O --> O1{有缺口?}
+    O1 -- 否 --> R2[O2 定向补检索<br/>缺 limitation 时检索 limitations of X] --> O
+    O1 -- 是 --> P[Gap Audit 对抗审计<br/>近邻对比确认缺口是否成立]
 
-    G -- 否 --> H[生成本轮检索 Query]
-    H --> I[调用多源论文检索工具]
-    I --> I1{工具调用是否成功?}
+    P --> P1{有存活缺口?}
+    P1 -- 否 --> R3[O2 定向补检索] --> O
+    P1 -- 是 --> Q[生成 Intervention 干预方案<br/>硬闸门: 证据/新颖性/可行性]
 
-    I1 -- 否 --> I2[重试/降级/记录错误]
-    I2 --> G
+    Q --> Q1{有通过闸门的方案?}
+    Q1 -- 否 --> R4[O2 定向补检索] --> O
+    Q1 -- 是 --> S[生成 Minimal Experiment<br/>形成 Research Idea]
 
-    I1 -- 是 --> J[论文清洗、标准化]
-    J --> K[跨源、跨轮次去重]
-    K --> L[保存论文到 SQLite]
-    L --> M[论文评分与优先级划分]
-    M --> N[生成本轮研究摘要]
-    N --> O[分析知识缺口]
-    O --> P[更新 Research State]
-    P --> G
+    S --> T[分级产出 A/B/C<br/>+ Landscape Brief]
+    T --> U[前端展示: 报告/论文/缺口/创意/实验]
 
-    G -- 是 --> Q[生成研究报告]
-    Q --> R[生成 Research Ideas]
-    R --> S[Idea 初步质量评估]
-    S --> T[前端展示报告、论文、Ideas 和评分]
-
-    T --> U{用户是否需要补充?}
-
-    U -- 是 --> V[用户补充约束、关键词或反馈]
-    V --> W[更新 Research State]
-    W --> G
-
-    U -- 否 --> X[用户选择感兴趣的 Idea]
-    X --> Y[Idea 深度质量评估]
-    Y --> Z{Idea 是否值得进入实验?}
-
-    Z -- 否 --> AA[根据失败原因生成补充检索方向]
-    AA --> W
-
-    Z -- 是 --> AB[生成实验方案]
-    AB --> AC[导出实验计划]
+    R1 -.预算耗尽.-> T
+    R4 -.预算耗尽.-> T
 ```
+
+> 图中 O2/O7 为本次优化引入的能力：O2 定向补检索回环让闸门失败时自动补检索重试而非直接终止；O7 在入库前按主题相似度过滤离题论文。所有终止路径都会产出 Landscape Brief。
 
 ## 技术栈
 
@@ -63,9 +55,10 @@ flowchart TD
 | 数据库 | SQLite |
 | ORM | SQLAlchemy 2.0 |
 | LLM | 多 provider 可切换，默认 Venus LLM Proxy（兼容 OpenAI API，模型 gpt-4o-2024-11-20） |
-| 论文数据源 | Semantic Scholar + arXiv + OpenAlex + Crossref + IEEE + CORE |
+| 论文数据源 | Semantic Scholar + arXiv + OpenAlex + Crossref + Unpaywall + CORE（无 key 时走免费额度） |
+| 向量检索 | ChromaDB + 可插拔 Embedding 后端（默认 OpenAI 兼容 API，绕开本地 PyTorch） |
 | 前端 | Vite + React + TypeScript + Tailwind CSS |
-| Agent 架构 | 轻量自研 Loop（不依赖 LangGraph） |
+| Agent 架构 |轻量自研 Loop（不依赖 LangGraph） |
 
 ## 核心参数
 
@@ -73,8 +66,12 @@ flowchart TD
 |------|--------|
 | 最大检索轮数 | 5 轮 |
 | 每轮生成 Query 数 | 3-5 个 |
-| 每源每 Query 返回论文数 | 15 篇 |
-| Idea 生成数量 | 5-8 个 |
+| 每源每 Query 返回论文数 | 15篇 |
+| 研究问题分解数量 | 5-12 个 |
+| O2 定向补检索：每原因上限 | 2 次 |
+| O2 定向补检索：全局轮数上限 | 3 轮 |
+| O7 相似度预过滤阈值 | 0.35 |
+| 评分批内校准最小批量 | 5 篇 |
 | 实验方案输出格式 | Markdown + JSON 双格式 |
 
 ## 终止条件（满足任一即停止）
@@ -242,13 +239,16 @@ deep-research/
 pending                       # 已创建，未启动
 clarifying                    # 正在分析方向是否明确
 waiting_for_clarification     # 等待用户回答澄清问题
-searching                     # 检索循环中
+searching                     # 检索循环中（含 O2 定向补检索）
 summarizing                   # 生成本轮摘要
+mining_gaps                   # 挖掘证据支撑的研究缺口（V2）
+auditing_gaps                 # 对研究缺口做对抗审计（V2）
+synthesizing_ideas            # 生成干预方案（V2）
+generating_experiment         # 生成最小实验方案
 reporting                     # 生成研究报告
-generating_ideas              # 生成 Research Ideas
-waiting_for_user_review       # 等待用户查看报告/Ideas 并反馈
-judging_ideas                 # 深度评估用户选中的 Ideas
-generating_experiment          # 生成实验方案
+waiting_for_user_review       # 等待用户查看报告/缺口/创意并反馈
+more_research_required        # 证据不足/无存活缺口，已产出 Landscape Brief（V2）
+abstained                     # 系统主动弃权，未产出可信 Idea（V2）
 done                          # 完成
 stopped                       # 用户手动停止
 failed                        # 执行失败
@@ -423,12 +423,26 @@ paper_score = 0.30 × relevance + 0.25 × authority + 0.15 × recency + 0.15 × 
 ```
 
 > **authority 调整**：缺失元数据（无引用+无年份）打 0.7 折；顶会/顶刊（ICML/NeurIPS/ICLR/CVPR/ACL 等）加 0.1（上限 1.0）。
+>
+> **跨论文校准**（本次优化）：单轮评分论文数 ≥ 5 时，对final_score 做批内校准 `adjusted = s + 0.15 × (s - batch_mean)`，把趋同的分数拉开区分度（历史上独立评分区分度仅约 0.05），批均值保持稳定，因此下方阈值仍适用。
 
 | 分数 | 优先级 |
 |------|--------|
 | >= 0.75 | high |
 | 0.5 - 0.75 | medium |
 | < 0.5 | low |
+
+### 研究缺口与干预方案的分级产出（Confidence Tier，本次优化）
+
+Pipeline V2 不再"闸门不过就丢弃"，而是分级产出，让用户拿到按置信度排序的方向清单：
+
+| 档位 | 含义 | 是否进入下游 |
+|------|------|--------------|
+| A | 通过全部硬闸门，且有可定位的全文证据支撑 | 是 |
+| B | 无闸门硬失败，但存在待确认项（某闸门 UNKNOWN/WARN，或缺口仅摘要级证据） | 是 |
+| C | 存在闸门硬失败，作为推测性方向保留 | 否（仅供参考） |
+
+> **可行性闸门放宽**（本次优化）：方案顺口提到"训练/微调"不再一票否决淘汰；仅当核心方案确实依赖训练且 Contract 声明无 GPU 时才判FAIL，否则降级为 WARN（落入 B 档，仍可下游）。
 
 ### Idea 评分
 
@@ -544,15 +558,32 @@ OPENAI_API_KEY=
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o
 
-# 论文源 API Keys（可选，无 key 时走免费额度）
+# 论文源 API Keys（全部可选，无 key 时走免费额度）
+# Semantic Scholar：留空即用无 key 模式（限速 20/min，易触发 429）；
+#   申请免费 key 后自动提速至 5000/min。申请：https://www.semanticscholar.org/product/api#api-key-form
 SEMANTIC_SCHOLAR_API_KEY=
+# OpenAlex / Crossref：填邮箱即可进入 polite pool，限速更宽松（无需审批，即时生效）
 OPENALEX_EMAIL=your@email.com
+CROSSREF_EMAIL=your@email.com
+
+# Embedding 后端（本次优化：可插拔，默认走 OpenAI 兼容 API，绕开 Windows PyTorch segfault）
+EMBEDDING_BACKEND=api                    # api | local
+EMBEDDING_API_URL=# 留空则从 VENUS_LLM_PROXY_URL 派生 /embeddings
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIM=1536
 
 # Agent 参数
 MAX_ROUNDS=5
 QUERIES_PER_ROUND=5
 PAPERS_PER_SOURCE_PER_QUERY=15
 HIGH_PRIORITY_TARGET=15
+
+# 优化参数（本次引入）
+MAX_REMEDIATION_ATTEMPTS=2               # O2 每个失败原因的定向补检索上限
+MAX_REMEDIATION_ROUNDS_TOTAL=3           # O2 全局定向补检索轮数上限
+SEARCH_PREFILTER_MIN_SIMILARITY=0.35     # O7 入库前主题相似度过滤阈值（0 关闭）
+SCORE_CALIBRATION_MIN_BATCH=5            # 评分批内校准最小批量
+SCORE_CALIBRATION_STRENGTH=0.15          # 校准强度
 
 # 数据库
 DATABASE_URL=sqlite:///./deep_research.db
@@ -666,6 +697,28 @@ async def generate_experiment_for_selected_ideas(task_id: str, idea_ids: list[st
 - [x] **SSE 队列限界**：`asyncio.Queue(maxsize=200)`，满时丢最旧事件；任务终态后 10 秒自动清理队列
 - [x] **API Key 认证**：`API_KEY` 环境变量控制，保护 `POST/PUT/DELETE /api/tasks`；留空则禁用（本地开发）
 - [x] **核心测试**：65 个测试覆盖去重、评分公式、终止条件、Wiki 合并、SSE 队列（`pytest tests/`）
+
+### 重构：Evidence-grounded Pipeline V2（已实现）
+
+**目标**：从"检索后让LLM 编Idea"转为"证据驱动的研究缺口发现与想法验证系统"，系统性对抗 LLM 幻觉。
+
+- [x] **Research Contract + Questions**：结构化研究方向与资源约束，分解为 5-12 个可检索问题
+- [x] **Evidence Unit + Coverage Matrix**：抽取可回溯的证据单元，构建问题-证据覆盖矩阵
+- [x] **Gap Mining + 对抗审计**：挖掘证据支撑的研究缺口，Generator 与 Auditor 隔离，近邻对比确认
+- [x] **Intervention + Minimal Experiment**：干预方案经证据/新颖性/可行性硬闸门，形成最小实验
+- [x] **Landscape Brief**：任何终止路径都产出领域态势简报，允许"零可信 Idea"的诚实结论
+
+### 链路优化（本次实现）
+
+**目标**：解决 V2 全严硬闸门串联导致端到端通过率过低、上游供给不足、失败即终止无回环的结构性问题。
+
+- [x] **O2 定向补检索回环**：readiness 与 4 个 opportunity 闸门失败时，按失败原因生成针对性补充query（如缺 limitation 检索 `limitations of X`）并重试，双重预算防死循环（`steps/targeted_research.py`）
+- [x] **O1 分级产出**：Intervention 与 Idea 引入 confidence_tier（A/B/C），闸门不再"不过即丢"；放宽 feasibility 关键词误杀
+- [x] **O5a 可插拔 Embedding + 全文 RAG**：新增 `embedding_service.py`，默认走 OpenAI 兼容 API 绕开 Windows PyTorch segfault，重新启用全文检索（`services/embedding_service.py`）
+- [x] **O7 检索预过滤**：入库前按主题相似度过滤离题论文，best-effort 降级
+- [x] **评分跨论文校准**：批内校准拉开优先级区分度
+- [x] **前端 V2 适配**：新增"研究缺口"页签（结构化字段 + A/B 分档 + 审计状态），Idea 卡片增加 A/B/C 置信度徽章
+- [x] **测试**：后端 182 个测试通过（新增 O2、Embedding 单元测试）
 
 ### MVP 0: 后端最小闭环
 

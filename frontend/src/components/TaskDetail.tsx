@@ -7,6 +7,7 @@ import { EventLog } from './EventLog';
 import { ReportView } from './ReportView';
 import { PapersView } from './PapersView';
 import { IdeasView } from './IdeasView';
+import { GapsView } from './GapsView';
 import { ExperimentsView } from './ExperimentsView';
 import { TracesView } from './TracesView';
 import { WikiView } from './WikiView';
@@ -18,13 +19,14 @@ interface Props {
   onBack: () => void;
 }
 
-type Tab = 'overview' | 'report' | 'papers' | 'ideas' | 'experiments' | 'traces' | 'wiki';
+type Tab = 'overview' | 'report' | 'papers' | 'gaps' | 'ideas' | 'experiments' | 'traces' | 'wiki';
 
 const TABS: { key: Tab; label: string; icon: string }[] = [
   { key: 'overview', label: '概览', icon: '📋' },
   { key: 'report', label: '研究报告', icon: '📄' },
   { key: 'papers', label: '论文', icon: '📚' },
   { key: 'wiki', label: '知识库', icon: '🧠' },
+  { key: 'gaps', label: '研究缺口', icon: '🔍' },
   { key: 'ideas', label: '创意', icon: '💡' },
   { key: 'experiments', label: '实验方案', icon: '🧪' },
   { key: 'traces', label: '执行轨迹', icon: '🔧' },
@@ -301,6 +303,7 @@ export function TaskDetail({ taskId, onBack }: Props) {
       {tab === 'report' && <ReportView taskId={taskId} status={task.status} />}
       {tab === 'papers' && <PapersView taskId={taskId} />}
       {tab === 'wiki' && <WikiView taskId={taskId} />}
+      {tab === 'gaps' && <GapsView taskId={taskId} status={task.status} />}
       {tab === 'ideas' && <IdeasView taskId={taskId} status={task.status} />}
       {tab === 'experiments' && <ExperimentsView taskId={taskId} status={task.status} />}
       {tab === 'traces' && <TracesView taskId={taskId} />}

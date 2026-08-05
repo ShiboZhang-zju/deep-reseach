@@ -114,11 +114,15 @@ async def generate_interventions(
                 logger.warning("Task %s: skip intervention with unknown dependency paper", task_id[:8])
                 continue
             gates = _evaluate_hard_gates(gap, latest_audit, evidence_ids, candidate, contract)
+            tier = _compute_confidence_tier(gap, gates["gate_statuses"])
             item = intervention_repo.create_intervention_candidate(db, task_id, gap.id, {
                 **candidate.model_dump(),
                 "contract_id": contract.id,
                 **gates,
-                "status": "passed" if all(value == "PASS" for value in gates["gate_statuses"].values()) else "rejected",
+                # O1: graded output. A/B tiers flow downstream (idea synthesis);
+                # C is kept as a speculative direction but does not pass the gate.
+                "status": "passed" if tier in ("A", "B") else "rejected",
+                "confidence_tier": tier,
                 "evidence_gate": gates["gate_statuses"]["evidence"],
                 "novelty_gate": gates["gate_statuses"]["novelty"],
                 "feasibility_gate": gates["gate_statuses"]["feasibility"],
@@ -135,6 +139,25 @@ async def generate_interventions(
     })
     db.commit()
     return InterventionGenerationResult(created_ids, passed_ids)
+
+
+def _compute_confidence_tier(gap, gate_statuses: dict) -> str:
+    """O1: derive an A/B/C confidence tier from gate results + gap provenance.
+
+    A: every hard gate PASS and the gap is backed by full-text evidence.
+    B: no gate FAILed but at least one is UNKNOWN/WARN, or the gap is only
+       abstract-strength (provenance_status !='complete'). Still actionable,
+       flagged as needing confirmation.
+    C: at least one gate FAILed — speculative direction, kept for the user but
+       not promoted downstream.
+    """
+    statuses = set(gate_statuses.values())
+    if "FAIL" in statuses:
+        return "C"
+    full_text = getattr(gap, "provenance_status", "partial") == "complete"
+    if statuses <= {"PASS"} and full_text:
+        return "A"
+    return "B"
 
 
 def _evaluate_hard_gates(gap, audit, evidence_ids, candidate, contract) -> dict:
@@ -154,19 +177,42 @@ def _evaluate_hard_gates(gap, audit, evidence_ids, candidate, contract) -> dict:
             novelty_status = "UNKNOWN"
             novelty_reason = "Gap 需先收窄后再判断新颖性"
 
+    # O1: relax the feasibility gate's keyword over-kill. A bare substring
+    # match (e.g. the LLM mentions "train a small classifier" as an auxiliary
+    # step) should NOT hard-FAIL the whole intervention. We distinguish:
+    #   - core intervention text mentions training  -> WARN (needs confirmation,
+    #     lands in B tier, still flows downstream)
+    #   - implementation_cost/plan explicitly centers on training AND the
+    #     contract forbids it AND no GPU -> FAIL (genuinely infeasible)
     feasibility_status = "PASS"
     feasibility_reason = "符合当前 Contract 约束"
-    text = " ".join([candidate.proposed_intervention, candidate.implementation_cost]).lower()
-    training_terms = (" fine-tune", " finetune", " training", "训练", "微调")
-    if contract.allow_model_training is False and any(token in text for token in training_terms):
-        feasibility_status = "FAIL"
-        feasibility_reason = "Contract 不允许模型训练"
-    elif contract.allow_large_benchmark is False and any(token in text for token in ("benchmark", "large dataset", "基准", "大规模数据集")):
-        feasibility_status = "FAIL"
-        feasibility_reason = "Contract 不允许构建大型 Benchmark"
-    elif contract.gpu_available is False and any(token in text for token in ("gpu", "train", "fine-tune", "训练", "微调")):
-        feasibility_status = "FAIL"
-        feasibility_reason = "Contract 未提供 GPU 资源"
+    core_text = candidate.proposed_intervention.lower()
+    cost_text = (candidate.implementation_cost or "").lower()
+    text = f"{core_text} {cost_text}"
+    training_terms = ("fine-tune", "finetune", "fine tune", "training", "train ", "训练", "微调")
+    benchmark_terms = ("benchmark", "large dataset", "基准", "大规模数据集")
+
+    mentions_training = any(token in text for token in training_terms)
+    mentions_benchmark = any(token in text for token in benchmark_terms)
+
+    if contract.allow_model_training is False and mentions_training:
+        # Only hard-FAIL when training is clearly central (appears in the core
+        # proposed intervention) AND no GPU is available; otherwise WARN.
+        core_training = any(token in core_text for token in training_terms)
+        if core_training and contract.gpu_available is False:
+            feasibility_status = "FAIL"
+            feasibility_reason = "Contract 不允许模型训练且无 GPU，方案核心依赖训练"
+        else:
+            feasibility_status = "WARN"
+            feasibility_reason = "方案提及训练/微调但可能仅为辅助步骤，需人工确认是否可在约束内替换"
+    elif contract.allow_large_benchmark is False and mentions_benchmark:
+        core_benchmark = any(token in core_text for token in benchmark_terms)
+        feasibility_status = "FAIL" if core_benchmark else "WARN"
+        feasibility_reason = ("Contract 不允许构建大型 Benchmark" if core_benchmark
+                              else "方案提及基准/大规模数据集，需确认规模是否在约束内")
+    elif contract.gpu_available is False and any(token in core_text for token in ("gpu", "train", "fine-tune", "训练", "微调")):
+        feasibility_status = "WARN"
+        feasibility_reason = "无 GPU 资源，需确认方案是否有免训练替代路径"
 
     gate_statuses = {
         "evidence": evidence_status,

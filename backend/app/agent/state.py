@@ -40,6 +40,11 @@ class ResearchState:
     active_gap_ids: list[str] = field(default_factory=list)
     surviving_gap_ids: list[str] = field(default_factory=list)
 
+    # O2: Targeted remediation — tracks how many extra directed-search rounds
+    # were spent trying to unblock a failed pipeline gate, keyed by reason code.
+    # Bounded by settings.max_remediation_attempts to avoid infinite loops.
+    remediation_attempts: dict = field(default_factory=dict)
+
     # Pipeline orchestration
     current_phase: str = "pending"
     pipeline_version: int = 2

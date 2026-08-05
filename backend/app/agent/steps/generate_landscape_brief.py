@@ -30,6 +30,8 @@ from app.db.models import (
     Paper,
     TaskPaper,
     GapCandidate,
+    InterventionCandidate,
+    ResearchIdea,
 )
 from app.db.repositories import gap_repo, paper_repo
 from sqlalchemy import func
@@ -147,6 +149,9 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
             lines.append(f"- [{g.status}][{tier}] {desc}")
         lines.append("")
 
+    # --- 5b. Graded candidate directions (O1) ---
+    _append_graded_directions(db, lines, task_id, contract_id)
+
     # --- 6. Recommended next steps ---
     lines.append("## 建议的下一步\n")
     for step in _recommend_next_steps(db, task_id, questions, latest_cov,
@@ -155,6 +160,52 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _append_graded_directions(db, lines, task_id, contract_id):
+    """O1: surface graded (A/B/C) intervention/idea directions in the brief.
+
+    Even when the pipeline did not reach the experiment stage, any interventions
+    that were generated are shown with their confidence tier so the user gets a
+    ranked list of directions instead of nothing.
+    """
+    if not contract_id:
+        return
+    interventions = db.query(InterventionCandidate).filter(
+        InterventionCandidate.task_id == task_id,
+        InterventionCandidate.contract_id == contract_id,
+    ).all()
+    ideas = db.query(ResearchIdea).filter(
+        ResearchIdea.task_id == task_id,
+        ResearchIdea.contract_id == contract_id,
+        ResearchIdea.idea_status == "active",
+    ).all()
+    if not interventions and not ideas:
+        return
+
+    lines.append("## 分级候选方向 (Confidence Tier)\n")
+    lines.append("A = 证据充分、通过全部闸门；B = 证据部分支撑或部分闸门待确认，可行但需人工/实验确认；"
+                 "C = 推测性方向，某闸门未通过，仅供参考。\n")
+
+    tier_order = {"A": 0, "B": 1, "C": 2}
+
+    def _tier_label(tier: str) -> str:
+        return {"A": "A(可信)", "B": "B(待确认)", "C": "C(推测)"}.get(tier or "C", "C(推测)")
+
+    if ideas:
+        lines.append("研究想法：")
+        for idea in sorted(ideas, key=lambda x: tier_order.get(x.confidence_tier or "C", 2)):
+            title = (idea.title or "")[:80].replace("\n", " ")
+            lines.append(f"- [{_tier_label(idea.confidence_tier)}] {title}")
+        lines.append("")
+
+    if interventions:
+        lines.append("干预方案：")
+        for itv in sorted(interventions, key=lambda x: tier_order.get(x.confidence_tier or "C", 2))[:12]:
+            desc = (itv.proposed_intervention or "")[:100].replace("\n", " ")
+            gate_summary = f"E:{itv.evidence_gate}/N:{itv.novelty_gate}/F:{itv.feasibility_gate}"
+            lines.append(f"- [{_tier_label(itv.confidence_tier)}][{itv.status}] {desc} （闸门 {gate_summary}）")
+        lines.append("")
 
 
 def _explain_terminal(status: str, reason: str) -> str:
