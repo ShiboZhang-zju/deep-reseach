@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api/client';
-import type { Gap } from '../types';
+import type { Gap, GapAudit, NeighborComparison } from '../types';
 import { formatDateTime } from '../utils/time';
 
 interface Props {
@@ -112,9 +112,77 @@ export function GapsView({ taskId, status }: Props) {
               {gap.risk_score != null && <span>风险 {gap.risk_score.toFixed(2)}</span>}
               <span className="ml-auto">挖掘轮次 {gap.mining_round} · {formatDateTime(gap.created_at)}</span>
             </div>
+
+            <GapAuditDetail gapId={gap.id} />
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function GapAuditDetail({ gapId }: { gapId: string }) {
+  const [open, setOpen] = useState(false);
+  const [audits, setAudits] = useState<GapAudit[]>([]);
+  const [neighbors, setNeighbors] = useState<NeighborComparison[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !loaded) {
+      Promise.all([
+        api.getGapAudits(gapId).catch(() => []),
+        api.getGapNeighbors(gapId).catch(() => []),
+      ]).then(([a, n]) => {
+        setAudits(a);
+        setNeighbors(n);
+        setLoaded(true);
+      });
+    }
+  };
+
+  return (
+    <div className="mt-3 pt-3 border-t border-gray-100">
+      <button onClick={toggle} className="text-xs text-blue-600 hover:text-blue-800">
+        {open ? '收起审计与近邻对比▲' : '查看审计与近邻对比 ▼'}
+      </button>
+      {open && (
+        <div className="mt-2 space-y-3">
+          {loaded && audits.length === 0 && neighbors.length === 0 && (
+            <p className="text-xs text-gray-400">暂无审计记录（可能因检索供给受限未进入审计）</p>
+          )}
+          {audits.map((a) => (
+            <div key={a.id} className="text-xs bg-gray-50 rounded p-3">
+              <div className="flex items-center gap-2 mb-1">
+                <span className={`px-2 py-0.5 rounded font-medium ${
+                  a.audit_result === 'confirmed' ? 'bg-green-100 text-green-700'
+                  : a.audit_result === 'rejected' ? 'bg-red-100 text-red-700'
+                  : 'bg-amber-100 text-amber-700'
+                }`}>{a.audit_result}</span>
+                <span className="text-gray-400">建议: {a.recommended_action}</span>
+                {a.audit_confidence != null && <span className="text-gray-400">置信度 {a.audit_confidence.toFixed(2)}</span>}
+              </div>
+              {a.nearest_neighbor_summary && <p className="text-gray-600 mb-1">近邻: {a.nearest_neighbor_summary}</p>}
+              {a.differentiation_summary && <p className="text-gray-600 mb-1">差异化: {a.differentiation_summary}</p>}
+              {a.remaining_delta && <p className="text-indigo-700">剩余增量: {a.remaining_delta}</p>}
+              {a.rejection_reason && <p className="text-red-600">拒绝原因: {a.rejection_reason}</p>}
+            </div>
+          ))}
+          {neighbors.length > 0 && (
+            <div className="text-xs">
+              <span className="font-semibold text-gray-500">近邻论文对比（{neighbors.length}）</span>
+              {neighbors.slice(0, 5).map((n) => (
+                <div key={n.id} className="bg-gray-50 rounded p-2 mt-1">
+                  <span className="text-gray-400">相似度 {n.similarity_score.toFixed(2)} · 重叠率 {n.overlap_ratio.toFixed(2)}</span>
+                  {n.shared_problem && <p className="text-gray-600">共享问题: {n.shared_problem}</p>}
+                  {n.uncovered_claims.length > 0 && <p className="text-emerald-700">未覆盖: {n.uncovered_claims.join('; ')}</p>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

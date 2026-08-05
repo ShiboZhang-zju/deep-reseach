@@ -120,6 +120,68 @@ export interface Gap {
   updated_at: string;
 }
 
+export interface Intervention {
+  id: string;
+  task_id: string;
+  gap_id: string;
+  contract_id: string | null;
+  intervention_type: string;
+  failure_mechanism: string;
+  proposed_intervention: string;
+  intermediate_effect: string;
+  measurable_outcome: string;
+  required_components: string[];
+  dependency_paper_ids: string[];
+  implementation_cost: string | null;
+  mechanism_confidence: number | null;
+  evidence_gate: string;
+  novelty_gate: string;
+  feasibility_gate: string;
+  gate_rationale: Record<string, unknown>;
+  confidence_tier: string;
+  status: string;
+  created_at: string;
+}
+
+export interface CoverageRecord {
+  id: string;
+  task_id: string;
+  question_id: string;
+  round_number: number;
+  coverage_score: number;
+  evidence_count?: number;
+  status?: string;
+  created_at?: string;
+}
+
+export interface GapAudit {
+  id: string;
+  gap_id: string;
+  task_id: string;
+  audit_result: string;
+  nearest_neighbor_summary: string | null;
+  differentiation_summary: string | null;
+  neighbor_paper_ids: string[];
+  remaining_delta: string | null;
+  audit_confidence: number | null;
+  recommended_action: string;
+  rejection_reason: string | null;
+  audit_round: number;
+  created_at: string;
+}
+
+export interface NeighborComparison {
+  id: string;
+  gap_id: string;
+  paper_id: string;
+  similarity_score: number;
+  shared_problem: string | null;
+  shared_mechanism: string | null;
+  overlap_ratio: number;
+  uncovered_claims: string[];
+  created_at: string;
+}
+
 export interface Experiment {
   id: string;
   task_id: string;

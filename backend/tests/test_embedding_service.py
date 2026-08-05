@@ -32,6 +32,7 @@ def test_embed_texts_api_batches(monkeypatch):
     """embed_texts (api) should call the endpoint and preserve input order."""
     monkeypatch.setattr(settings, "embedding_backend", "api")
     monkeypatch.setattr(settings, "embedding_batch_size", 2)
+    monkeypatch.setattr(settings, "embedding_dim", 1)
 
     calls = {"n": 0}
 
@@ -57,6 +58,28 @@ def test_embed_texts_api_batches(monkeypatch):
     # Sorted by index -> [1.0], [2.0]
     assert out == [[1.0], [2.0]]
     assert calls["n"] == 1
+    monkeypatch.undo()
+
+
+def test_embed_texts_api_dim_mismatch_raises(monkeypatch):
+    """A returned dimension != settings.embedding_dim must fail loudly."""
+    monkeypatch.setattr(settings, "embedding_backend", "api")
+    monkeypatch.setattr(settings, "embedding_dim", 1536)
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"data": [{"index": 0, "embedding": [0.1, 0.2, 0.3]}]}  # dim=3
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, *a, **k): return FakeResp()
+
+    monkeypatch.setattr(es.httpx, "Client", FakeClient)
+    with pytest.raises(RuntimeError, match="dim mismatch"):
+        es.embed_texts(["x"])
     monkeypatch.undo()
 
 

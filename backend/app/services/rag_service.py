@@ -92,18 +92,56 @@ _paper_collection = None
 _paper_level_collection = None
 
 
-def get_chroma_collection():
-    """Get or create the ChromaDB paper_chunks collection (chunk-level embeddings)."""
-    global _chroma_client, _paper_collection
+def _embedding_signature() -> str:
+    """Identity of the current embedding config; used to detect dim/model drift."""
+    from app.config import settings
+    return f"{settings.embedding_backend}:{settings.embedding_model}:{settings.embedding_dim}"
+
+
+def _get_chroma_client():
+    global _chroma_client
     if _chroma_client is None:
         import chromadb
         os.makedirs(CHROMA_DIR, exist_ok=True)
         _chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
-    if _paper_collection is None:
-        _paper_collection = _chroma_client.get_or_create_collection(
-            name="paper_chunks",
-            metadata={"hnsw:space": "cosine"},
+    return _chroma_client
+
+
+def _get_or_recreate_collection(name: str):
+    """Get a collection, recreating it if its embedding signature drifted.
+
+    Guards against the O5a hazard where a collection created with the old local
+    bge model (768-dim) is later queried/written with API vectors (1536-dim),
+    which raises an opaque ChromaDB dimension-mismatch error. If the stored
+    signature does not match the current config, we drop and recreate the
+    collection (the vectors are reproducible from SQLite via reembed).
+    """
+    client = _get_chroma_client()
+    sig = _embedding_signature()
+    col = client.get_or_create_collection(
+        name=name,
+        metadata={"hnsw:space": "cosine", "embedding_signature": sig},
+    )
+    stored_sig = (col.metadata or {}).get("embedding_signature")
+    if stored_sig is not None and stored_sig != sig:
+        logger.warning(
+            "ChromaDB collection '%s' embedding signature drift: stored=%s current=%s "
+            "-> recreating collection (vectors will be re-embedded from SQLite on demand)",
+            name, stored_sig, sig,
         )
+        client.delete_collection(name)
+        col = client.get_or_create_collection(
+            name=name,
+            metadata={"hnsw:space": "cosine", "embedding_signature": sig},
+        )
+    return col
+
+
+def get_chroma_collection():
+    """Get or create the ChromaDB paper_chunks collection (chunk-level embeddings)."""
+    global _paper_collection
+    if _paper_collection is None:
+        _paper_collection = _get_or_recreate_collection("paper_chunks")
     return _paper_collection
 
 
@@ -111,16 +149,9 @@ def get_paper_level_collection():
     """Get or create the ChromaDB paper_embeddings collection (one embedding per paper).
     Used for literature map semantic similarity.
     """
-    global _chroma_client, _paper_level_collection
-    if _chroma_client is None:
-        import chromadb
-        os.makedirs(CHROMA_DIR, exist_ok=True)
-        _chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+    global _paper_level_collection
     if _paper_level_collection is None:
-        _paper_level_collection = _chroma_client.get_or_create_collection(
-            name="paper_embeddings",
-            metadata={"hnsw:space": "cosine"},
-        )
+        _paper_level_collection = _get_or_recreate_collection("paper_embeddings")
     return _paper_level_collection
 
 
@@ -949,17 +980,13 @@ def embed_and_store_chunks(paper_id: str, chunks: list[ParsedChunk]) -> None:
 async def embed_and_store_chunks_async(paper_id: str, chunks: list[ParsedChunk]) -> None:
     """Async wrapper for embed_and_store_chunks.
 
-    P1-16: Runs synchronously in the event loop (NOT in to_thread) because
-    PyTorch model.encode in a worker thread causes segfaults on Windows
-    ("Cannot copy out of meta tensor" → process crash). Running synchronously
-    blocks the event loop briefly (~1-2s per paper) but is stable.
-
-    This is only called from fetch_and_index_papers which runs serially
-    (one paper at a time), so blocking is acceptable. The scoring phase
-    (score_papers) does NOT call this — it uses rag_retrieve which is
-    also sync-safe (returns [] when ChromaDB is empty).
+    O5a: with the API embedding backend (no local PyTorch), the old constraint
+    that forced synchronous execution (P1-16: model.encode segfault on Windows)
+    no longer applies, so we run in a thread pool to avoid blocking the event
+    loop during the HTTP embedding call.
     """
-    embed_and_store_chunks(paper_id, chunks)
+    import asyncio
+    await asyncio.to_thread(embed_and_store_chunks, paper_id, chunks)
 
 
 # === Phase 4: RAG Retrieval ===

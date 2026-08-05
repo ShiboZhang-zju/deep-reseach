@@ -85,3 +85,12 @@ class PaperSource(ABC):
         """Search papers by query string."""
         ...
 
+    def is_available(self) -> bool:
+        """Whether this source can actually return results in the current config.
+
+        Sources that require an API key should override this to return False
+        when the key is missing, so the search service can skip loading them
+        (avoiding wasted requests) and report an honest active-source count.
+        """
+        return True
+

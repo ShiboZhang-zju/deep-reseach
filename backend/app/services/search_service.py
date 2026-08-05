@@ -62,7 +62,10 @@ class SearchService:
     """Coordinates multi-source paper search with concurrency."""
 
     def __init__(self):
-        self.sources: list[PaperSource] = [
+        # All candidate sources; only load those actually usable in the current
+        # config so we don't fire wasted requests at key-gated sources (IEEE /
+        # CORE) and can report an honest active-source count.
+        all_sources: list[PaperSource] = [
             SemanticScholarSource(),
             ArxivSource(),
             OpenAlexSource(),
@@ -70,11 +73,29 @@ class SearchService:
             IeeeSource(),
             CoreSource(),
         ]
+        self.sources: list[PaperSource] = [s for s in all_sources if s.is_available()]
+        skipped = [s.name for s in all_sources if not s.is_available()]
+        logger.info(
+            "SearchService: %d/%d sources active (%s)%s",
+            len(self.sources), len(all_sources),
+            ", ".join(s.name for s in self.sources),
+            f"; skipped (no key): {', '.join(skipped)}" if skipped else "",
+        )
         self._unpaywall = UnpaywallSource()
         # 429 cooldown: source_name -> cooldown_until timestamp
         # When a source returns 429 (rate limited), skip it for cooldown_s
         self._cooldowns: dict[str, float] = {}
         self._cooldown_s = settings.rate_limit_cooldown_s
+
+    def source_health(self) -> dict:
+        """Report active/skipped sources for diagnostics and UI transparency."""
+        active = [s.name for s in self.sources]
+        return {
+            "active_sources": active,
+            "active_count": len(active),
+            "cooling_down": [name for name in self._cooldowns
+                             if self._is_cooled_down(name)],
+        }
 
     def _is_cooled_down(self, source_name: str) -> bool:
         """Check if source is in 429 cooldown period."""

@@ -1,4 +1,4 @@
-import type { Task, Paper, Round, Report, Idea, Experiment, Trace, Gap } from '../types';
+import type { Task, Paper, Round, Report, Idea, Experiment, Trace, Gap, Intervention, CoverageRecord, GapAudit, NeighborComparison } from '../types';
 
 const BASE = '/api';
 
@@ -65,6 +65,18 @@ export const api = {
 
   getGaps: (taskId: string) =>
     fetchJSON<Gap[]>(`${BASE}/tasks/${taskId}/gaps`),
+
+  getGapAudits: (gapId: string) =>
+    fetchJSON<GapAudit[]>(`${BASE}/gaps/${gapId}/audits`),
+
+  getGapNeighbors: (gapId: string) =>
+    fetchJSON<NeighborComparison[]>(`${BASE}/gaps/${gapId}/neighbors`),
+
+  getInterventions: (taskId: string) =>
+    fetchJSON<Intervention[]>(`${BASE}/tasks/${taskId}/interventions`),
+
+  getCoverage: (taskId: string) =>
+    fetchJSON<CoverageRecord[]>(`${BASE}/tasks/${taskId}/coverage`),
 
   selectIdeas: (taskId: string, ideaIds: string[]) =>
     fetchJSON<{ status: string }>(`${BASE}/tasks/${taskId}/ideas/select`, {

@@ -76,6 +76,8 @@ class VenusProvider(LLMProvider):
             return schema.model_validate(data2)
 
     async def _post(self, payload: dict) -> dict:
+        # Budget enforcement (raises LLMBudgetExceeded if over budget).
+        self._track_call()
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token}",
@@ -94,4 +96,5 @@ class VenusProvider(LLMProvider):
             usage = data.get("usage")
             if usage:
                 self.last_usage = usage
+                self._record_usage()
             return data

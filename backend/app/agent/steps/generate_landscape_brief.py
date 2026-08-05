@@ -152,6 +152,17 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
     # --- 5b. Graded candidate directions (O1) ---
     _append_graded_directions(db, lines, task_id, contract_id)
 
+    # --- 5c. Constrained-retrieval notice (high-priority #2) ---
+    from app.config import settings
+    if settings.constrained_retrieval_mode:
+        lines.append("## 检索供给提示\n")
+        lines.append(
+            "当前未配置 Semantic Scholar API Key，也未提供 OpenAlex/Crossref 邮箱，"
+            "高质量检索源（含引用关系与近邻对比）受限，可能降低研究缺口通过审计的比例。"
+            "缺口审计的准入门已自动放宽以适配受限模式。若产出偏少，可在 .env 填入 "
+            "OPENALEX_EMAIL / CROSSREF_EMAIL（无需审批、即时生效）或申请 Semantic Scholar Key 以改善。\n"
+        )
+
     # --- 6. Recommended next steps ---
     lines.append("## 建议的下一步\n")
     for step in _recommend_next_steps(db, task_id, questions, latest_cov,

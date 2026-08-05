@@ -732,3 +732,27 @@ class GapEvidenceLinkOut(BaseModel):
     relation_type: str = "suggests"
     relevance_score: float = 0.5
     created_at: str
+
+
+class InterventionOut(BaseModel):
+    """Intervention candidate for API response (mid-priority #6)."""
+    id: str
+    task_id: str
+    gap_id: str
+    contract_id: str | None = None
+    intervention_type: str
+    failure_mechanism: str
+    proposed_intervention: str
+    intermediate_effect: str
+    measurable_outcome: str
+    required_components: list[str] = Field(default_factory=list)
+    dependency_paper_ids: list[str] = Field(default_factory=list)
+    implementation_cost: str | None = None
+    mechanism_confidence: float | None = None
+    evidence_gate: str = "UNKNOWN"
+    novelty_gate: str = "UNKNOWN"
+    feasibility_gate: str = "UNKNOWN"
+    gate_rationale: dict = Field(default_factory=dict)
+    confidence_tier: str = "C"
+    status: str = "candidate"
+    created_at: str

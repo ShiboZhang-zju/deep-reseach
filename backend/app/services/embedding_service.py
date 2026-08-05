@@ -59,7 +59,17 @@ def _embed_texts_api(texts: list[str]) -> list[list[float]]:
             data = resp.json()
             # OpenAI returns items in input order but include index to be safe.
             items = sorted(data["data"], key=lambda d: d.get("index", 0))
-            out.extend(item["embedding"] for item in items)
+            batch_vecs = [item["embedding"] for item in items]
+            # Guard: the returned dimension MUST match the configured dim, else
+            # ChromaDB will later raise an opaque mismatch. Fail loud & early.
+            for vec in batch_vecs:
+                if len(vec) != settings.embedding_dim:
+                    raise RuntimeError(
+                        f"Embedding dim mismatch: API returned {len(vec)} but "
+                        f"settings.embedding_dim={settings.embedding_dim}. "
+                        f"Fix EMBEDDING_DIM to match model '{settings.embedding_model}'."
+                    )
+            out.extend(batch_vecs)
     return out
 
 

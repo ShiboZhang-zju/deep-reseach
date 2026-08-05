@@ -14,6 +14,9 @@ class CoreSource(PaperSource):
     name = "core"
     base_url = "https://api.core.ac.uk/v3/search/works"
 
+    def is_available(self) -> bool:
+        return bool(settings.core_api_key)
+
     async def search(self, query: str, limit: int = 15) -> list[RawPaper]:
         if not settings.core_api_key:
             logger.warning("CORE API key not configured, skipping")

@@ -51,6 +51,7 @@ from app.agent.steps import (
 from app.agent.steps.analyze_papers import analyze_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
 from app.llm.factory import get_llm
+from app.llm.base import LLMBudgetExceeded
 from app.services.event_service import emit_event, emit_event_with_cleanup
 
 logger = logging.getLogger(__name__)
@@ -334,6 +335,13 @@ async def run_task(task_id: str):
     try:
         state = task_repo.get_state(db, task_id)
         llm = get_llm()
+        # High-priority #3: enforce a per-task LLM budget so cost is bounded and
+        # a runaway task degrades gracefully instead of hard-failing/timing out.
+        if hasattr(llm, "set_budget"):
+            llm.set_budget(
+                max_calls=settings.max_llm_calls_per_task,
+                max_total_tokens=settings.max_llm_tokens_per_task,
+            )
 
         # === 1. Topic clarification (skip if already clarified) ===
         if state.normalized_topic:
@@ -530,6 +538,22 @@ async def run_task(task_id: str):
             # Legacy pipeline: generate ideas directly
             await _run_ideas_loop(db, state, llm, task_id, cluster_list)
 
+    except LLMBudgetExceeded as budget_err:
+        # High-priority #3: graceful degradation — emit a landscape brief with
+        # whatever evidence exists rather than hard-failing on budget overrun.
+        logger.warning("Task %s: LLM budget exceeded, degrading gracefully: %s",
+                       task_id[:8], budget_err)
+        try:
+            db.rollback()
+            state = task_repo.get_state(db, task_id)
+            await _terminate_more_research(
+                db, state, task_id, "more_research_required", "llm_budget_exceeded")
+        except Exception as deg_err:
+            logger.error("Task %s: degradation after budget overrun failed: %s",
+                         task_id[:8], deg_err)
+            task_repo.update_status(db, task_id, "failed")
+            task_repo.update_stop_reason(db, task_id, "llm_budget_exceeded")
+            db.commit()
     finally:
         db.close()
 

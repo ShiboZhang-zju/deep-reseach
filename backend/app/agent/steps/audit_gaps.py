@@ -121,6 +121,15 @@ def build_adversarial_queries(gap: GapCandidate) -> list[AdversarialQuerySpec]:
     return [spec for spec in specs if spec.query_text and not (spec.query_text.lower() in seen or seen.add(spec.query_text.lower()))]
 
 def evaluate_gap_search_admission(db, gap, query_ids):
+    from app.config import settings
+    constrained = settings.constrained_retrieval_mode
+    min_completed = (settings.gap_admission_min_completed_queries_constrained
+                     if constrained else settings.gap_admission_min_completed_queries)
+    min_families = (settings.gap_admission_min_query_families_constrained
+                    if constrained else settings.gap_admission_min_query_families)
+    min_papers = (settings.gap_admission_min_gap_papers_constrained
+                  if constrained else settings.gap_admission_min_gap_papers)
+
     queries = db.query(SearchQueryRecord).filter(
         SearchQueryRecord.id.in_(query_ids),
         SearchQueryRecord.target_gap_id == gap.id,
@@ -132,17 +141,21 @@ def evaluate_gap_search_admission(db, gap, query_ids):
     completed = [item for item in queries if item.status == "completed"]
     failed = [item for item in queries if item.status == "failed"]
     families = sorted({item.query_family for item in completed if item.query_family})
-    if len(completed) < 2: reasons.append("INSUFFICIENT_COMPLETED_QUERIES")
-    if len(families) < 2: reasons.append("INSUFFICIENT_QUERY_FAMILIES")
+    if len(completed) < min_completed: reasons.append("INSUFFICIENT_COMPLETED_QUERIES")
+    if len(families) < min_families: reasons.append("INSUFFICIENT_QUERY_FAMILIES")
     if len(completed) / max(len(queries), 1) < 0.5: reasons.append("SEARCH_SUCCESS_RATE_TOO_LOW")
     mappings = db.query(SearchQueryPaper).filter(SearchQueryPaper.query_id.in_([item.id for item in completed])).all()
     paper_ids = sorted({item.paper_id for item in mappings})
     sources = {item.source for item in mappings if item.source and item.source != "unknown"}
     if not sources: reasons.append("NO_SUCCESSFUL_SOURCE")
-    if len(paper_ids) < 3: reasons.append("INSUFFICIENT_GAP_SPECIFIC_PAPERS")
+    if len(paper_ids) < min_papers: reasons.append("INSUFFICIENT_GAP_SPECIFIC_PAPERS")
     support_papers = {db.get(EvidenceUnit, link.evidence_id).paper_id for link in gap_repo.list_gap_evidence(db, gap.id) if link.relation_type == "suggests" and db.get(EvidenceUnit, link.evidence_id)}
     external = [item for item in paper_ids if item not in support_papers]
     if not external: reasons.append("NO_EXTERNAL_NEIGHBOR")
+    if constrained and reasons:
+        logger.info("Gap %s admission evaluated under constrained retrieval mode "
+                    "(relaxed thresholds: completed>=%d, families>=%d, papers>=%d)",
+                    gap.id[:8], min_completed, min_families, min_papers)
     return GapSearchAdmission(gap.id, "PASS" if not reasons else "UNKNOWN", reasons, [item.id for item in queries], [item.id for item in completed], [item.id for item in failed], families, len(sources), paper_ids, external)
 
 def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS):

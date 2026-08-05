@@ -85,6 +85,18 @@ def evaluate_gap_mining_admission(question, links, evidence_by_id) -> QuestionEv
         evidence_tier = "B"
         reasons.append("NO_FULLTEXT_LOCATABLE_EVIDENCE")
 
+    # Mid-priority #5: down-weight abstract-only evidence. Even if some
+    # full-text span exists, if the *limitation signal itself* is only
+    # abstract-strength (never full-text-locatable), the gap should not be
+    # A-tier — the core "problem" claim is weakly grounded. Demote to B so
+    # downstream (O1 tiering / audit) treats it as needing confirmation.
+    # NOTE: this only affects the tier, NOT the PASS/UNKNOWN admission decision
+    # (so it never blocks an otherwise-admissible gap).
+    if evidence_tier == "A" and limiting and not any(_is_fulltext_locatable(item) for item in limiting):
+        evidence_tier = "B"
+        logger.info("Question %s: demoting gap evidence A->B (limitation signal is abstract-only)",
+                    question.id[:8])
+
     status = "PASS" if not reasons else "UNKNOWN"
     return QuestionEvidenceAdmission(
         question.id, status, reasons,

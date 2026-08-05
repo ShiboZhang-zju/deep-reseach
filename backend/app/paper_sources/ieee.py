@@ -14,6 +14,9 @@ class IeeeSource(PaperSource):
     name = "ieee"
     base_url = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
 
+    def is_available(self) -> bool:
+        return bool(settings.ieee_api_key)
+
     async def search(self, query: str, limit: int = 15) -> list[RawPaper]:
         if not settings.ieee_api_key:
             logger.warning("IEEE API key not configured, skipping")

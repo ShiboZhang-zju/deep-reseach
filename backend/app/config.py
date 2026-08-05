@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # Concurrency limits (P0-1: prevent SQLite write contention)
     max_concurrent_agents: int = 2
 
+    # LLM budget per task (0 = unlimited). When exceeded, the runner degrades
+    # gracefully to existing output (emits a landscape brief) instead of
+    # running unbounded cost or hard-failing.
+    max_llm_calls_per_task: int = 800
+    max_llm_tokens_per_task: int = 0# 0 = no token cap; set to enforce token budget
+
     # O2: Targeted remediation — when a pipeline gate fails (no gap / no
     # surviving gap / no intervention / readiness), run up to this many extra
     # directed-search rounds aimed at the specific failure reason before giving
@@ -119,6 +125,28 @@ class Settings(BaseSettings):
         if self.semantic_scholar_api_key.strip():
             return self.s2_rate_with_key
         return self.rate_limit_s2_per_min
+
+    @property
+    def constrained_retrieval_mode(self) -> bool:
+        """True when high-quality source supply is likely constrained (no S2 key
+        and no polite-pool emails), so gap-audit admission thresholds should be
+        relaxed to avoid systematically stalling at'uncertain'."""
+        if self.semantic_scholar_api_key.strip():
+            return False
+        # An OpenAlex/Crossref polite-pool email materially improves neighbor
+        # supply; if the user provided one, don't treat retrieval as constrained.
+        if self.openalex_email.strip() or self.crossref_email.strip() or self.openalex_api_key.strip():
+            return False
+        return True
+
+    # Gap-audit search admission thresholds (relaxed automatically under
+    # constrained_retrieval_mode to keep the no-key path usable).
+    gap_admission_min_completed_queries: int = 2
+    gap_admission_min_query_families: int = 2
+    gap_admission_min_gap_papers: int = 3
+    gap_admission_min_completed_queries_constrained: int = 1
+    gap_admission_min_query_families_constrained: int = 1
+    gap_admission_min_gap_papers_constrained: int = 2
 
     @property
     def effective_openalex_rate_per_min(self) -> int:

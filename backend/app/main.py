@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db.session import engine, Base
-from app.api.routes import tasks, papers, reports, ideas, experiments, events, traces, contracts, gaps
+from app.api.routes import tasks, papers, reports, ideas, experiments, events, traces, contracts, gaps, interventions
 from app.api.auth import ApiKeyMiddleware
 from app.agent.runner import recover_interrupted_tasks
 
@@ -65,6 +65,8 @@ app.include_router(traces.router, prefix="/api", tags=["traces"])
 app.include_router(contracts.router, prefix="/api", tags=["contracts"])
 # Phase 3A: Gap routes (read-only)
 app.include_router(gaps.router, tags=["gaps"])
+# Mid-priority #6: Intervention routes (read-only)
+app.include_router(interventions.router, tags=["interventions"])
 
 # Mount paper assets directory for serving extracted figures
 _assets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "paper_assets")
