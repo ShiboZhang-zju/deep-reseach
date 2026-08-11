@@ -67,45 +67,36 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
 
     coverage_deltas = []
 
+    # Pre-build a compact, indexed view of all evidence for LLM matching. Using
+    # the LLM for semantic relevance replaces the old English-only keyword
+    # substring matcher, which produced zero matches for Chinese claims.
+    evidence_index = list(all_evidence)  # stable order;1-based index in prompt
+
     for question in questions:
-        # (#12) Multi-criteria matching
         supporting = 0
         contradicting = 0
         background = 0
-        linked_count = 0
 
-        # Extract keywords from question (multi-word phrases)
-        q_keywords = _extract_keywords(question.question)
-        q_type_relevant_evidence = _get_relevant_evidence_types(question.question_type)
+        # (#12) LLM-based semantic matching: one batched call (or a few) per
+        # question decides which evidence items are relevant and how.
+        matched = await _llm_match_evidence(llm, question, evidence_index)
 
-        for eu in all_evidence:
-            claim_lower = (eu.normalized_claim or "").lower()
+        for eu_idx, relation_type, relevance in matched:
+            eu = evidence_index[eu_idx]
+            link = QuestionEvidenceLink(
+                question_id=question.id,
+                evidence_id=eu.id,
+                relation_type=relation_type,
+                relevance_score=relevance,
+            )
+            db.add(link)
 
-            # Check relevance: at least 2 keyword matches OR type match + 1 keyword
-            keyword_matches = sum(1 for kw in q_keywords if kw in claim_lower)
-            type_match = eu.evidence_type in q_type_relevant_evidence
-
-            is_relevant = (keyword_matches >= 2) or (keyword_matches >= 1 and type_match)
-
-            if is_relevant:
-                relation_type = _determine_relation(eu, question)
-                relevance = min(1.0, keyword_matches * 0.2 + (0.3 if type_match else 0))
-
-                link = QuestionEvidenceLink(
-                    question_id=question.id,
-                    evidence_id=eu.id,
-                    relation_type=relation_type,
-                    relevance_score=relevance,
-                )
-                db.add(link)
-                linked_count += 1
-
-                if relation_type == "supports":
-                    supporting += 1
-                elif relation_type == "contradicts":
-                    contradicting += 1
-                else:
-                    background += 1
+            if relation_type == "supports":
+                supporting += 1
+            elif relation_type == "contradicts":
+                contradicting += 1
+            else:
+                background += 1
 
         # (#12) Better coverage score calculation
         total_relevant = supporting + contradicting + background
@@ -128,19 +119,24 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
 
         question.status = new_status
 
-        # (#13) Create new CoverageRecord for this round (snapshot)
-        cr = CoverageRecord(
-            task_id=task_id,
-            question_id=question.id,
-            coverage_score=coverage,
-            confidence=min(1.0, total_relevant * 0.15),
-            supporting_evidence_count=supporting,
-            contradicting_evidence_count=contradicting,
-            direct_neighbor_count=0,
-            unresolved_aspects_json=json.dumps([], ensure_ascii=False),
-            round_number=round_number,
-        )
-        db.add(cr)
+        # (#13) Upsert CoverageRecord. The table has a UNIQUE(task_id,
+        # question_id) constraint, so re-inserting on a later round raises an
+        # IntegrityError; update the existing record in place instead (per-round
+        # history lives in traces).
+        cr = db.query(CoverageRecord).filter(
+            CoverageRecord.task_id == task_id,
+            CoverageRecord.question_id == question.id,
+        ).first()
+        if cr is None:
+            cr = CoverageRecord(task_id=task_id, question_id=question.id)
+            db.add(cr)
+        cr.coverage_score = coverage
+        cr.confidence = min(1.0, total_relevant * 0.15)
+        cr.supporting_evidence_count = supporting
+        cr.contradicting_evidence_count = contradicting
+        cr.direct_neighbor_count = 0
+        cr.unresolved_aspects_json = json.dumps([], ensure_ascii=False)
+        cr.round_number = round_number
 
         # Calculate delta
         prev_score = prev_coverage.get(question.id, 0.0)
@@ -182,14 +178,69 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
     return coverage_deltas
 
 
-def _extract_keywords(question_text: str) -> list[str]:
-    """Extract meaningful keywords from a question (multi-word phrases)."""
-    # Simple: split by common delimiters, filter short words
-    import re
-    words = re.findall(r'\b[a-zA-Z]{4,}\b', question_text.lower())
-    # Also try to extract multi-word phrases
-    phrases = re.findall(r'\b(?:memory|token|budget|oracle|test|graph|neural|network|method|benchmark)\w*', question_text.lower())
-    return list(set(words + phrases))[:15]
+async def _llm_match_evidence(llm, question, evidence_index):
+    """Use the LLM to judge which evidence items are relevant to a question.
+
+    Returns a list of (evidence_index, relation_type, relevance).
+
+    Efficiency: instead of one LLM call per (question, evidence) pair, all
+    evidence claims are presented as a numbered list and the model returns only
+    the relevant indices — one call per batch. This replaces the English-only
+    keyword substring matcher that produced zero matches on Chinese claims.
+
+    On any LLM/parse failure it falls back to the evidence-type heuristic so
+    coverage never silently collapses to zero because of a transient error.
+    """
+    from app.config import settings
+    from app.schemas.schemas import EvidenceMatchList
+
+    if not evidence_index:
+        return []
+
+    batch_size = 40
+    results: list[tuple[int, str, float]] = []
+
+    for batch_start in range(0, len(evidence_index), batch_size):
+        batch = evidence_index[batch_start:batch_start + batch_size]
+        lines = []
+        for i, eu in enumerate(batch):
+            claim = (eu.normalized_claim or "").strip().replace("\n", " ")
+            lines.append(f"{i + 1}. [{eu.evidence_type}] {claim[:200]}")
+        listing = "\n".join(lines)
+
+        system = (
+            "你是严谨的科研证据审阅员。给定一个研究问题和一批编号的证据条目，"
+            "判断每条证据是否与该问题相关。只返回相关的条目，忽略不相关的。"
+            "relation 取值：supports(支持/回答该问题)、contradicts(与问题的假设相矛盾/负面结果)、"
+            "partially_answers(部分回答/指出局限)、background(仅背景相关)。"
+            "relevance 为0-1的相关度。不要编造编号，index 必须来自输入列表。"
+        )
+        user = (
+            f"研究问题：{question.question}\n"
+            f"问题类型：{question.question_type}\n\n"
+            f"证据列表：\n{listing}\n\n"
+            "返回 JSON：{\"matches\":[{\"index\":<编号>,\"relation\":\"...\",\"relevance\":0-1}]}"
+        )
+
+        try:
+            res = await llm.chat_json(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": user}],
+                EvidenceMatchList,
+            )
+            for m in res.matches:
+                idx0 = m.index - 1  # to 0-based within batch
+                if 0 <= idx0 < len(batch):
+                    results.append((batch_start + idx0, m.relation, m.relevance))
+        except Exception as e:
+            logger.warning("LLM evidence match failed for question %s (batch %d): %s; "
+                           "falling back to type heuristic",
+                           question.id[:8], batch_start, e)
+            for i, eu in enumerate(batch):
+                if eu.evidence_type in _get_relevant_evidence_types(question.question_type):
+                    results.append((batch_start + i, _determine_relation(eu, question), 0.4))
+
+    return results
 
 
 def _get_relevant_evidence_types(question_type: str) -> list[str]:
