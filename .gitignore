@@ -21,6 +21,7 @@ env/
 *.db
 *.db-shm
 *.db-wal
+*.db.bak*
 *.sqlite
 *.sqlite3
 
