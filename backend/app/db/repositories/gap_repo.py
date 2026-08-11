@@ -276,7 +276,14 @@ def create_neighbor_comparison(
     overlap_ratio: float = 0.0,
     overlap_risk: float = 0.0,
 ) -> NeighborComparison:
-    """Create a neighbor comparison. Validates task consistency."""
+    """Record how a gap compares to one neighbour paper.
+
+    A (gap, paper) pair holds one current judgement, enforced by a unique
+    constraint, so a re-audit updates that row instead of inserting a second
+    one. Blindly inserting made any second audit of the same gap crash with an
+    IntegrityError, which is exactly what happens when a narrowed gap is
+    re-audited against the same neighbours.
+    """
     gap = db.get(GapCandidate, gap_id)
     if not gap:
         raise ValueError(f"Gap {gap_id} not found")
@@ -285,20 +292,21 @@ def create_neighbor_comparison(
             f"Gap task {gap.task_id} != Comparison task {task_id}"
         )
 
-    comp = NeighborComparison(
-        gap_id=gap_id,
-        paper_id=paper_id,
-        task_id=task_id,
-        similarity_score=similarity_score,
-        shared_problem=shared_problem,
-        shared_mechanism=shared_mechanism,
-        shared_evaluation=shared_evaluation,
-        covered_claims_json=json.dumps(covered_claims or []),
-        uncovered_claims_json=json.dumps(uncovered_claims or []),
-        overlap_ratio=overlap_ratio,
-        overlap_risk=overlap_risk,
-    )
-    db.add(comp)
+    comp = db.query(NeighborComparison).filter(
+        NeighborComparison.gap_id == gap_id,
+        NeighborComparison.paper_id == paper_id,
+    ).first()
+    if comp is None:
+        comp = NeighborComparison(gap_id=gap_id, paper_id=paper_id, task_id=task_id)
+        db.add(comp)
+    comp.similarity_score = similarity_score
+    comp.shared_problem = shared_problem
+    comp.shared_mechanism = shared_mechanism
+    comp.shared_evaluation = shared_evaluation
+    comp.covered_claims_json = json.dumps(covered_claims or [])
+    comp.uncovered_claims_json = json.dumps(uncovered_claims or [])
+    comp.overlap_ratio = overlap_ratio
+    comp.overlap_risk = overlap_risk
     db.flush()
     return comp
 

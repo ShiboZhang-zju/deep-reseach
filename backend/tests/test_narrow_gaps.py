@@ -119,6 +119,37 @@ def test_gap_without_a_concrete_remaining_delta_is_not_narrowed(temp_db):
     db.close()
 
 
+def test_re_auditing_a_gap_updates_the_neighbour_comparison_in_place(temp_db):
+    """A second audit of the same gap/neighbour pair must not violate uniqueness.
+
+    Narrowing makes re-audits actually happen; before this, the second audit of
+    any gap crashed the whole run with an IntegrityError on
+    neighbor_comparisons(gap_id, paper_id).
+    """
+    from app.db.models import Paper
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, contract, gap = _seed_audited_gap(db)
+    paper = Paper(title="Neighbour", abstract="a")
+    db.add(paper)
+    db.flush()
+
+    gap_repo.create_neighbor_comparison(
+        db, gap_id=gap.id, paper_id=paper.id, task_id=task.id,
+        similarity_score=0.4, overlap_ratio=0.3, covered_claims=["generic QA"])
+    gap_repo.create_neighbor_comparison(
+        db, gap_id=gap.id, paper_id=paper.id, task_id=task.id,
+        similarity_score=0.8, overlap_ratio=0.6, covered_claims=["state change"])
+    db.commit()
+
+    comparisons = gap_repo.list_neighbor_comparisons(db, gap.id)
+    assert len(comparisons) == 1
+    assert comparisons[0].similarity_score == 0.8
+    assert "state change" in comparisons[0].covered_claims_json
+    db.close()
+
+
 def test_narrowing_is_capped(temp_db):
     from app.agent.state import ResearchState
     from app.agent.steps.narrow_gaps import MAX_NARROW_ATTEMPTS, narrow_audited_gaps
