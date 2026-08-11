@@ -33,6 +33,9 @@ def _embedding_endpoint() -> str:
 
 
 def _auth_header() -> dict:
+    # A dedicated embedding key (e.g. Aliyun DashScope) takes precedence.
+    if settings.embedding_key:
+        return {"Authorization": f"Bearer {settings.embedding_key}"}
     if settings.openai_api_key and "openai.com" in _embedding_endpoint():
         return {"Authorization": f"Bearer {settings.openai_api_key}"}
     token = settings.env_venus_openapi_secret_id

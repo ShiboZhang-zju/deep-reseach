@@ -1,6 +1,8 @@
 """Application configuration loaded from environment variables."""
 
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,17 +14,56 @@ if not _env_file.exists():
         _env_file = Path("../../.env")
 
 
+@dataclass
+class ModelConfig:
+    """A concrete LLM backend configuration (OpenAI-compatible endpoint).
+
+    base_url must be the OpenAI-compatible root; the provider appends
+    '/chat/completions'. extra_body carries vendor sampling/template params
+    forwarded verbatim to the backend (e.g. local Qwen: top_k,
+    repetition_penalty, chat_template_kwargs.enable_thinking).
+    """
+
+    name: str
+    base_url: str
+    model: str
+    extra_body: dict[str, Any] = field(default_factory=dict)
+
+
+# Project-level model registry. The first entry is the default backend used
+# by the Settings defaults below; .env values still override at runtime.
+MODELS: list[ModelConfig] = [
+    ModelConfig(
+        name="Qwen3.5-397B-A17B",
+        base_url="http://28.251.176.200:8080/openapi",
+        model="Qwen3.5-397B-A17B-W8A8-P800-Functional-Agent",
+        extra_body={
+            "top_k": 50,
+            "repetition_penalty": 1.05,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    ),
+]
+
+_DEFAULT_MODEL = MODELS[0]
+
+
 class Settings(BaseSettings):
     # LLM Provider
     llm_provider: str = "venus"
     env_venus_openapi_secret_id: str = ""
-    venus_llm_proxy_url: str = "http://v2.open.venus.oa.com/llmproxy"
-    venus_llm_model: str = "gpt-4o-2024-11-20"
+    venus_llm_proxy_url: str = _DEFAULT_MODEL.base_url
+    venus_llm_model: str = _DEFAULT_MODEL.model
 
     # OpenAI fallback
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o"
+
+    # Extra request-body params forwarded to the LLM backend (OpenAI-compatible
+    # backends that accept vendor params, e.g. local Qwen: top_k,
+    # repetition_penalty, chat_template_kwargs). JSON object; empty = none.
+    llm_extra_body: dict[str, Any] = dict(_DEFAULT_MODEL.extra_body)
 
     # Paper source API keys / polite-pool emails
     semantic_scholar_api_key: str = ""  # 可选，免费申请: https://www.semanticscholar.org/product/api#api-key-form
@@ -58,6 +99,12 @@ class Settings(BaseSettings):
 
     # RAG / PDF download
     enable_scihub: bool = False  # P0-4: Sci-Hub disabled by default for legal compliance
+    # RAG full-text indexing does synchronous PDF parsing (PyMuPDF/pdfplumber)
+    # which can hard-crash (native segfault, not catchable by try/except) on some
+    # malformed PDFs under Windows. Set to False to skip full-text RAG indexing and
+    # fall back to abstract-only grounding (gap mining relies on extracted Evidence
+    # Units, not on RAG chunks, so the pipeline can still produce gaps/ideas).
+    enable_rag_indexing: bool = True
 
     # O5a: Embedding backend — pluggable so we can use an OpenAI-compatible
     # embedding API (Venus / OpenAI) instead of local sentence-transformers,
@@ -65,13 +112,46 @@ class Settings(BaseSettings):
     # When "api", RAG full-text retrieval is re-enabled on all platforms.
     embedding_backend: str = "api"
     embedding_api_url: str = ""          # OpenAI-compatible embeddings endpoint; empty -> derive from venus_llm_proxy_url
+    embedding_key: str = ""              # dedicated embedding API key (e.g. Aliyun DashScope); falls back to openai/venus if empty
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536            # dimension of the chosen embedding model
-    embedding_batch_size: int = 64
+    embedding_batch_size: int = 10       # Aliyun DashScope caps embeddings batch at 20; keep <=20
     # O7: drop retrieved papers whose title+abstract cosine similarity to the
     # research topic is below this threshold, before they enter the store.
     # Set to 0 to disable prefiltering.
     search_prefilter_min_similarity: float = 0.35
+
+    # Evidence extraction (P0/P1/P2/P4)
+    # Max papers to extract evidence from per round. Lower for quick validation
+    # runs; the historical hard-coded value was 30.
+    evidence_max_papers: int = 30
+    # Papers are processed in batches so that finished papers are committed
+    # (and thus survive a crash/OOM) before the next batch starts. This is the
+    # per-batch size AND the concurrency within a batch.
+    evidence_batch_size: int = 4
+    # Per-paper wall-clock timeout (seconds) for evidence extraction. Prevents a
+    # single slow paper from stalling the whole round. Must be generous enough
+    # for a paper's chunks to finish; with chunk-level concurrency a paper
+    # typically needs a few LLM round-trips, not one per chunk serially.
+    evidence_paper_timeout_s: int = 300
+    # Skip chunks shorter than this many characters (likely references/boilerplate).
+    evidence_min_chunk_chars: int = 200
+    # Cap the number of chunks per paper sent to the LLM (the most information-
+    # dense sections come first). Bounds per-paper cost and latency so a paper
+    # cannot blow the timeout by having dozens of chunks.
+    evidence_max_chunks_per_paper: int = 6
+    # How many chunks of a single paper to extract concurrently. Turns the old
+    # serial per-chunk loop (N x 15s) into ceil(N/concurrency) x 15s.
+    evidence_chunk_concurrency: int = 4
+    # Scoring prefilter: only send the top-N papers (by a cheap heuristic:
+    # citations, recency, source authority) to the LLM for full scoring; the
+    # rest are marked low-priority without an LLM call. 0 disables the prefilter
+    # (score everything). This bounds the very slow LLM scoring stage.
+    score_llm_top_n: int = 40
+    # Background metadata enrichment re-queries S2/OpenAlex for newly found
+    # papers. Without an S2 key these share the same rate-limited quota as the
+    # main search loop and slow it down for little gain. Disable to skip it.
+    enable_metadata_enrichment: bool = True
 
     # Scoring weights (P1-7: authority bumped from 0.25 to 0.30)
     score_weight_relevance: float = 0.25
