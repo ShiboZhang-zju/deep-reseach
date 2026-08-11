@@ -62,6 +62,23 @@ class ConfirmingAuditLLM:
         )
 
 
+class MistypedEvidenceIdAuditLLM:
+    """Returns a sound verdict but corrupts one evidence UUID while copying it."""
+
+    async def chat_json(self, messages, schema):
+        from app.agent.steps.audit_gaps import GapAuditDecisionSchema
+
+        return GapAuditDecisionSchema(
+            audit_result="partially_closed",
+            recommended_action="narrow",
+            remaining_delta="近邻覆盖了长程评测，但没有定义固定预算下的状态变化边界指标。",
+            nearest_neighbor_summary="近邻覆盖长程评测与多轴指标。",
+            evidence_for_gap_ids=["e3024371-a441-44a2-b4-a40c-f879938efa05"],
+            novelty_confidence=0.7,
+            audit_confidence=0.7,
+        )
+
+
 class MalformedAuditLLM:
     """Returns a decision whose recommended_action is outside the contract."""
 
@@ -144,6 +161,38 @@ async def test_confirmed_audit_creates_comparison_and_survives(temp_db):
     assert gap_repo.get_gap(db, gap.id).status == "surviving"
     assert len(gap_repo.list_neighbor_comparisons(db, gap.id)) == 1
     assert gap_repo.list_gap_audits(db, gap.id)[0].recommended_action == "continue"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_mistyped_evidence_id_does_not_discard_a_sound_verdict(temp_db):
+    """A miscopied evidence UUID is an annotation defect, not a bad verdict.
+
+    Production case (task 3286cf05): the model wrote
+    ...-44a2-b4-... instead of ...-42b4-..., and a complete partially_closed
+    verdict with a concrete remaining delta was thrown away as uncertain.
+    """
+    from app.agent.state import ResearchState
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.models import AgentTrace
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+
+    results = await audit_gap_candidates(db, state, MistypedEvidenceIdAuditLLM(), task.id,
+                                         perform_search=True)
+
+    assert [item.audit_result for item in results] == ["partially_closed"]
+    audit = gap_repo.list_gap_audits(db, gap.id)[-1]
+    assert audit.recommended_action == "narrow"
+    assert audit.remaining_delta, "the usable part of the verdict must be kept"
+    assert not (audit.rejection_reason or ""), "this is not a contract violation"
+    trace = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "gap_audit_dropped_evidence_ids").one()
+    assert "e3024371-a441-44a2-b4-a40c-f879938efa05" in trace.output_json
     db.close()
 
 

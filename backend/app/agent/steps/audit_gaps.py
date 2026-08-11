@@ -50,7 +50,10 @@ recommended_action must be exactly one of these four values, and nothing else:
 - "reject" for a closed gap;
 - "more_search" when the decision is uncertain.
 
-For each neighbor, compare only the supplied gap claims and paper content. Do not invent papers or evidence IDs."""
+For each neighbor, compare only the supplied gap claims and paper content. Do not invent papers or evidence IDs.
+evidence_for_gap_ids and evidence_against_gap_ids may only contain IDs copied verbatim
+from the gap's supporting/contradicting evidence lists; neighbor paper IDs are not
+evidence IDs and must never appear there. Copy every ID character by character."""
 
 _AUDIT_USER = """Candidate gap:
 - ID: {gap_id}
@@ -367,7 +370,7 @@ async def audit_gap_candidate(
     ], GapAuditDecisionSchema)
 
     try:
-        _validate_audit_decision(decision, gap, neighbors, db)
+        dropped_evidence_ids = _validate_audit_decision(decision, gap, neighbors, db)
     except AuditDecisionInvalid as err:
         # A malformed decision is a failure of this one audit, not of the run.
         # Raising here used to abort the whole task and discard every gap,
@@ -393,9 +396,16 @@ async def audit_gap_candidate(
         })
         db.commit()
         return GapAuditResult(gap.id, "uncertain", "more_search", "")
+    if dropped_evidence_ids:
+        logger.warning("Gap %s: dropped %d unusable evidence ID(s) from the audit "
+                       "decision: %s", gap.id[:8], len(dropped_evidence_ids),
+                       dropped_evidence_ids)
+        paper_repo.save_trace(db, task_id, "gap_audit_dropped_evidence_ids", "decision",
+                              output_data={"gap_id": gap.id,
+                                           "dropped_evidence_ids": dropped_evidence_ids,
+                                           "audit_result": decision.audit_result})
     for comparison in decision.comparisons:
-        gap_repo.create_neighbor_comparison(
-            db,
+        gap_repo.create_neighbor_comparison(            db,
             gap_id=gap.id,
             paper_id=comparison.paper_id,
             task_id=task_id,
@@ -480,8 +490,19 @@ def _gap_evidence_ids(db, gap_id: str, relation_type: str) -> list[str]:
     ]
 
 
-def _validate_audit_decision(decision, gap, neighbors, db) -> None:
-    """Enforce the audit contract, naming the offending value on failure."""
+def _validate_audit_decision(decision, gap, neighbors, db) -> list[str]:
+    """Enforce the audit contract, naming the offending value on failure.
+
+    Returns the evidence IDs that were dropped as unusable. The distinction is
+    deliberate: a comparison is bound to one specific neighbour paper, so a wrong
+    paper ID would attach a verdict to the wrong work and must invalidate the
+    decision. The evidence_for/against lists are supporting annotations — the
+    verdict rests on audit_result, remaining_delta and the per-neighbour
+    comparisons — so an unusable ID there is dropped and recorded instead of
+    discarding an otherwise sound audit. Observed in production: a model copied
+    one UUID with a corrupted segment (…-44a2-b4-… instead of …-42b4-…) and a
+    complete partially_closed verdict was downgraded to uncertain because of it.
+    """
     if decision.audit_result not in {"confirmed", "partially_closed", "closed", "uncertain"}:
         raise AuditDecisionInvalid(f"invalid audit_result: {decision.audit_result!r}")
     if decision.recommended_action not in {"continue", "narrow", "more_search", "reject"}:
@@ -494,8 +515,12 @@ def _validate_audit_decision(decision, gap, neighbors, db) -> None:
         raise AuditDecisionInvalid(
             f"comparison cites unknown neighbor paper(s): {unknown_papers}")
     valid_evidence_ids = {link.evidence_id for link in gap_repo.list_gap_evidence(db, gap.id)}
-    unknown_evidence = sorted(
+    dropped = sorted(
         set(decision.evidence_for_gap_ids + decision.evidence_against_gap_ids)
         - valid_evidence_ids)
-    if unknown_evidence:
-        raise AuditDecisionInvalid(f"unknown evidence ID(s): {unknown_evidence}")
+    if dropped:
+        decision.evidence_for_gap_ids = [item for item in decision.evidence_for_gap_ids
+                                        if item in valid_evidence_ids]
+        decision.evidence_against_gap_ids = [item for item in decision.evidence_against_gap_ids
+                                            if item in valid_evidence_ids]
+    return dropped
