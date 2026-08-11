@@ -8,7 +8,16 @@ from app.db.models import ResearchTask
 from app.agent.state import ResearchState
 
 
-def create_task(db: Session, user_input: str, max_rounds: int = 5) -> ResearchTask:
+def create_task(db: Session, user_input: str, max_rounds: int | None = None) -> ResearchTask:
+    """Create a pending task.
+
+    max_rounds defaults to settings.max_rounds (MAX_ROUNDS in .env) instead of a
+    hard-coded constant, otherwise the configured round budget is silently
+    ignored for every task created through the API.
+    """
+    if max_rounds is None:
+        from app.config import settings
+        max_rounds = settings.max_rounds
     task = ResearchTask(user_input=user_input, status="pending", max_rounds=max_rounds)
     state = ResearchState(user_input=user_input)
     task.state_json = state.to_json()

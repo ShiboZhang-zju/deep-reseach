@@ -197,7 +197,7 @@ def start_agent(task_id: str) -> bool:
                        task_id[:8], settings.max_concurrent_agents)
         return False  # rejected — caller should return 429
 
-    AGENT_TIMEOUT = 3600  # P4-1: increased from 1800 to 3600 (60 min) to avoid timeout on retry
+    AGENT_TIMEOUT = settings.agent_timeout_seconds
 
     async def _run():
         sem = _get_agent_semaphore()
@@ -337,6 +337,12 @@ async def run_task(task_id: str):
     try:
         state = task_repo.get_state(db, task_id)
         llm = get_llm()
+        # A resumed task still carries the stop_reason of the run that ended
+        # (e.g. "interrupted_by_restart", or a previous terminal reason).
+        # Leaving it in place makes the API/UI report a stale terminal reason
+        # while the task is in fact running again.
+        task_repo.update_stop_reason(db, task_id, "")
+        db.commit()
         # High-priority #3: enforce a per-task LLM budget so cost is bounded and
         # a runaway task degrades gracefully instead of hard-failing/timing out.
         if hasattr(llm, "set_budget"):
@@ -472,6 +478,17 @@ async def run_task(task_id: str):
 
             if readiness.status == "failed":
                 logger.error("Task %s: readiness gate FAILED — %s", task_id[:8], readiness.reason)
+                # Even a hard control-plane failure should hand the user
+                # whatever was actually collected (papers, evidence, coverage)
+                # instead of dying silently. Best-effort: never let brief
+                # generation mask the real failure reason.
+                try:
+                    await generate_landscape_brief(
+                        db, state, task_id, "failed", f"readiness_failed: {readiness.reason}")
+                except Exception as brief_err:
+                    logger.warning("Task %s: landscape brief on readiness failure "
+                                   "could not be generated (non-fatal): %s",
+                                   task_id[:8], brief_err)
                 task_repo.update_status(db, task_id, "failed")
                 task_repo.update_stop_reason(db, task_id, f"readiness_failed: {readiness.reason}")
                 emit_event(task_id, "error", {

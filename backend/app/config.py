@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     # Concurrency limits (P0-1: prevent SQLite write contention)
     max_concurrent_agents: int = 2
 
+    # Hard wall-clock budget for one agent run. Evidence extraction dominates
+    # runtime (roughly 1 min per paper with a local model), so a run with a
+    # wide evidence budget can legitimately exceed one hour; making this
+    # configurable avoids losing a whole run to a hard-coded ceiling. Progress
+    # is committed incrementally, so a timed-out task can be resumed.
+    agent_timeout_seconds: int = 3600
+
     # LLM budget per task (0 = unlimited). When exceeded, the runner degrades
     # gracefully to existing output (emits a landscape brief) instead of
     # running unbounded cost or hard-failing.
