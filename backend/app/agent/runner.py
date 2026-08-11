@@ -50,6 +50,7 @@ from app.agent.steps import (
 )
 from app.agent.steps.analyze_papers import analyze_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
+from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION
 from app.llm.factory import get_llm
 from app.llm.base import LLMBudgetExceeded
 from app.services.event_service import emit_event, emit_event_with_cleanup
@@ -662,6 +663,10 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             "round": state.current_round,
             "pipeline_version": state.pipeline_version,
             "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+            # The audit's own policy governs its behaviour, so it belongs here for
+            # the same reason mining includes its policy: changing the audit rules
+            # must invalidate a previously stamped audit run.
+            "gap_search_policy_version": GAP_SEARCH_POLICY_VERSION,
         }, sort_keys=True).encode()).hexdigest()
         await phase_service.execute_phase(
             db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
