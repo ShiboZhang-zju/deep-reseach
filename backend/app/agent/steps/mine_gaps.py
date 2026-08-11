@@ -49,7 +49,10 @@ def _is_fulltext_locatable(item: EvidenceUnit) -> bool:
     )
 
 def evaluate_gap_mining_admission(question, links, evidence_by_id) -> QuestionEvidenceAdmission:
-    if question.status not in {"open", "partially_covered"}:
+    # "covered" is eligible: it means the question is well evidenced, which is a
+    # prerequisite for claiming a gap, not a reason to exclude it. Only questions
+    # retired from the active set (e.g. superseded) are ineligible here.
+    if question.status not in {"open", "partially_covered", "covered"}:
         return QuestionEvidenceAdmission(question.id, "FAIL", ["QUESTION_NOT_ELIGIBLE"])
     if not links:
         return QuestionEvidenceAdmission(question.id, "UNKNOWN", ["NO_LINKED_EVIDENCE"])
@@ -197,10 +200,24 @@ async def mine_gap_candidates(
         state.active_gap_ids = [gap.id for gap in existing if gap.status != "rejected"]
         return existing
 
+    # A gap can only be claimed where the existing work is understood, so the
+    # questions with the *most* evidence are the ones worth mining. Restricting
+    # this to open/partially_covered questions inverted that: `update_coverage`
+    # marks a question "covered" once evidence accumulates, so the best-supported
+    # questions were excluded and mining ran on the weakest ones. Observed on a
+    # real run: 10 active questions, 8 high-importance ones covered, 191 evidence
+    # units — yet only the single question at 0.15 coverage was mined, yielding
+    # one fragile candidate that the audit could not confirm, which then burned a
+    # remediation round. "covered" means well-evidenced, not gap-free.
+    #
+    # Quality is still enforced per question by evaluate_gap_mining_admission
+    # (distinct papers, verified spans, limitation-type evidence), so widening
+    # the pool lets that gate do its job instead of pre-filtering on a signal
+    # that means the opposite of what mining needs.
     questions = db.query(ResearchQuestion).filter(
         ResearchQuestion.task_id == task_id,
         ResearchQuestion.contract_id == contract.id,
-        ResearchQuestion.status.in_(["open", "partially_covered"]),
+        ResearchQuestion.status.in_(["open", "partially_covered", "covered"]),
     ).order_by(ResearchQuestion.importance.desc()).all()
     if not questions:
         return []

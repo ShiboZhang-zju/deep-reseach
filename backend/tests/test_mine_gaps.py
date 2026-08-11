@@ -115,6 +115,69 @@ async def test_mine_gap_creates_traceable_candidate(temp_db):
 
 
 @pytest.mark.asyncio
+async def test_well_evidenced_covered_question_is_mined(temp_db):
+    """A "covered" question is the best gap material, not a reason to skip it.
+
+    Mining used to filter on status in (open, partially_covered), but
+    update_coverage marks a question "covered" precisely when evidence has
+    accumulated. On a real run that excluded 9 of 10 questions (191 evidence
+    units) and mined only the weakest one at 0.15 coverage.
+    """
+    from app.agent.state import ResearchState
+    from app.agent.steps.mine_gaps import mine_gap_candidates
+    from app.db.models import (EvidenceUnit, Paper, QuestionEvidenceLink, ResearchContract,
+                               ResearchQuestion, ResearchTask)
+
+    db = temp_db()
+    task = ResearchTask(user_input="agent memory", status="mining_gaps")
+    db.add(task)
+    db.flush()
+    contract = ResearchContract(task_id=task.id, topic="Agent Memory", status="active",
+                                version=1, input_hash="contract-v1")
+    db.add(contract)
+    db.flush()
+    question = ResearchQuestion(
+        task_id=task.id, contract_id=contract.id,
+        question="固定预算下状态变化会如何影响记忆系统？",
+        question_type="failure", importance=0.9, searchability=0.8,
+        status="covered",
+    )
+    db.add(question)
+    db.flush()
+    first_paper = Paper(title="Evidence Paper A")
+    second_paper = Paper(title="Evidence Paper B")
+    db.add_all([first_paper, second_paper])
+    db.flush()
+    evidence = EvidenceUnit(
+        task_id=task.id, paper_id=first_paper.id, evidence_type="limitation",
+        normalized_claim="在状态变化后，固定预算记忆会遗漏关键历史证据。",
+        original_span="状态变化后会遗漏关键证据", section="Limitations", page_number=8,
+        span_start=10, span_end=22, source_chunk_hash="test-fulltext",
+        verification_status="verified", extraction_confidence=0.8,
+    )
+    second_evidence = EvidenceUnit(
+        task_id=task.id, paper_id=second_paper.id, evidence_type="comparison",
+        normalized_claim="现有评测未覆盖状态变化边界。", verification_status="abstract_only",
+    )
+    db.add_all([evidence, second_evidence])
+    db.flush()
+    db.add_all([
+        QuestionEvidenceLink(question_id=question.id, evidence_id=evidence.id,
+                             relation_type="supports", relevance_score=0.9),
+        QuestionEvidenceLink(question_id=question.id, evidence_id=second_evidence.id,
+                             relation_type="supports", relevance_score=0.9),
+    ])
+    db.commit()
+    state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=2)
+
+    gaps = await mine_gap_candidates(db, state, FakeGapLLM(), task.id)
+
+    assert len(gaps) == 1, "a covered question with strong evidence must be mined"
+    assert gaps[0].provenance_status == "complete"
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_mine_gap_rejects_hallucinated_ids(temp_db):
     from app.agent.state import ResearchState
     from app.agent.steps.mine_gaps import mine_gap_candidates
