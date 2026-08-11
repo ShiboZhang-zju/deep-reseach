@@ -75,13 +75,13 @@ class ScriptedLLM:
 
 
 @pytest.mark.asyncio
-async def test_opportunity_pipeline_is_lineage_safe_and_idempotent(temp_db):
+async def test_opportunity_pipeline_is_lineage_safe_and_idempotent(temp_db, monkeypatch):
     from app.agent.state import ResearchState
     from app.agent.steps.audit_gaps import audit_gap_candidates
     from app.agent.steps.generate_interventions import generate_interventions
     from app.agent.steps.generate_minimal_experiments import generate_minimal_experiments
     from app.agent.steps.mine_gaps import mine_gap_candidates
-    from app.db.models import EvidenceUnit, Paper, QuestionEvidenceLink, ResearchContract, ResearchIdea, ResearchQuestion, ResearchTask, TaskPaper
+    from app.db.models import EvidenceUnit, Paper, QuestionEvidenceLink, ResearchContract, ResearchIdea, ResearchQuestion, ResearchTask, SearchQueryPaper, TaskPaper
 
     db = temp_db()
     task = ResearchTask(user_input="agent memory")
@@ -106,17 +106,44 @@ async def test_opportunity_pipeline_is_lineage_safe_and_idempotent(temp_db):
         QuestionEvidenceLink(question_id=question.id, evidence_id=evidence.id, relation_type="supports", relevance_score=0.9),
         QuestionEvidenceLink(question_id=question.id, evidence_id=second_evidence.id, relation_type="supports", relevance_score=0.9),
     ])
+    # Neighbours the adversarial gap search is expected to surface. They must be
+    # distinct from the papers backing the gap, otherwise admission reports
+    # NO_EXTERNAL_NEIGHBOR. Three of them satisfy the strict (non-constrained)
+    # admission threshold as well.
+    neighbour_papers = [
+        Paper(title=f"Adversarial Neighbor {index}", abstract="Generic memory benchmark without state changes")
+        for index in range(3)
+    ]
+    db.add_all(neighbour_papers)
     db.commit()
+    neighbour_ids = [item.id for item in neighbour_papers]
+
+    async def _fake_gap_search(db, state, executions, task_id, round_number):
+        """Stand in for the live search layer: mark every adversarial query
+        completed and attach the neighbour papers, so the gap-search admission
+        gate is exercised on realistic data instead of being short-circuited."""
+        from app.db.repositories.search_query_repo import update_query_results
+        for execution in executions:
+            update_query_results(db, execution.query_id, len(neighbour_ids), 0, status="completed")
+            for rank, paper_id in enumerate(neighbour_ids, start=1):
+                db.add(SearchQueryPaper(query_id=execution.query_id, paper_id=paper_id,
+                                        rank=rank, source="openalex", is_new_for_task=False))
+        db.commit()
+
+    monkeypatch.setattr("app.agent.steps.audit_gaps.search_and_save_papers", _fake_gap_search)
 
     state = ResearchState(task_id=task.id, contract_id=contract.id, pipeline_version=2, current_round=1)
     llm = ScriptedLLM()
     gaps = await mine_gap_candidates(db, state, llm, task.id)
-    audits = await audit_gap_candidates(db, state, llm, task.id, perform_search=False)
+    audits = await audit_gap_candidates(db, state, llm, task.id)
     interventions = await generate_interventions(db, state, llm, task.id)
     experiments = await generate_minimal_experiments(db, state, llm, task.id)
 
-    idea = db.get(ResearchIdea, experiments.idea_ids[0])
+    assert [item.audit_result for item in audits] == ["confirmed"], (
+        "gap audit must reach a decision once adversarial search admission passes"
+    )
     assert len(gaps) == len(audits) == len(interventions.passed_intervention_ids) == len(experiments.idea_ids) == 1
+    idea = db.get(ResearchIdea, experiments.idea_ids[0])
     assert idea.contract_id == contract.id
     assert idea.gap_id == gaps[0].id
     assert idea.intervention_id == interventions.passed_intervention_ids[0]

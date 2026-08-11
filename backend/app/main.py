@@ -2,6 +2,7 @@
 
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,16 +26,28 @@ if os.environ.get("AUTO_CREATE_SCHEMA", "false").lower() == "true":
 else:
     logger.info("Schema managed by Alembic. Run 'alembic upgrade head' to create/update tables.")
 
-# Recover tasks interrupted by process crash/restart
-try:
-    recover_interrupted_tasks()
-except Exception as e:
-    logger.error("Failed to recover interrupted tasks on startup: %s", e)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Recover tasks interrupted by a process crash/restart.
+
+    This must run on server startup, NOT at import time: importing this module
+    (which any test or CLI script doing `from app.main import app` does) would
+    otherwise rewrite task rows — including marking a currently running task's
+    phases as interrupted.
+    """
+    try:
+        recover_interrupted_tasks()
+    except Exception as e:
+        logger.error("Failed to recover interrupted tasks on startup: %s", e)
+    yield
+
 
 app = FastAPI(
     title="Deep Research API",
     description="AI Agent for automated research: multi-source paper search, scoring, report generation, and idea generation.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS
