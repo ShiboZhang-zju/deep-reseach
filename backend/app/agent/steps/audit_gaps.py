@@ -39,6 +39,12 @@ A gap is:
 - closed when a neighbor covers the core problem, capability, and evaluation claim;
 - uncertain when the supplied evidence cannot decide.
 
+recommended_action must be exactly one of these four values, and nothing else:
+- "continue" for a confirmed gap;
+- "narrow" for a partially_closed gap;
+- "reject" for a closed gap;
+- "more_search" when the decision is uncertain.
+
 For each neighbor, compare only the supplied gap claims and paper content. Do not invent papers or evidence IDs."""
 
 _AUDIT_USER = """Candidate gap:
@@ -73,8 +79,14 @@ class NeighborAuditSchema(BaseModel):
 
 
 class GapAuditDecisionSchema(BaseModel):
-    audit_result: str
-    recommended_action: str
+    # Kept as plain strings on purpose: the provider injects this schema into the
+    # prompt, so the allowed values are stated here, but an out-of-contract value
+    # must reach _validate_audit_decision (which degrades a single gap) instead of
+    # raising a ValidationError that would abort the whole run.
+    audit_result: str = Field(
+        description="One of: confirmed, partially_closed, closed, uncertain")
+    recommended_action: str = Field(
+        description="One of: continue, narrow, more_search, reject")
     remaining_delta: str = ""
     nearest_neighbor_summary: str = ""
     differentiation_summary: str = ""
