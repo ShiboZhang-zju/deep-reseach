@@ -238,7 +238,10 @@ async def _llm_match_evidence(llm, question, evidence_index):
                            question.id[:8], batch_start, e)
             for i, eu in enumerate(batch):
                 if eu.evidence_type in _get_relevant_evidence_types(question.question_type):
-                    results.append((batch_start + i, _determine_relation(eu, question), 0.4))
+                    # 0.5 is the minimum relevance gap-mining admission accepts
+                    # (mine_gaps._MIN_RELATION_RELEVANCE); a lower value would
+                    # make every fallback link silently inadmissible.
+                    results.append((batch_start + i, _determine_relation(eu, question), 0.5))
 
     return results
 

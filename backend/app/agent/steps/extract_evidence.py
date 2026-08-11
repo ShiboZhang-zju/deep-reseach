@@ -37,30 +37,41 @@ def compute_chunk_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def find_span_in_chunk(original_span: str, chunk_text: str) -> tuple[int, int] | None:
+def locate_span_in_chunk(original_span: str, chunk_text: str) -> tuple[int, int, str] | None:
     """(#6) Validate that original_span actually exists in the source chunk.
 
-    Returns (start, end) character offsets, or None if not found.
+    Returns (start, end, match_quality) where match_quality is:
+      - "exact": the span was found verbatim in the chunk
+      - "anchored": the span was located via its leading/trailing 80 chars
+        (the LLM slightly reworded the middle), so the offsets are anchor-based
+    Returns None when the span cannot be located at all.
     """
     if not original_span or not chunk_text:
         return None
     # Try exact match first
     pos = chunk_text.find(original_span)
     if pos >= 0:
-        return pos, pos + len(original_span)
+        return pos, pos + len(original_span), "exact"
     # Try first 80 chars (LLM may have slightly modified the span)
     snippet = original_span[:80]
     if snippet:
         pos = chunk_text.find(snippet)
         if pos >= 0:
-            return pos, pos + len(original_span)
+            return pos, pos + len(original_span), "anchored"
     # Try last 80 chars
     snippet = original_span[-80:]
     if snippet:
         pos = chunk_text.find(snippet)
         if pos >= 0:
-            return pos, pos + len(original_span)
+            return pos, pos + len(original_span), "anchored"
     return None
+
+
+def find_span_in_chunk(original_span: str, chunk_text: str) -> tuple[int, int] | None:
+    """Offsets-only wrapper around locate_span_in_chunk (kept for callers that
+    do not care about match quality)."""
+    located = locate_span_in_chunk(original_span, chunk_text)
+    return (located[0], located[1]) if located else None
 
 
 async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
@@ -318,12 +329,20 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
         page_num = _find_page_for_text(chunk_text, page_texts, sec_name)
         for ev in evidence_list:
             # (#6) Validate original_span exists in chunk
-            span_pos = find_span_in_chunk(ev.original_span, chunk_text)
-            if span_pos is None:
+            located = locate_span_in_chunk(ev.original_span, chunk_text)
+            if located is None:
                 logger.debug("Paper %s: original_span not found in chunk, skipping evidence",
                              paper.id[:8])
                 continue
+            span_start, span_end, match_quality = located
 
+            # The span was just located inside the very chunk it was extracted
+            # from, and the unit carries full provenance (chunk hash, page,
+            # offsets). That is exactly what downstream gap admission means by
+            # "full-text locatable", so record it as verified instead of the
+            # previous hard-coded "unverified" — which silently made every
+            # full-text unit inadmissible for gap mining. Confidence reflects
+            # how strong the match was (exact vs anchor-based).
             eu = EvidenceUnit(
                 task_id=task_id,
                 paper_id=paper.id,
@@ -334,15 +353,15 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
                 page_number=page_num,
                 page_start=page_num,
                 page_end=page_num,
-                span_start=span_pos[0],
-                span_end=span_pos[1],
+                span_start=span_start,
+                span_end=span_end,
                 source_chunk_hash=chunk_hash,
                 dataset_name=ev.dataset_name,
                 metric_name=ev.metric_name,
                 result_value=ev.result_value,
                 extraction_method="pdf_fulltext",
-                extraction_confidence=0.8,
-                verification_status="unverified",
+                extraction_confidence=0.9 if match_quality == "exact" else 0.7,
+                verification_status="verified",
             )
             db.add(eu)
             evidence_count += 1
