@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 _INTERVENTION_SYSTEM = """You design bounded research interventions for an audited research gap.
 Generate 1-3 interventions, not full paper ideas. Each intervention must explicitly connect:
 Observed problem -> failure mechanism -> intervention -> intermediate effect -> measurable outcome.
-Do not invent papers, datasets, or evidence IDs. Use only dependency paper IDs supplied in the context."""
+Do not invent papers, datasets, or evidence IDs.
+dependency_paper_ids may only contain IDs taken verbatim from the "Neighbor paper IDs"
+list in the context; the "Evidence IDs" are evidence units, not papers, and must never
+appear there. Leave dependency_paper_ids empty when no neighbor paper is required."""
 
 _INTERVENTION_USER = """Surviving gap:
 - ID: {gap_id}
@@ -80,6 +83,7 @@ async def generate_interventions(
 
     created_ids = []
     passed_ids = []
+    dropped_dependencies = []
     gaps = db.query(GapCandidate).filter(
         GapCandidate.task_id == task_id,
         GapCandidate.contract_id == contract.id,
@@ -110,9 +114,23 @@ async def generate_interventions(
             )},
         ], InterventionList)
         for candidate in result.interventions:
-            if not set(candidate.dependency_paper_ids).issubset(set(neighbor_ids)):
-                logger.warning("Task %s: skip intervention with unknown dependency paper", task_id[:8])
-                continue
+            # dependency_paper_ids is supporting context, not the basis of the
+            # intervention's validity (the three hard gates below decide that).
+            # Discarding the whole intervention over one unoffered ID threw away
+            # otherwise sound proposals — observed in production, where every
+            # intervention for a surviving gap was dropped this way and the run
+            # ended with no idea at all. Drop the unoffered IDs and record them.
+            unoffered = [item for item in candidate.dependency_paper_ids
+                         if item not in set(neighbor_ids)]
+            if unoffered:
+                candidate.dependency_paper_ids = [
+                    item for item in candidate.dependency_paper_ids
+                    if item in set(neighbor_ids)]
+                dropped_dependencies.append({"gap_id": gap.id, "dropped_paper_ids": unoffered})
+                logger.warning(
+                    "Task %s: dropped %d unoffered dependency paper ID(s) from an "
+                    "intervention for gap %s: %s",
+                    task_id[:8], len(unoffered), gap.id[:8], unoffered)
             gates = _evaluate_hard_gates(gap, latest_audit, evidence_ids, candidate, contract)
             tier = _compute_confidence_tier(gap, gates["gate_statuses"])
             item = intervention_repo.create_intervention_candidate(db, task_id, gap.id, {
@@ -136,6 +154,7 @@ async def generate_interventions(
         "surviving_gap_count": len(gaps),
         "intervention_count": len(created_ids),
         "passed_gate_count": len(passed_ids),
+        "dropped_dependency_paper_ids": dropped_dependencies,
     })
     db.commit()
     return InterventionGenerationResult(created_ids, passed_ids)
