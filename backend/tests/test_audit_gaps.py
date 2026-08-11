@@ -62,6 +62,20 @@ class ConfirmingAuditLLM:
         )
 
 
+class MalformedAuditLLM:
+    """Returns a decision whose recommended_action is outside the contract."""
+
+    async def chat_json(self, messages, schema):
+        from app.agent.steps.audit_gaps import GapAuditDecisionSchema
+
+        return GapAuditDecisionSchema(
+            audit_result="confirmed",
+            recommended_action="proceed_to_experiment",
+            novelty_confidence=0.8,
+            audit_confidence=0.8,
+        )
+
+
 class UncertainAuditLLM:
     async def chat_json(self, messages, schema):
         from app.agent.steps.audit_gaps import GapAuditDecisionSchema
@@ -130,6 +144,40 @@ async def test_confirmed_audit_creates_comparison_and_survives(temp_db):
     assert gap_repo.get_gap(db, gap.id).status == "surviving"
     assert len(gap_repo.list_neighbor_comparisons(db, gap.id)) == 1
     assert gap_repo.list_gap_audits(db, gap.id)[0].recommended_action == "continue"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_audit_decision_degrades_one_gap_instead_of_failing_the_run(temp_db):
+    """A decision outside the audit contract must not abort the whole task.
+
+    Production case (task 5e040ad5): the first run that ever produced gap
+    candidates died with ValueError("Invalid recommended action"), discarding
+    259 evidence units and every downstream artefact.
+    """
+    from app.agent.state import ResearchState
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.models import AgentTrace
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+
+    results = await audit_gap_candidates(db, state, MalformedAuditLLM(), task.id,
+                                         perform_search=True)
+
+    assert [item.audit_result for item in results] == ["uncertain"]
+    assert state.surviving_gap_ids == []
+    assert gap_repo.get_gap(db, gap.id).status == "auditing"
+    audit = gap_repo.list_gap_audits(db, gap.id)[0]
+    assert audit.recommended_action == "more_search"
+    assert "proceed_to_experiment" in (audit.rejection_reason or ""), (
+        "the offending value must be recorded for diagnosis"
+    )
+    assert db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "gap_audit_invalid_decision").count() == 1
     db.close()
 
 

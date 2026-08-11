@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 _MAX_NEIGHBORS = 5
 GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v1"
 
+
+class AuditDecisionInvalid(ValueError):
+    """The model returned an audit decision that violates the audit contract.
+
+    Kept distinct from other errors so that one malformed decision degrades a
+    single gap's audit instead of aborting the whole research run.
+    """
+
+
 _AUDIT_SYSTEM = """You are conducting an adversarial research-gap audit.
 Your job is to find whether the supplied neighboring papers already close the candidate gap.
 Do not infer novelty from absence alone. Return uncertain when the evidence is insufficient.
@@ -276,7 +285,33 @@ async def audit_gap_candidate(
         )},
     ], GapAuditDecisionSchema)
 
-    _validate_audit_decision(decision, gap, neighbors, db)
+    try:
+        _validate_audit_decision(decision, gap, neighbors, db)
+    except AuditDecisionInvalid as err:
+        # A malformed decision is a failure of this one audit, not of the run.
+        # Raising here used to abort the whole task and discard every gap,
+        # every piece of evidence and the entire report. Degrade this gap to
+        # uncertain (the same outcome as a blocked search admission) and record
+        # what was wrong, so the remaining gaps still get audited and a later
+        # round can retry.
+        logger.warning("Gap %s: rejecting malformed audit decision (%s)", gap.id[:8], err)
+        gap.status = "auditing"
+        gap_repo.create_gap_audit(
+            db, gap_id=gap.id, task_id=task_id, adversarial_queries=queries,
+            audit_result="uncertain", neighbor_paper_ids=[paper.id for paper in neighbors],
+            recommended_action="more_search", audit_round=audit_round,
+            rejection_reason=f"invalid_audit_decision: {err}",
+            search_policy_version=GAP_SEARCH_POLICY_VERSION,
+            search_admission_status=admission.status,
+            search_admission_reasons=admission.reason_codes, search_query_ids=admission.query_ids,
+        )
+        paper_repo.save_trace(db, task_id, "gap_audit_invalid_decision", "decision", output_data={
+            "gap_id": gap.id, "error": str(err),
+            "audit_result": decision.audit_result,
+            "recommended_action": decision.recommended_action,
+        })
+        db.commit()
+        return GapAuditResult(gap.id, "uncertain", "more_search", "")
     for comparison in decision.comparisons:
         gap_repo.create_neighbor_comparison(
             db,
@@ -365,13 +400,21 @@ def _gap_evidence_ids(db, gap_id: str, relation_type: str) -> list[str]:
 
 
 def _validate_audit_decision(decision, gap, neighbors, db) -> None:
+    """Enforce the audit contract, naming the offending value on failure."""
     if decision.audit_result not in {"confirmed", "partially_closed", "closed", "uncertain"}:
-        raise ValueError("Invalid audit result")
+        raise AuditDecisionInvalid(f"invalid audit_result: {decision.audit_result!r}")
     if decision.recommended_action not in {"continue", "narrow", "more_search", "reject"}:
-        raise ValueError("Invalid recommended action")
+        raise AuditDecisionInvalid(
+            f"invalid recommended_action: {decision.recommended_action!r}")
     valid_paper_ids = {paper.id for paper in neighbors}
-    if any(item.paper_id not in valid_paper_ids for item in decision.comparisons):
-        raise ValueError("Audit contains a comparison for an unknown neighbor paper")
+    unknown_papers = sorted({item.paper_id for item in decision.comparisons
+                             if item.paper_id not in valid_paper_ids})
+    if unknown_papers:
+        raise AuditDecisionInvalid(
+            f"comparison cites unknown neighbor paper(s): {unknown_papers}")
     valid_evidence_ids = {link.evidence_id for link in gap_repo.list_gap_evidence(db, gap.id)}
-    if not set(decision.evidence_for_gap_ids + decision.evidence_against_gap_ids).issubset(valid_evidence_ids):
-        raise ValueError("Audit contains an unknown evidence ID")
+    unknown_evidence = sorted(
+        set(decision.evidence_for_gap_ids + decision.evidence_against_gap_ids)
+        - valid_evidence_ids)
+    if unknown_evidence:
+        raise AuditDecisionInvalid(f"unknown evidence ID(s): {unknown_evidence}")
