@@ -116,6 +116,9 @@ For every gap:
 - cite only supplied question IDs and evidence IDs;
 - every evidence ID you cite must list one of the gap's question IDs under
   "Linked questions", so the gap stays grounded in the questions it claims;
+- cite evidence from at least two different papers (see "Paper ID");
+- cite at least one evidence unit whose Type is "limitation" or
+  "negative_result": a gap needs a documented shortcoming, not only comparisons;
 - state what existing work already covers and the smallest missing capability;
 - write a falsifiable condition that would close the gap;
 - do not propose a solution or invent paper findings.
@@ -138,10 +141,11 @@ def _format_evidence(evidence: list[EvidenceUnit],
                      question_ids_by_evidence: dict[str, list[str]] | None = None) -> str:
     """Render the evidence block.
 
-    `question_ids_by_evidence` exposes which admitted questions each evidence
-    unit is linked to. Without it the model cannot know the evidence-to-question
-    mapping that downstream validation enforces, and legitimate candidates get
-    discarded as UNKNOWN_EVIDENCE_ID.
+    Every attribute that downstream validation tests must be visible here,
+    otherwise the model is judged on constraints it was never shown and valid
+    candidates are silently discarded: `Paper ID` backs the "at least two
+    independent papers" gate, `Type` backs the limitation-signal gate, and
+    `question_ids_by_evidence` backs the question-grounding gate.
     """
     lines = []
     for item in evidence:
@@ -149,6 +153,7 @@ def _format_evidence(evidence: list[EvidenceUnit],
         condition_text = json.dumps(conditions, ensure_ascii=False) if conditions else "(none)"
         entry = (
             f"- Evidence ID: {item.id}\n"
+            f"  Paper ID: {item.paper_id}\n"
             f"  Type: {item.evidence_type}\n"
             f"  Claim: {item.normalized_claim}\n"
             f"  Section: {item.section or '(unknown)'}\n"
@@ -259,29 +264,39 @@ async def mine_gap_candidates(
 
     created = []
     rejected_candidates = []
+    accepted_candidates = []
     for candidate in result.gaps[:max_gaps]:
         candidate_question_ids = set(candidate.question_ids)
         allowed_for_candidate = {
             evidence_id for question_id in candidate_question_ids
             for evidence_id in passed_admissions.get(question_id, QuestionEvidenceAdmission("", "FAIL")).admissible_evidence_ids
         }
-        cited_evidence_ids = set(candidate.supporting_evidence_ids)
-        support = [evidence_by_id.get(evidence_id) for evidence_id in candidate.supporting_evidence_ids]
+        cited_evidence_ids = list(dict.fromkeys(candidate.supporting_evidence_ids))
+        # Drop citations that were never offered instead of discarding the whole
+        # candidate: a single stale or fabricated ID used to invalidate every
+        # other correctly cited, admitted evidence unit. Whatever remains must
+        # still satisfy every substantive gate below on its own, and the dropped
+        # IDs are recorded, so nothing is laundered.
+        unoffered_evidence_ids = [item for item in cited_evidence_ids
+                                  if item not in allowed_evidence_ids]
+        usable_evidence_ids = [item for item in cited_evidence_ids
+                               if item in allowed_evidence_ids]
+        support = [evidence_by_id[evidence_id] for evidence_id in usable_evidence_ids]
         reason = None
         if candidate.gap_type not in _SUPPORTED_GAP_TYPES: reason = "UNSUPPORTED_GAP_TYPE"
         elif not candidate_question_ids or not candidate_question_ids.issubset(passed_admissions): reason = "UNKNOWN_QUESTION_ID"
-        elif not cited_evidence_ids or not cited_evidence_ids.issubset(allowed_evidence_ids):
-            # Cites an ID that was never offered (fabricated, or belongs to a
+        elif not usable_evidence_ids:
+            # Nothing the candidate cites was ever offered (fabricated, or from a
             # question that did not pass admission).
             reason = "UNKNOWN_EVIDENCE_ID"
-        elif not (cited_evidence_ids & allowed_for_candidate):
-            # Every cited ID is admissible, but none of them is linked to a
+        elif not (set(usable_evidence_ids) & allowed_for_candidate):
+            # Every usable citation is admissible, but none is linked to a
             # question the candidate claims — the gap is not grounded in its own
             # questions. Corroborating evidence from sibling questions is kept,
             # since the prompt deliberately offers the whole admitted pool.
             reason = "EVIDENCE_NOT_LINKED_TO_CITED_QUESTION"
         elif candidate.contradicting_evidence_ids: reason = "UNEXPECTED_CONTRADICTING_EVIDENCE"
-        elif None in support or len({item.paper_id for item in support}) < 2: reason = "INSUFFICIENT_CANDIDATE_PAPER_SUPPORT"
+        elif len({item.paper_id for item in support}) < 2: reason = "INSUFFICIENT_CANDIDATE_PAPER_SUPPORT"
         elif not any(item.evidence_type in _LIMITATION_SIGNAL_TYPES for item in support): reason = "CANDIDATE_LACKS_LIMITATION_SIGNAL"
         if reason:
             rejected_candidates.append({
@@ -289,7 +304,7 @@ async def mine_gap_candidates(
                 "gap_type": candidate.gap_type,
                 "question_ids": candidate.question_ids,
                 "cited_evidence_ids": candidate.supporting_evidence_ids,
-                "unoffered_evidence_ids": sorted(cited_evidence_ids - allowed_evidence_ids),
+                "unoffered_evidence_ids": unoffered_evidence_ids,
             })
             continue
 
@@ -297,7 +312,7 @@ async def mine_gap_candidates(
         # A-tier (complete) has a full-text-locatable span; B-tier (partial)
         # is abstract-strength only and must be confirmed by the downstream
         # adversarial audit before it can survive.
-        has_fulltext = any(_is_fulltext_locatable(item) for item in support if item)
+        has_fulltext = any(_is_fulltext_locatable(item) for item in support)
         provenance_status = "complete" if has_fulltext else "partial"
         gap = gap_repo.create_gap_candidate(
             db, task_id=task_id, contract_id=contract.id, gap_type=candidate.gap_type,
@@ -311,13 +326,21 @@ async def mine_gap_candidates(
             significance_score=candidate.significance_score,
             mining_policy_version=GAP_MINING_POLICY_VERSION,
         )
-        for evidence_id in candidate.supporting_evidence_ids:
+        # Only admitted evidence gets linked; an unoffered ID would otherwise
+        # create a gap-evidence link pointing at nothing.
+        for evidence_id in usable_evidence_ids:
             gap_repo.create_gap_evidence_link(db, gap.id, evidence_id, "suggests", 0.8)
         for evidence_id in candidate.contradicting_evidence_ids:
             gap_repo.create_gap_evidence_link(db, gap.id, evidence_id, "contradicts", 0.8)
         created.append(gap)
+        accepted_candidates.append({
+            "gap_id": gap.id, "gap_type": candidate.gap_type,
+            "linked_evidence_ids": usable_evidence_ids,
+            "dropped_evidence_ids": unoffered_evidence_ids,
+        })
     paper_repo.save_trace(db, task_id, "gap_mining_candidates", "decision", output_data={
         "llm_candidate_count": len(result.gaps), "accepted_candidate_count": len(created),
+        "accepted_candidates": accepted_candidates,
         "rejected_candidates": rejected_candidates,
     })
     state.active_gap_ids = [gap.id for gap in created]

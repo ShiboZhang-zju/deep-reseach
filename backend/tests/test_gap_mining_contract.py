@@ -49,10 +49,12 @@ class _GapLLM:
         self.question_ids = question_ids
         self.evidence_ids = evidence_ids
         self.prompts = []
+        self.system_prompts = []
 
     async def chat_json(self, messages, schema):
         from app.schemas.schemas import GapCandidateList, GapCandidateSchema
 
+        self.system_prompts.append(messages[0]["content"])
         self.prompts.append(messages[1]["content"])
         return GapCandidateList(gaps=[GapCandidateSchema(
             gap_type="missing_evaluation",
@@ -145,6 +147,43 @@ async def test_prompt_exposes_the_question_link_validation_enforces(temp_db):
         assert f"Linked questions: {question.id}" in prompt, (
             "each evidence unit must disclose the question it is admitted for"
         )
+    # The two-paper and limitation-signal gates are enforced downstream, so the
+    # prompt has to expose paper identity and evidence type as well.
+    for units in evidence.values():
+        for unit in units:
+            assert f"Paper ID: {unit.paper_id}" in prompt
+    assert "limitation" in llm.system_prompts[0]
+    assert "negative_result" in llm.system_prompts[0]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_single_unoffered_id_does_not_discard_an_otherwise_valid_candidate(temp_db):
+    """One bad citation must not invalidate the correctly cited evidence.
+
+    Production case: a candidate cited five IDs, four of them admitted, and the
+    single unoffered ID rejected the whole gap.
+    """
+    import json
+
+    from app.agent.state import ResearchState
+    from app.agent.steps.mine_gaps import mine_gap_candidates
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, contract, questions, evidence = _seed_two_questions(db)
+    own = [item.id for item in evidence[questions[0].id]]
+    llm = _GapLLM([questions[0].id], own + ["stale-evidence-id"])
+    state = ResearchState(task_id=task.id, contract_id=contract.id, pipeline_version=2,
+                          current_round=1)
+
+    created = await mine_gap_candidates(db, state, llm, task.id)
+
+    trace = json.loads(_last_trace(db, task.id, "gap_mining_candidates").output_json)
+    assert len(created) == 1, trace["rejected_candidates"]
+    assert trace["accepted_candidates"][0]["dropped_evidence_ids"] == ["stale-evidence-id"]
+    linked = {link.evidence_id for link in gap_repo.list_gap_evidence(db, created[0].id)}
+    assert linked == set(own), "only admitted evidence may be linked to the gap"
     db.close()
 
 
@@ -195,7 +234,7 @@ async def test_candidate_grounded_only_in_other_questions_is_rejected(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_fabricated_evidence_id_is_reported_with_the_offending_ids(temp_db):
+async def test_candidate_citing_only_unoffered_ids_is_rejected(temp_db):
     import json
 
     from app.agent.state import ResearchState
@@ -203,8 +242,7 @@ async def test_fabricated_evidence_id_is_reported_with_the_offending_ids(temp_db
 
     db = temp_db()
     task, contract, questions, evidence = _seed_two_questions(db)
-    llm = _GapLLM([questions[0].id],
-                  [evidence[questions[0].id][0].id, "not-a-real-evidence-id"])
+    llm = _GapLLM([questions[0].id], ["not-a-real-evidence-id", "another-fake-id"])
     state = ResearchState(task_id=task.id, contract_id=contract.id, pipeline_version=2,
                           current_round=1)
 
@@ -214,7 +252,8 @@ async def test_fabricated_evidence_id_is_reported_with_the_offending_ids(temp_db
     assert created == []
     rejection = trace["rejected_candidates"][0]
     assert rejection["reason"] == "UNKNOWN_EVIDENCE_ID"
-    assert rejection["unoffered_evidence_ids"] == ["not-a-real-evidence-id"], (
+    assert rejection["unoffered_evidence_ids"] == ["not-a-real-evidence-id",
+                                                   "another-fake-id"], (
         "the trace must name the offending IDs so fabrication is distinguishable "
         "from a scope mismatch without re-running the model"
     )
