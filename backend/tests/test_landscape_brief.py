@@ -97,6 +97,7 @@ def test_landscape_brief_handles_missing_contract(temp_db):
 def test_landscape_brief_includes_gap_tiers(temp_db):
     """When gaps exist, the brief lists them with A/B tier from provenance."""
     from app.agent.steps.generate_landscape_brief import build_landscape_brief_markdown
+    from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
     from app.db.repositories import gap_repo
 
     db = temp_db()
@@ -109,7 +110,7 @@ def test_landscape_brief_includes_gap_tiers(temp_db):
         existing_coverage="c", missing_capability="m", claimed_delta="d",
         testable_hypothesis="h", falsification_condition="f",
         provenance_status="partial", question_ids=[q.id], mining_round=1,
-        mining_policy_version="evidence-admission-v1",
+        mining_policy_version=GAP_MINING_POLICY_VERSION,
     )
     db.commit()
 

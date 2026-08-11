@@ -16,7 +16,7 @@ _SUPPORTING_RELATIONS = {"supports", "partially_answers"}
 _ADMISSIBLE_STATUSES = {"verified", "upgraded", "abstract_only"}
 _LIMITATION_SIGNAL_TYPES = {"limitation", "negative_result"}
 _MIN_RELATION_RELEVANCE = 0.5
-GAP_MINING_POLICY_VERSION = "evidence-admission-v1"
+GAP_MINING_POLICY_VERSION = "evidence-admission-v2"
 
 @dataclass(frozen=True)
 class QuestionEvidenceAdmission:
@@ -114,6 +114,8 @@ Allowed gap types:
 
 For every gap:
 - cite only supplied question IDs and evidence IDs;
+- every evidence ID you cite must list one of the gap's question IDs under
+  "Linked questions", so the gap stays grounded in the questions it claims;
 - state what existing work already covers and the smallest missing capability;
 - write a falsifiable condition that would close the gap;
 - do not propose a solution or invent paper findings.
@@ -132,12 +134,20 @@ Evidence (only these IDs may be cited):
 Generate at most {max_gaps} evidence-backed candidate gaps."""
 
 
-def _format_evidence(evidence: list[EvidenceUnit]) -> str:
+def _format_evidence(evidence: list[EvidenceUnit],
+                     question_ids_by_evidence: dict[str, list[str]] | None = None) -> str:
+    """Render the evidence block.
+
+    `question_ids_by_evidence` exposes which admitted questions each evidence
+    unit is linked to. Without it the model cannot know the evidence-to-question
+    mapping that downstream validation enforces, and legitimate candidates get
+    discarded as UNKNOWN_EVIDENCE_ID.
+    """
     lines = []
     for item in evidence:
         conditions = json.loads(item.conditions_json or "{}")
         condition_text = json.dumps(conditions, ensure_ascii=False) if conditions else "(none)"
-        lines.append(
+        entry = (
             f"- Evidence ID: {item.id}\n"
             f"  Type: {item.evidence_type}\n"
             f"  Claim: {item.normalized_claim}\n"
@@ -145,6 +155,10 @@ def _format_evidence(evidence: list[EvidenceUnit]) -> str:
             f"  Conditions: {condition_text}\n"
             f"  Verification: {item.verification_status or 'unverified'}"
         )
+        linked = (question_ids_by_evidence or {}).get(item.id)
+        if linked:
+            entry += "\n  Linked questions: " + ", ".join(linked)
+        lines.append(entry)
     return "\n".join(lines)
 
 
@@ -225,6 +239,10 @@ async def mine_gap_candidates(
         for evidence_id in admission.admissible_evidence_ids
     }
     evidence = [evidence_by_id[evidence_id] for evidence_id in allowed_evidence_ids]
+    question_ids_by_evidence: dict[str, list[str]] = {}
+    for question_id, admission in passed_admissions.items():
+        for evidence_id in admission.admissible_evidence_ids:
+            question_ids_by_evidence.setdefault(evidence_id, []).append(question_id)
     question_text = "\n".join(
         f"- Question ID: {question.id}\n  Type: {question.question_type}\n  Question: {question.question}"
         for question in questions if question.id in passed_admissions
@@ -235,7 +253,7 @@ async def mine_gap_candidates(
         "role": "user", "content": _GAP_MINING_USER.format(
             topic=contract.topic, target_problem=contract.target_problem or "(not specified)",
             target_setting=contract.target_setting or "(not specified)", questions=question_text,
-            evidence=_format_evidence(evidence), max_gaps=max_gaps,
+            evidence=_format_evidence(evidence, question_ids_by_evidence), max_gaps=max_gaps,
         ),
     }], GapCandidateList)
 
@@ -247,16 +265,32 @@ async def mine_gap_candidates(
             evidence_id for question_id in candidate_question_ids
             for evidence_id in passed_admissions.get(question_id, QuestionEvidenceAdmission("", "FAIL")).admissible_evidence_ids
         }
+        cited_evidence_ids = set(candidate.supporting_evidence_ids)
         support = [evidence_by_id.get(evidence_id) for evidence_id in candidate.supporting_evidence_ids]
         reason = None
         if candidate.gap_type not in _SUPPORTED_GAP_TYPES: reason = "UNSUPPORTED_GAP_TYPE"
         elif not candidate_question_ids or not candidate_question_ids.issubset(passed_admissions): reason = "UNKNOWN_QUESTION_ID"
-        elif not candidate.supporting_evidence_ids or not set(candidate.supporting_evidence_ids).issubset(allowed_for_candidate): reason = "UNKNOWN_EVIDENCE_ID"
+        elif not cited_evidence_ids or not cited_evidence_ids.issubset(allowed_evidence_ids):
+            # Cites an ID that was never offered (fabricated, or belongs to a
+            # question that did not pass admission).
+            reason = "UNKNOWN_EVIDENCE_ID"
+        elif not (cited_evidence_ids & allowed_for_candidate):
+            # Every cited ID is admissible, but none of them is linked to a
+            # question the candidate claims — the gap is not grounded in its own
+            # questions. Corroborating evidence from sibling questions is kept,
+            # since the prompt deliberately offers the whole admitted pool.
+            reason = "EVIDENCE_NOT_LINKED_TO_CITED_QUESTION"
         elif candidate.contradicting_evidence_ids: reason = "UNEXPECTED_CONTRADICTING_EVIDENCE"
         elif None in support or len({item.paper_id for item in support}) < 2: reason = "INSUFFICIENT_CANDIDATE_PAPER_SUPPORT"
         elif not any(item.evidence_type in _LIMITATION_SIGNAL_TYPES for item in support): reason = "CANDIDATE_LACKS_LIMITATION_SIGNAL"
         if reason:
-            rejected_candidates.append(reason)
+            rejected_candidates.append({
+                "reason": reason,
+                "gap_type": candidate.gap_type,
+                "question_ids": candidate.question_ids,
+                "cited_evidence_ids": candidate.supporting_evidence_ids,
+                "unoffered_evidence_ids": sorted(cited_evidence_ids - allowed_evidence_ids),
+            })
             continue
 
         # O5(b): full-text presence sets provenance tier rather than rejecting.

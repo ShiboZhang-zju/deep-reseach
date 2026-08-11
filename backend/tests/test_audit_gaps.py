@@ -75,6 +75,7 @@ class UncertainAuditLLM:
 
 
 def _seed_gap(db):
+    from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
     from app.db.models import EvidenceUnit, GapCandidate, Paper, ResearchContract, ResearchTask, TaskPaper
     from app.db.repositories import gap_repo
 
@@ -102,7 +103,9 @@ def _seed_gap(db):
         testable_hypothesis="状态变化性能较低",
         falsification_condition="已有同设置边界评测",
         status="candidate",
-        mining_policy_version="evidence-admission-v1",
+        # The audit only considers gaps mined under the *current* policy, so this
+        # must track the constant rather than pin an outdated literal.
+        mining_policy_version=GAP_MINING_POLICY_VERSION,
     )
     db.add(gap)
     db.flush()
