@@ -165,6 +165,31 @@ class GeneratedQuery(BaseModel):
     target_question_id: str = Field(..., description="目标 ResearchQuestion ID")
     expected_evidence_type: EvidenceType | None = Field(None, description="期望证据类型")
 
+    @field_validator("intent", mode="before")
+    @classmethod
+    def _coerce_intent(cls, v):
+        # Smaller/local models sometimes emit an out-of-enum intent (e.g.
+        # "method", which is actually an EvidenceType). Coerce unknown values to
+        # a safe default so a single malformed query never fails the whole
+        # QueryList validation and aborts a search round.
+        allowed = {
+            "survey", "seminal", "recent_work", "benchmark",
+            "direct_neighbor", "limitation", "negative_result",
+            "question_answering", "gap_falsification",
+        }
+        return v if v in allowed else "recent_work"
+
+    @field_validator("expected_evidence_type", mode="before")
+    @classmethod
+    def _coerce_evidence_type(cls, v):
+        if v in (None, ""):
+            return None
+        allowed = {
+            "problem", "method", "result", "limitation", "dataset", "metric",
+            "negative_result", "future_work", "comparison",
+        }
+        return v if v in allowed else None
+
 
 class QueryList(BaseModel):
     queries: list[GeneratedQuery] = Field(..., description="结构化 query 列表")
@@ -439,6 +464,16 @@ class ResearchQuestionSchema(BaseModel):
         ..., description="问题类型")
     importance: float = Field(0.5, ge=0, le=1, description="重要性")
     searchability: float = Field(0.5, ge=0, le=1, description="可检索性")
+
+    @field_validator("question_type", mode="before")
+    @classmethod
+    def _coerce_question_type(cls, v):
+        # Local models occasionally emit an out-of-enum type (e.g. "comparison").
+        # Coerce unknown values to "problem" so one bad question does not fail
+        # the whole decomposition.
+        allowed = {"problem", "method", "evaluation", "dataset",
+                   "resource", "failure", "application"}
+        return v if v in allowed else "problem"
     axis_name: str = Field("", description="所属研究轴")
 
 
@@ -585,6 +620,30 @@ class EvidenceExtractionSchema(BaseModel):
     metric_name: str | None = None
     result_value: str | None = None
     conditions: dict = Field(default_factory=dict, description="条件信息")
+
+    @field_validator("evidence_type", mode="before")
+    @classmethod
+    def _coerce_evidence_type(cls, v):
+        allowed = {
+            "problem", "method", "result", "limitation", "dataset", "metric",
+            "negative_result", "future_work", "comparison",
+        }
+        return v if v in allowed else "method"
+
+    @field_validator("conditions", mode="before")
+    @classmethod
+    def _coerce_conditions(cls, v):
+        # Local models often emit conditions as a string or list instead of a
+        # dict (e.g. "仅使用Javadoc注释"). Wrap non-dict values so a single
+        # malformed unit does not fail the whole extraction batch and burn a
+        # retry.
+        if v is None or v == "":
+            return {}
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, list):
+            return {"notes": v}
+        return {"note": str(v)}
 
 
 class EvidenceExtractionList(BaseModel):
@@ -756,3 +815,21 @@ class InterventionOut(BaseModel):
     confidence_tier: str = "C"
     status: str = "candidate"
     created_at: str
+
+
+class EvidenceMatchItem(BaseModel):
+    """One evidence->question relevance judgment made by the LLM."""
+    index: int = Field(..., description="被判定证据在输入列表中的编号(从1开始)")
+    relation: str = Field("supports", description="关系: supports/contradicts/partially_answers/background")
+    relevance: float = Field(0.5, ge=0, le=1, description="相关度0-1")
+
+    @field_validator("relation", mode="before")
+    @classmethod
+    def _coerce_relation(cls, v):
+        allowed = {"supports", "contradicts", "partially_answers", "background"}
+        return v if v in allowed else "supports"
+
+
+class EvidenceMatchList(BaseModel):
+    """LLM output: which evidence items are relevant to a single question."""
+    matches: list[EvidenceMatchItem] = Field(default_factory=list)
