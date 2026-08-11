@@ -25,6 +25,21 @@ def _normalize_str(s: str) -> str:
     return (s or "").strip()
 
 
+def _gather_feedback_components(db, task_id: str) -> tuple[list[str], list[str]]:
+    """Return (clarification_answers, research_feedbacks) in creation order."""
+    clarification_answers = []
+    research_feedbacks = []
+    feedbacks = db.query(UserFeedback).filter(
+        UserFeedback.task_id == task_id,
+    ).order_by(UserFeedback.created_at).all()
+    for fb in feedbacks:
+        if fb.feedback_type == "clarification_answer":
+            clarification_answers.append(fb.content or "")
+        elif fb.feedback_type == "research_feedback":
+            research_feedbacks.append(fb.content or "")
+    return clarification_answers, research_feedbacks
+
+
 def compute_contract_input_version(db, task: ResearchTask, state: ResearchState) -> str:
     """Compute a stable SHA-256 hash of ALL inputs that affect the Contract.
 
@@ -32,35 +47,57 @@ def compute_contract_input_version(db, task: ResearchTask, state: ResearchState)
     1. task.user_input (original input)
     2. state.user_input (with clarifications appended)
     3. state.user_feedback
-    4. state.clarification_questions (JSON, sorted keys)
-    5. All clarification_answer feedback records (JSON content)
-    6. All research_feedback records (JSON content)
-    7. state.pipeline_version
+    4. All clarification_answer feedback records (JSON content)
+    5. All research_feedback records (JSON content)
+    6. state.pipeline_version
+
+    Deliberately EXCLUDES state.clarification_questions: those are
+    LLM-generated, non-deterministic derived data, and the /clarify endpoint
+    clears them before the contract is ever built — so they were always empty
+    here. Including them only created a way for the key to drift after the
+    fact (a state-load migration used to copy the decomposed research questions
+    into that field), which made a resumed task supersede its own active
+    contract and orphan every coverage snapshot bound to the old questions.
+    The questions actually put to the user are still covered indirectly: they
+    are stored inside each clarification_answer payload.
     """
-    # Gather clarification_answer feedback
-    clarification_answers = []
-    research_feedbacks = []
-    feedbacks = db.query(UserFeedback).filter(
-        UserFeedback.task_id == task.id,
-    ).order_by(UserFeedback.created_at).all()
-    for fb in feedbacks:
-        if fb.feedback_type == "clarification_answer":
-            clarification_answers.append(fb.content or "")
-        elif fb.feedback_type == "research_feedback":
-            research_feedbacks.append(fb.content or "")
+    clarification_answers, research_feedbacks = _gather_feedback_components(db, task.id)
 
     # Build stable JSON representation
     components = {
         "task_user_input": _normalize_str(task.user_input),
         "state_user_input": _normalize_str(state.user_input),
         "state_user_feedback": _normalize_str(state.user_feedback),
-        "clarification_questions": state.clarification_questions or [],
         "clarification_answers": clarification_answers,
         "research_feedbacks": research_feedbacks,
         "pipeline_version": state.pipeline_version,
     }
 
     # Stable serialization: sort_keys=True, fixed separators
+    combined = json.dumps(components, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+
+def _compute_legacy_input_version_v1(db, task: ResearchTask, state: ResearchState) -> str:
+    """Reproduce the pre-migration hash scheme, for reuse comparison only.
+
+    The old scheme carried a "clarification_questions" component. At the point
+    a contract is built that list is always empty (either no clarification was
+    needed, or /clarify cleared it), so the empty list is hard-coded here: that
+    is exactly what every already-stored input_hash was computed from. This
+    lets an existing contract still be recognised as current after the scheme
+    change instead of being wrongly superseded.
+    """
+    clarification_answers, research_feedbacks = _gather_feedback_components(db, task.id)
+    components = {
+        "task_user_input": _normalize_str(task.user_input),
+        "state_user_input": _normalize_str(state.user_input),
+        "state_user_feedback": _normalize_str(state.user_feedback),
+        "clarification_questions": [],
+        "clarification_answers": clarification_answers,
+        "research_feedbacks": research_feedbacks,
+        "pipeline_version": state.pipeline_version,
+    }
     combined = json.dumps(components, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
@@ -97,6 +134,19 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
 
     if existing and existing.input_hash == current_hash:
         logger.info("Task %s: contract v%d reuse (hash=%s)", task_id[:8], existing.version, current_hash[:12])
+        state.contract_id = existing.id
+        state.normalized_topic = existing.topic
+        state.keywords = json.loads(existing.key_terms_json or "[]")
+        task_repo.save_state(db, task_id, state)
+        db.commit()
+        return existing
+
+    if existing and existing.input_hash == _compute_legacy_input_version_v1(db, task, state):
+        # Same inputs, older hash scheme: re-stamp instead of superseding, so
+        # the questions (and every coverage snapshot bound to them) survive.
+        logger.info("Task %s: contract v%d reuse via legacy hash scheme, re-stamping to %s",
+                    task_id[:8], existing.version, current_hash[:12])
+        existing.input_hash = current_hash
         state.contract_id = existing.id
         state.normalized_topic = existing.topic
         state.keywords = json.loads(existing.key_terms_json or "[]")

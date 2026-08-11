@@ -80,9 +80,27 @@ class ResearchState:
         # Filter to known fields only (backward compat: ignores unknown keys)
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
 
-        # Phase 1.5: Migrate old research_questions to clarification_questions
-        # if clarification_questions is empty but research_questions has data
-        if not known.get("clarification_questions") and known.get("research_questions"):
+        # Phase 1.5: Migrate old research_questions to clarification_questions.
+        # This applies ONLY to genuinely legacy state blobs, i.e. those written
+        # before the two fields were separated. Such blobs have no
+        # pipeline_version and no contract_id.
+        #
+        # It must NOT run for current-pipeline states: `decompose_research_space`
+        # writes the decomposed *research* questions into the deprecated
+        # `research_questions` field, so an unconditional migration would load
+        # them back as "clarification questions" on every read. That silently
+        # changed `compute_contract_input_version` after the contract was built,
+        # which made resuming a task supersede its active contract, orphan all
+        # coverage snapshots bound to the old questions, and fail the readiness
+        # gate with no_high_importance_question_has_coverage_snapshot.
+        is_legacy_blob = (
+            "pipeline_version" not in data
+            and not data.get("contract_id")
+            and not data.get("active_question_ids")
+        )
+        if (is_legacy_blob
+                and not known.get("clarification_questions")
+                and known.get("research_questions")):
             known["clarification_questions"] = known["research_questions"]
 
         return cls(**known)
