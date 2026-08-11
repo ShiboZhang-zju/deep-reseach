@@ -76,6 +76,8 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
         supporting = 0
         contradicting = 0
         background = 0
+        supporting_papers: set[str] = set()
+        contradicting_papers: set[str] = set()
 
         # (#12) LLM-based semantic matching: one batched call (or a few) per
         # question decides which evidence items are relevant and how.
@@ -93,17 +95,30 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
 
             if relation_type == "supports":
                 supporting += 1
+                if eu.paper_id:
+                    supporting_papers.add(eu.paper_id)
             elif relation_type == "contradicts":
                 contradicting += 1
+                if eu.paper_id:
+                    contradicting_papers.add(eu.paper_id)
             else:
                 background += 1
 
-        # (#12) Better coverage score calculation
+        # Coverage is driven by how many *distinct papers* speak to the question,
+        # not by how many evidence units were extracted. Counting units let a
+        # single paper saturate a question: with `0.4 + supporting * 0.1`, six
+        # units from one paper scored a perfect 1.00, and in a real round six of
+        # ten questions hit 1.00 after only 15 papers. That inflated score is not
+        # cosmetic — coverage decides whether to keep searching and which
+        # questions may back a gap, so it must reflect corroboration breadth.
+        distinct_supporting = len(supporting_papers)
+        distinct_contradicting = len(contradicting_papers)
         total_relevant = supporting + contradicting + background
-        if total_relevant >= 5 and supporting >= 3:
-            coverage = min(1.0, 0.4 + supporting * 0.1 + contradicting * 0.05)
-        elif total_relevant >= 3 and supporting >= 1:
-            coverage = 0.3 + supporting * 0.1
+        if total_relevant >= 5 and distinct_supporting >= 3:
+            coverage = min(1.0, 0.4 + distinct_supporting * 0.1
+                          + distinct_contradicting * 0.05)
+        elif total_relevant >= 3 and distinct_supporting >= 1:
+            coverage = 0.3 + distinct_supporting * 0.1
         elif total_relevant >= 1:
             coverage = 0.15
         else:
@@ -150,6 +165,11 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
             "status": new_status,
             "supporting": supporting,
             "contradicting": contradicting,
+            # Breadth is what now drives the score, so it has to be visible:
+            # "12 units from 1 paper" and "12 units from 9 papers" are very
+            # different states that used to look identical in the logs.
+            "distinct_supporting_papers": distinct_supporting,
+            "distinct_contradicting_papers": distinct_contradicting,
         })
 
     db.flush()
@@ -161,9 +181,10 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
     # Log coverage deltas
     for d in coverage_deltas:
         delta_str = f"+{d['delta']:.2f}" if d['delta'] >= 0 else f"{d['delta']:.2f}"
-        logger.info("  Q[%s] coverage: %.2f -> %.2f (%s) %s [%s]",
+        logger.info("  Q[%s] coverage: %.2f -> %.2f (%s) %s [%d units / %d papers]",
                      d['question_id'][:8], d['prev_coverage'], d['new_coverage'],
-                     delta_str, d['status'], d['supporting'])
+                     delta_str, d['status'], d['supporting'],
+                     d['distinct_supporting_papers'])
 
     paper_repo.save_trace(db, task_id, "update_coverage_matrix", "action",
                           round_number=round_number,
