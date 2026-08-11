@@ -11,14 +11,19 @@ from app.agent.state import ResearchState
 from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
-from app.db.models import EvidenceUnit, GapCandidate, Paper, SearchQueryPaper, SearchQueryRecord, TaskPaper
+from app.db.models import (EvidenceUnit, GapCandidate, Paper, QuestionEvidenceLink,
+                          SearchQueryPaper, SearchQueryRecord, TaskPaper)
 from app.db.repositories import gap_repo, paper_repo, task_repo
 from app.db.repositories.search_query_repo import save_search_query
 
 logger = logging.getLogger(__name__)
 
 _MAX_NEIGHBORS = 5
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v1"
+# Bumped to v2 when corpus papers from the same research questions became
+# admissible comparison material. Like the mining policy version, this is what
+# invalidates audits already stamped for a round, so an admission-rule change
+# must bump it or resumed tasks keep their old verdicts.
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v2"
 
 
 class AuditDecisionInvalid(ValueError):
@@ -141,6 +146,43 @@ def build_adversarial_queries(gap: GapCandidate) -> list[AdversarialQuerySpec]:
     seen = set()
     return [spec for spec in specs if spec.query_text and not (spec.query_text.lower() in seen or seen.add(spec.query_text.lower()))]
 
+def collect_same_question_neighbors(db, gap) -> list[str]:
+    """Papers already in the corpus that speak to the same research questions.
+
+    The adversarial search decides whether due diligence was done; it should not
+    also be the only supply of comparison material. Rounds of searching already
+    put the most relevant papers into this task's corpus, and the papers behind
+    the evidence for a gap's own questions are, by construction, existing work on
+    that exact question — precisely what "has this been done already?" needs.
+
+    Observed on a real run: three of four gaps were stuck at
+    INSUFFICIENT_GAP_SPECIFIC_PAPERS with source_count=1 and only two candidate
+    papers, because the academic sources were rate limited at the IP level, while
+    112 papers and 375 evidence units sat unused in the corpus.
+
+    A gap's own supporting papers are excluded: a claim cannot be checked against
+    the very evidence it was derived from.
+    """
+    question_ids = json.loads(gap.question_ids_json or "[]")
+    if not question_ids:
+        return []
+    support_papers = {
+        db.get(EvidenceUnit, link.evidence_id).paper_id
+        for link in gap_repo.list_gap_evidence(db, gap.id)
+        if db.get(EvidenceUnit, link.evidence_id)
+    }
+    links = db.query(QuestionEvidenceLink).filter(
+        QuestionEvidenceLink.question_id.in_(question_ids)).all()
+    if not links:
+        return []
+    units = db.query(EvidenceUnit).filter(
+        EvidenceUnit.id.in_({link.evidence_id for link in links})).all()
+    return sorted({
+        unit.paper_id for unit in units
+        if unit.paper_id and unit.paper_id not in support_papers
+    })
+
+
 def evaluate_gap_search_admission(db, gap, query_ids):
     from app.config import settings
     constrained = settings.constrained_retrieval_mode
@@ -162,13 +204,18 @@ def evaluate_gap_search_admission(db, gap, query_ids):
     completed = [item for item in queries if item.status == "completed"]
     failed = [item for item in queries if item.status == "failed"]
     families = sorted({item.query_family for item in completed if item.query_family})
+    # Search-quality gates stay strict: they attest that due diligence happened,
+    # and no local corpus can substitute for that.
     if len(completed) < min_completed: reasons.append("INSUFFICIENT_COMPLETED_QUERIES")
     if len(families) < min_families: reasons.append("INSUFFICIENT_QUERY_FAMILIES")
     if len(completed) / max(len(queries), 1) < 0.5: reasons.append("SEARCH_SUCCESS_RATE_TOO_LOW")
     mappings = db.query(SearchQueryPaper).filter(SearchQueryPaper.query_id.in_([item.id for item in completed])).all()
-    paper_ids = sorted({item.paper_id for item in mappings})
+    retrieved_paper_ids = {item.paper_id for item in mappings}
     sources = {item.source for item in mappings if item.source and item.source != "unknown"}
     if not sources: reasons.append("NO_SUCCESSFUL_SOURCE")
+    # Only the *amount* of comparison material may be topped up from the corpus.
+    corpus_paper_ids = collect_same_question_neighbors(db, gap)
+    paper_ids = sorted(retrieved_paper_ids | set(corpus_paper_ids))
     if len(paper_ids) < min_papers: reasons.append("INSUFFICIENT_GAP_SPECIFIC_PAPERS")
     support_papers = {db.get(EvidenceUnit, link.evidence_id).paper_id for link in gap_repo.list_gap_evidence(db, gap.id) if link.relation_type == "suggests" and db.get(EvidenceUnit, link.evidence_id)}
     external = [item for item in paper_ids if item not in support_papers]
@@ -196,7 +243,29 @@ def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS):
         tp = db.query(TaskPaper).filter(TaskPaper.task_id == gap.task_id, TaskPaper.paper_id == paper_id).first()
         score = 0.4 * item["hits"] + 0.3 * len(item["families"]) + 0.2 / (item["best_rank"] + 1) + 0.1 * len(item["sources"]) + 0.1 * (tp.final_score or 0 if tp else 0)
         ranked.append((score, paper))
-    return [paper for _, paper in sorted(ranked, key=lambda item: item[0], reverse=True)[:limit]]
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    neighbors = [paper for _, paper in ranked[:limit]]
+    if len(neighbors) >= limit:
+        return neighbors
+    # Admission may pass on corpus papers, so the comparison step has to be able
+    # to see them too — otherwise the audit is asked to judge novelty with fewer
+    # neighbours than it was admitted on. These rank after retrieved papers
+    # because they carry no adversarial-search signal, and are ordered by the
+    # task's own relevance score.
+    seen = {paper.id for paper in neighbors}
+    fallback = []
+    for paper_id in collect_same_question_neighbors(db, gap):
+        if paper_id in seen or paper_id in stats:
+            continue
+        paper = db.get(Paper, paper_id)
+        if not paper:
+            continue
+        tp = db.query(TaskPaper).filter(TaskPaper.task_id == gap.task_id,
+                                       TaskPaper.paper_id == paper_id).first()
+        fallback.append(((tp.final_score or 0.0) if tp else 0.0, paper))
+    fallback.sort(key=lambda item: item[0], reverse=True)
+    neighbors.extend(paper for _, paper in fallback[:limit - len(neighbors)])
+    return neighbors
 
 def _save_search_admission_trace(db, task_id, admission):
     paper_repo.save_trace(db, task_id, "gap_search_admission", "decision", output_data={
