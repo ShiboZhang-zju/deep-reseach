@@ -20,6 +20,13 @@ class OpenAlexSource(PaperSource):
             "per_page": min(limit, 200),
             "sort": "relevance_score:desc",
         }
+        # OpenAlex accepts the polite-pool contact either as a mailto parameter
+        # or in the User-Agent; send both, since only the parameter survives
+        # proxies that rewrite headers. Note this does not lift an IP-level rate
+        # limit: a controlled probe returned 429 for anonymous, User-Agent and
+        # mailto-parameter requests alike, so cooldown remains the real defence.
+        if settings.openalex_email:
+            params["mailto"] = settings.openalex_email
         # API key gives $1/day budget (vs $0.10 without); free at openalex.org
         if settings.openalex_api_key:
             params["api_key"] = settings.openalex_api_key
@@ -29,8 +36,9 @@ class OpenAlexSource(PaperSource):
             return resp.json()
 
     async def search(self, query: str, limit: int = 15) -> list[RawPaper]:
-        mailto = settings.openalex_email or "research@example.com"
-        headers = {"User-Agent": f"DeepResearch/1.0 (mailto:{mailto})"}
+        mailto = settings.openalex_email
+        headers = {"User-Agent": f"DeepResearch/1.0 (mailto:{mailto})" if mailto
+                   else "DeepResearch/1.0"}
 
         try:
             data = await retry_with_backoff(

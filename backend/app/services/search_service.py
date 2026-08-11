@@ -9,7 +9,7 @@ from collections import OrderedDict
 import httpx
 
 from app.config import settings
-from app.paper_sources.base import PaperSource, RawPaper
+from app.paper_sources.base import PaperSource, RawPaper, parse_retry_after
 from app.paper_sources.semantic_scholar import SemanticScholarSource
 from app.paper_sources.arxiv import ArxivSource
 from app.paper_sources.openalex import OpenAlexSource
@@ -107,10 +107,17 @@ class SearchService:
             del self._cooldowns[source_name]
         return False
 
-    def _mark_cooldown(self, source_name: str):
-        """Mark a source as rate-limited; skip for cooldown_s."""
-        self._cooldowns[source_name] = time.time() + self._cooldown_s
-        logger.info("Source '%s' entered %ds cooldown (429)", source_name, self._cooldown_s)
+    def _mark_cooldown(self, source_name: str, retry_after: float | None = None):
+        """Mark a source as rate-limited; skip for cooldown_s.
+
+        A server-supplied Retry-After wins when it asks for longer than the
+        default: it states when the source is actually usable again.
+        """
+        cooldown_s = self._cooldown_s
+        if retry_after is not None and retry_after > cooldown_s:
+            cooldown_s = retry_after
+        self._cooldowns[source_name] = time.time() + cooldown_s
+        logger.info("Source '%s' entered %.0fs cooldown (429)", source_name, cooldown_s)
 
     async def _search_with_cache(self, src: PaperSource, query: str, limit: int) -> list[RawPaper]:
         """Search one source with cache + rate limit + 429 cooldown."""
@@ -127,13 +134,21 @@ class SearchService:
 
         # Acquire rate-limit token before hitting the API
         await rate_limiter.acquire(src.name)
+        # Re-check the cooldown after queueing: acquire() is where concurrent
+        # queries wait, so a sibling query may have hit 429 and cooled the source
+        # down in the meantime. Without this the whole concurrent batch still
+        # fires requests that are certain to fail, which is exactly what made a
+        # rate-limited source cost every query its full retry budget.
+        if self._is_cooled_down(src.name):
+            logger.debug("Skipping %s (cooled down while awaiting rate limit)", src.name)
+            return []
         try:
             result = await src.search(query, limit)
             _cache_put(key, result)
             return result
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
-                self._mark_cooldown(src.name)
+                self._mark_cooldown(src.name, parse_retry_after(e.response))
             else:
                 logger.warning("Source %s HTTP %d", src.name, e.response.status_code)
             return []
