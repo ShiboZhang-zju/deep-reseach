@@ -16,7 +16,11 @@ _SUPPORTING_RELATIONS = {"supports", "partially_answers"}
 _ADMISSIBLE_STATUSES = {"verified", "upgraded", "abstract_only"}
 _LIMITATION_SIGNAL_TYPES = {"limitation", "negative_result"}
 _MIN_RELATION_RELEVANCE = 0.5
-GAP_MINING_POLICY_VERSION = "evidence-admission-v2"
+# Bumped to v3 when "covered" questions became eligible for mining: the policy
+# version is what invalidates gaps already stamped for a round, so a change to
+# the admission rules must bump it or the new rules never take effect on a
+# resumed task.
+GAP_MINING_POLICY_VERSION = "evidence-admission-v3"
 
 @dataclass(frozen=True)
 class QuestionEvidenceAdmission:
