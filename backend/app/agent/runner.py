@@ -52,6 +52,12 @@ from app.agent.steps.analyze_papers import analyze_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
 from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION
 from app.agent.steps.narrow_gaps import MAX_NARROW_ATTEMPTS, narrow_audited_gaps
+
+# Upper bound on narrowing passes in one pipeline run. Each pass advances a
+# single gap by one attempt, so this covers roughly four gaps at
+# MAX_NARROW_ATTEMPTS each — beyond that, more papers are more useful than a
+# smaller claim.
+_MAX_NARROW_ITERATIONS = MAX_NARROW_ATTEMPTS * 4
 from app.llm.factory import get_llm
 from app.llm.base import LLMBudgetExceeded
 from app.services.event_service import emit_event, emit_event_with_cleanup
@@ -620,8 +626,17 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
     # global remediation budget (can_remediate checks the counters), plus the
     # iterations that gap narrowing can consume — narrowing re-audits without
     # spending a remediation round, so it needs its own headroom.
+    #
+    # Narrowing headroom is per gap, not per batch: in practice one audit round
+    # leaves a single gap at partially_closed while the others are still
+    # undecided, so each pass advances one gap and costs one iteration (observed:
+    # 3 consecutive single-gap narrowing passes on one task). Budgeting only
+    # MAX_NARROW_ATTEMPTS would exhaust the loop mid-narrowing and end the task
+    # as more_research_required with work still pending. The narrowing passes are
+    # counted separately so they cannot silently eat the remediation budget.
+    narrow_iterations = 0
     max_pipeline_iters = (1 + settings.max_remediation_rounds_total
-                         + MAX_NARROW_ATTEMPTS + 1)
+                         + _MAX_NARROW_ITERATIONS)
     for _iter in range(max_pipeline_iters):
         state = task_repo.get_state(db, task_id)
 
@@ -694,11 +709,17 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             # A partially closed gap comes with an explicit remaining delta, so
             # shrink the claim to it and re-audit before paying for another
             # remediation round of paper collection.
-            narrowed = narrow_audited_gaps(db, state, task_id)
-            if narrowed:
-                logger.info("Task %s: narrowed %d audited gap(s), re-auditing",
-                            task_id[:8], len(narrowed))
-                continue
+            if narrow_iterations < _MAX_NARROW_ITERATIONS:
+                narrowed = narrow_audited_gaps(db, state, task_id)
+                if narrowed:
+                    narrow_iterations += 1
+                    logger.info("Task %s: narrowed %d audited gap(s), re-auditing "
+                                "(narrowing pass %d/%d)", task_id[:8], len(narrowed),
+                                narrow_iterations, _MAX_NARROW_ITERATIONS)
+                    continue
+            else:
+                logger.info("Task %s: narrowing budget exhausted (%d passes), "
+                            "falling back to remediation", task_id[:8], narrow_iterations)
             if await _try_remediate(db, state, llm, task_id, "no_surviving_gap_after_audit"):
                 continue
             await _terminate_more_research(db, state, task_id,
