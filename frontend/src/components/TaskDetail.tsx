@@ -41,6 +41,14 @@ const RUNNING_STATUSES = [
   'building_contract',
   'decomposing',
   'searching',
+  // V2 control-plane phases: without these the UI stops polling (and renders
+  // the task as not running) for the longest part of the pipeline.
+  'extracting_evidence',
+  'updating_coverage',
+  'analyzing_papers',
+  'building_wiki',
+  'building_clusters',
+  'checking_feasibility',
   'summarizing',
   'reporting',
   'generating_ideas',
@@ -85,8 +93,15 @@ export function TaskDetail({ taskId, onBack }: Props) {
     if (!task.state_json) return;
     try {
       const state = JSON.parse(task.state_json);
-      if (state.research_questions && state.research_questions.length > 0) {
-        setRecoveredQuestions(state.research_questions);
+      // Current pipeline stores them in clarification_questions;
+      // research_questions is only a legacy pre-1.5 fallback (and now holds
+      // decomposed research questions, so it must not take precedence).
+      const questions: string[] | undefined =
+        (state.clarification_questions && state.clarification_questions.length > 0)
+          ? state.clarification_questions
+          : state.research_questions;
+      if (questions && questions.length > 0) {
+        setRecoveredQuestions(questions);
       }
     } catch {
       // ignore
