@@ -51,6 +51,7 @@ from app.agent.steps import (
 from app.agent.steps.analyze_papers import analyze_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
 from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION
+from app.agent.steps.narrow_gaps import MAX_NARROW_ATTEMPTS, narrow_audited_gaps
 from app.llm.factory import get_llm
 from app.llm.base import LLMBudgetExceeded
 from app.services.event_service import emit_event, emit_event_with_cleanup
@@ -616,8 +617,11 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
 
     # The opportunity pipeline is attempted; on a remediable stall we run a
     # directed search round and loop again. The loop count is bounded by the
-    # global remediation budget (can_remediate checks the counters).
-    max_pipeline_iters = 1 + settings.max_remediation_rounds_total
+    # global remediation budget (can_remediate checks the counters), plus the
+    # iterations that gap narrowing can consume — narrowing re-audits without
+    # spending a remediation round, so it needs its own headroom.
+    max_pipeline_iters = (1 + settings.max_remediation_rounds_total
+                         + MAX_NARROW_ATTEMPTS + 1)
     for _iter in range(max_pipeline_iters):
         state = task_repo.get_state(db, task_id)
 
@@ -660,6 +664,10 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
 
         audit_input_version = hashlib.sha256(json.dumps({
             "gap_ids": sorted(gap.id for gap in gaps),
+            # Narrowing rewrites a gap's claimed delta; the audit judges exactly
+            # that claim, so it belongs in the audit's input identity. Otherwise a
+            # narrowed gap would be skipped as "already audited".
+            "gap_claims": {gap.id: (gap.claimed_delta or "") for gap in gaps},
             "round": state.current_round,
             "pipeline_version": state.pipeline_version,
             "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
@@ -683,6 +691,14 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         db.commit()
         state = task_repo.get_state(db, task_id)
         if not state.surviving_gap_ids:
+            # A partially closed gap comes with an explicit remaining delta, so
+            # shrink the claim to it and re-audit before paying for another
+            # remediation round of paper collection.
+            narrowed = narrow_audited_gaps(db, state, task_id)
+            if narrowed:
+                logger.info("Task %s: narrowed %d audited gap(s), re-auditing",
+                            task_id[:8], len(narrowed))
+                continue
             if await _try_remediate(db, state, llm, task_id, "no_surviving_gap_after_audit"):
                 continue
             await _terminate_more_research(db, state, task_id,
