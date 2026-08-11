@@ -35,13 +35,16 @@ class CoreSource(PaperSource):
                     logger.warning("CORE rate limited")
                     raise httpx.HTTPStatusError("429", request=resp.request, response=resp)
                 if resp.status_code != 200:
-                    logger.error("CORE error %d: %s", resp.status_code, resp.text[:200])
+                    logger.debug("CORE error %d: %s", resp.status_code, resp.text[:200])
                     return []
                 data = resp.json()
         except httpx.HTTPStatusError:
             raise  # let search_service handle cooldown
         except Exception as e:
-            logger.error("CORE request failed: %s", e)
+            # P3: CORE frequently fails without an API key (empty/timeout
+            # errors). Log at debug with the exception type so it is diagnosable
+            # but does not spam the run log; the source degrades silently.
+            logger.debug("CORE request failed: %s: %s", type(e).__name__, e)
             return []
 
         papers: list[RawPaper] = []

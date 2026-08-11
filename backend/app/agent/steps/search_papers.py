@@ -128,7 +128,19 @@ async def search_and_save_papers(db, state: ResearchState,
     db.flush()
 
     # Save SearchQueryPaper mappings
+    # NOTE: the same (query_id, paper_id, source) can appear multiple times in
+    # query_paper_mappings within a single round (e.g. a paper returned under
+    # the same source for a query more than once). The DB has a UNIQUE
+    # constraint on (query_id, paper_id, source), and checking only committed
+    # rows via `existing_sqp` misses duplicates already staged in this batch,
+    # which caused an IntegrityError that rolled back the whole round. Track a
+    # per-batch seen-set so we only add each unique triple once.
+    seen_sqp: set[tuple] = set()
     for query_id, paper_id, rank, source_name, is_new_for_task in query_paper_mappings:
+        key = (query_id, paper_id, source_name)
+        if key in seen_sqp:
+            continue
+        seen_sqp.add(key)
         existing_sqp = db.query(SearchQueryPaper).filter(
             SearchQueryPaper.query_id == query_id,
             SearchQueryPaper.paper_id == paper_id,
@@ -187,8 +199,10 @@ async def search_and_save_papers(db, state: ResearchState,
     logger.info("Round %d: %d raw papers, %d after dedup, %d completed queries, %d failed",
                 round_num, papers_found, len(deduped), len(completed_query_ids), len(failed_query_ids))
 
-    # P1-8: Async metadata enrichment for newly found papers (non-blocking)
-    if new_paper_ids:
+    # P1-8: Async metadata enrichment for newly found papers (non-blocking).
+    # O3: skippable — without an S2 key it competes with the main search loop
+    # for the same rate-limited quota and slows it down for little gain.
+    if new_paper_ids and settings.enable_metadata_enrichment:
         asyncio.create_task(_trigger_metadata_enrichment(list(new_paper_ids)))
 
     return papers_found, len(deduped), new_paper_ids

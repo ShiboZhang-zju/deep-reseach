@@ -152,6 +152,8 @@ _INTERRUPTED_STATUSES = {
     "building_contract",
     "decomposing",
     "searching",
+    "extracting_evidence",
+    "updating_coverage",
     "summarizing",
     "analyzing_papers",
     "building_wiki",
@@ -499,25 +501,35 @@ async def run_task(task_id: str):
         # (API embedding, no local PyTorch → stable on Windows). Falls back to
         # abstract-only if the embedding backend is unavailable.
         from app.services.embedding_service import embedding_enabled
-        if embedding_enabled():
+        if settings.enable_rag_indexing and embedding_enabled():
             logger.info("Task %s: RAG indexing enabled (embedding backend=%s)",
                         task_id[:8], settings.embedding_backend)
             await _run_rag_indexing(db, task_id, llm)
         else:
-            logger.info("Task %s: skipping RAG indexing (embedding backend unavailable, using abstract fallback)", task_id[:8])
-            emit_event(task_id, "status", {"status": "indexing_skipped", "reason": "embedding backend unavailable"})
+            _skip_reason = ("disabled via enable_rag_indexing"
+                            if not settings.enable_rag_indexing
+                            else "embedding backend unavailable")
+            logger.info("Task %s: skipping RAG indexing (%s, using abstract fallback)",
+                        task_id[:8], _skip_reason)
+            emit_event(task_id, "status", {"status": "indexing_skipped", "reason": _skip_reason})
 
         # === 2.5b. Paper Deep Analysis (新增：论文深度分析) ===
         # Download PDFs for high-priority papers, extract text, LLM structured analysis
-        # Results stored in paper_analyses table, used by wiki/report/ideas
-        logger.info("Task %s: starting paper deep analysis...", task_id[:8])
-        task_repo.update_status(db, task_id, "analyzing_papers")
-        db.commit()
-        emit_event(task_id, "status", {"status": "analyzing_papers"})
-        try:
-            await analyze_papers(db, state, llm, task_id)
-        except Exception as e:
-            logger.warning("Task %s: paper analysis failed (non-fatal, continuing): %s", task_id[:8], e)
+        # Results stored in paper_analyses table, used by wiki/report/ideas.
+        # Also gated by enable_rag_indexing because it does the same PDF parsing
+        # that can native-segfault on Windows; gap mining relies on Evidence Units,
+        # not on this deep analysis, so skipping it is safe for the V2 pipeline.
+        if settings.enable_rag_indexing:
+            logger.info("Task %s: starting paper deep analysis...", task_id[:8])
+            task_repo.update_status(db, task_id, "analyzing_papers")
+            db.commit()
+            emit_event(task_id, "status", {"status": "analyzing_papers"})
+            try:
+                await analyze_papers(db, state, llm, task_id)
+            except Exception as e:
+                logger.warning("Task %s: paper analysis failed (non-fatal, continuing): %s", task_id[:8], e)
+        else:
+            logger.info("Task %s: skipping paper deep analysis (enable_rag_indexing=False)", task_id[:8])
 
         # Wiki, clustering, and reports are optional presentation features for Pipeline V2.
         # They must not determine whether an evidence-grounded opportunity is found.

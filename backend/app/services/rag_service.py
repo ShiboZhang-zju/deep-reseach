@@ -101,9 +101,19 @@ def _embedding_signature() -> str:
 def _get_chroma_client():
     global _chroma_client
     if _chroma_client is None:
+        # P3: disable anonymized telemetry — it emits noisy capture() errors to
+        # the log on every event. Settings(anonymized_telemetry=False) alone is
+        # not honored by all chromadb versions, so also set the env var BEFORE
+        # importing chromadb, which is the reliable off-switch.
+        os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+        os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "none")
         import chromadb
+        from chromadb.config import Settings as ChromaSettings
         os.makedirs(CHROMA_DIR, exist_ok=True)
-        _chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+        _chroma_client = chromadb.PersistentClient(
+            path=CHROMA_DIR,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
     return _chroma_client
 
 
