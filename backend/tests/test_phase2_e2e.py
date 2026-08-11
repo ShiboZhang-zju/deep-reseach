@@ -345,15 +345,25 @@ async def test_evidence_extraction_idempotent(temp_db):
 
     llm = FakeLLM()
 
-    # First extraction
-    state = ResearchState(task_id=task_id, user_input="test", pipeline_version=2)
-    count1 = await extract_evidence_units(db, state, llm, task_id, round_number=1)
-    db.commit()
+    # Evidence extraction spawns per-paper sessions via the module-level
+    # SessionLocal (crash-safety by design). Point it at the temp engine so
+    # those writes land in the DB this test queries.
+    import app.agent.steps.extract_evidence as _ee
+    _orig_session_local = _ee.SessionLocal
+    _ee.SessionLocal = Session
+    try:
+        # First extraction
+        state = ResearchState(task_id=task_id, user_input="test", pipeline_version=2)
+        count1 = await extract_evidence_units(db, state, llm, task_id, round_number=1)
+        db.commit()
 
-    # Second extraction (should not produce duplicates)
-    count2 = await extract_evidence_units(db, state, llm, task_id, round_number=1)
-    db.commit()
+        # Second extraction (should not produce duplicates)
+        count2 = await extract_evidence_units(db, state, llm, task_id, round_number=1)
+        db.commit()
+    finally:
+        _ee.SessionLocal = _orig_session_local
 
+    db.expire_all()
     total = db.query(EvidenceUnit).filter(EvidenceUnit.task_id == task_id).count()
     # Should be same as first run (idempotent)
     assert total == count1, f"Expected {count1} evidence (idempotent), got {total}"

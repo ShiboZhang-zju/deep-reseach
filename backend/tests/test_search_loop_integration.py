@@ -690,7 +690,8 @@ async def test_task_new_vs_global_new(temp_db):
         )]
     fake_search.search_multiple_queries = _return_existing
 
-    with patch("app.agent.steps.search_papers.search_service", fake_search):
+    with patch("app.agent.steps.search_papers.search_service", fake_search), \
+         patch("app.agent.steps.search_papers.settings.search_prefilter_min_similarity", 0.0):
         from app.agent.steps.generate_queries import SearchQueryExecution
         qe = SearchQueryExecution(
             query_id="test-q", query_text="pre-existing paper",

@@ -67,6 +67,42 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
     if not paper_map:
         return []
 
+    # O2: heuristic prefilter — LLM scoring is the slowest stage, so only send
+    # the top-N papers (by a cheap heuristic) to the LLM. The rest are marked
+    # low-priority without an LLM call. This can cut the scoring stage by 2/3+.
+    prefiltered_low = []
+    top_n = settings.score_llm_top_n
+    if top_n and len(paper_map) > top_n:
+        def _heuristic(item):
+            tp, paper = item
+            score = 0.0
+            score += min((paper.citation_count or 0) / 50.0, 3.0)  # citations
+            if paper.year:
+                # recency: newer is better, saturating
+                score += max(0.0, min((paper.year - 2018) / 2.0, 3.0))
+            venue_str = (paper.venue or "").upper()
+            if any(kv in venue_str for kv in TOP_VENUE_KEYWORDS):
+                score += 2.0
+            if paper.abstract:  # has abstract to score at all
+                score += 0.5
+            return score
+
+        ranked = sorted(paper_map.items(), key=lambda kv: _heuristic(kv[1]), reverse=True)
+        kept = dict(ranked[:top_n])
+        for tp_id, (tp, paper) in ranked[top_n:]:
+            # Mark as low priority directly, no LLM call.
+            paper_repo.update_task_paper_scores(
+                db, tp.id, {}, 0.3, "low",
+                "heuristic prefilter: below top-N for LLM scoring", ""
+            )
+            if paper.id not in state.low_priority_paper_ids:
+                state.low_priority_paper_ids.append(paper.id)
+            prefiltered_low.append(tp_id)
+        db.commit()
+        logger.info("Scoring prefilter: %d papers -> top %d to LLM, %d marked low",
+                    len(paper_map), len(kept), len(prefiltered_low))
+        paper_map = kept
+
     logger.info("Scoring %d papers in round %d (concurrent, max 5)...", len(paper_map), round_num)
 
     # Concurrent scoring with semaphore
