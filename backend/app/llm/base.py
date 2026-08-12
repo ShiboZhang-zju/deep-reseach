@@ -1,5 +1,6 @@
 """LLM Provider abstract base class."""
 
+import math
 from abc import ABC, abstractmethod
 from typing import Type, TypeVar
 
@@ -17,6 +18,45 @@ class LLMBudgetExceeded(RuntimeError):
     """
 
 
+class LLMContextOverflow(RuntimeError):
+    """The prompt alone does not fit the model's context window.
+
+    Distinct from a transport error: the backend rejects such a request with a
+    plain HTTP 400, which used to surface as an opaque "LLM call failed: 400"
+    and abort the whole task. Callers that build prompts from an unbounded
+    collection (evidence units, papers) need to tell this apart so they can
+    shrink the input instead of retrying it verbatim.
+    """
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough, deliberately conservative token estimate for mixed CJK/Latin text.
+
+    Used only to keep a request inside the model's context window before it is
+    sent, so over-estimating is safe and under-estimating is not: CJK
+    characters are counted as one token each (they usually are), everything
+    else at ~3.2 characters per token, which is below the ~4 that Latin text
+    typically achieves.
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if "\u3000" <= ch <= "\u9fff" or "\uff00" <= ch <= "\uffef")
+    return cjk + math.ceil((len(text) - cjk) / 3.2)
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    """Estimate the prompt size of a chat message list (with per-message overhead)."""
+    return sum(estimate_tokens(str(message.get("content") or "")) + 4
+               for message in messages)
+
+
+# How fast the measured-vs-estimated ratio is allowed to fall back towards 1.
+# Keeping the worst recent observation is deliberate: the cost of forgetting it
+# is a rejected request, the cost of remembering it is a slightly stricter guard.
+_TOKEN_RATIO_DECAY = 0.9
+_MAX_TOKEN_RATIO = 4.0
+
+
 class LLMProvider(ABC):
     """Abstract base for LLM providers.
 
@@ -32,6 +72,23 @@ class LLMProvider(ABC):
         self.max_total_tokens: int = 0
         self.call_count: int = 0
         self.total_tokens_used: int = 0
+        # Correction factor between measured prompt tokens and the
+        # character-based estimate. No single divisor fits both shapes of prompt
+        # this pipeline sends: a prompt dense with UUIDs tokenizes at roughly
+        # 1.8 characters per token, while prose reaches about 4, so a fixed
+        # divisor either under-protects the first or needlessly rejects the
+        # second. Measured usage from the backend calibrates it instead.
+        self.token_estimate_ratio: float = 1.0
+
+    def calibrate_token_estimate(self, estimated: int, measured: int) -> None:
+        """Update the estimate correction factor from one measured call."""
+        if estimated <= 0 or measured <= 0:
+            return
+        observed = measured / estimated
+        self.token_estimate_ratio = min(
+            max(observed, self.token_estimate_ratio * _TOKEN_RATIO_DECAY, 1.0),
+            _MAX_TOKEN_RATIO,
+        )
 
     def set_budget(self, max_calls: int = 0, max_total_tokens: int = 0) -> None:
         """Configure and reset the per-task budget."""

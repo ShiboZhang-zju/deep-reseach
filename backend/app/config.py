@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # repetition_penalty, chat_template_kwargs). JSON object; empty = none.
     llm_extra_body: dict[str, Any] = dict(_DEFAULT_MODEL.extra_body)
 
+    # Context window of the configured model and the output budget reserved
+    # inside it. The local Qwen deployment rejects any request whose input
+    # exceeds llm_context_tokens with a bare HTTP 400, and it derives the
+    # allowed output length from what is left of the window: a prompt that
+    # nearly fills the context silently leaves no room for the answer, which
+    # arrives truncated mid-string. Reserving the output budget up front keeps
+    # both failure modes out of the pipeline.
+    llm_context_tokens: int = 40960
+    llm_max_output_tokens: int = 4096
+
     # Paper source API keys / polite-pool emails
     semantic_scholar_api_key: str = ""  # 可选，免费申请: https://www.semanticscholar.org/product/api#api-key-form
     openalex_email: str = ""            # 进 OpenAlex polite pool
