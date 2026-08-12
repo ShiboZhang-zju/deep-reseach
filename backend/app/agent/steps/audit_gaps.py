@@ -302,7 +302,16 @@ async def audit_gap_candidates(
     results = []
     for gap in gaps:
         results.append(await audit_gap_candidate(db, state, llm, task_id, gap, perform_search))
-    state.surviving_gap_ids = [result.gap_id for result in results if result.audit_result == "confirmed"]
+    # Read the surviving set back from the database rather than from this batch:
+    # when only some gaps are re-audited (e.g. after narrowing), gaps confirmed
+    # by an earlier batch are still surviving and must not be dropped from the
+    # state.
+    state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
+        GapCandidate.task_id == task_id,
+        GapCandidate.contract_id == state.contract_id,
+        GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
+        GapCandidate.status == "surviving",
+    ).all()]
     task_repo.save_state(db, task_id, state)
     db.commit()
     return results

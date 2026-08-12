@@ -635,6 +635,10 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
     # as more_research_required with work still pending. The narrowing passes are
     # counted separately so they cannot silently eat the remediation budget.
     narrow_iterations = 0
+    # Set to the gaps a narrowing pass just rewrote, so the next audit only
+    # re-judges those. Everything else would be re-audited with an identical
+    # claim and identical queries.
+    pending_audit_gap_ids: list[str] | None = None
     max_pipeline_iters = (1 + settings.max_remediation_rounds_total
                          + _MAX_NARROW_ITERATIONS)
     for _iter in range(max_pipeline_iters):
@@ -694,11 +698,26 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         db.commit()
         emit_event(task_id, "status", {"status": "auditing_gaps", "gap_count": len(gaps)})
 
+        current_gap_ids = [gap.id for gap in gaps]
+        # A narrowing pass rewrites one gap's claim and leaves the others exactly
+        # as the audit left them. Re-auditing an unchanged gap replays the same
+        # adversarial queries for the same verdict at minutes per gap (observed:
+        # one gap audited four times with an identical query set and an identical
+        # "uncertain", ~19 minutes of a run spent re-deciding settled gaps).
+        audit_gap_ids = current_gap_ids
+        if pending_audit_gap_ids is not None:
+            narrowed_ids = set(pending_audit_gap_ids)
+            audit_gap_ids = [gap_id for gap_id in current_gap_ids if gap_id in narrowed_ids]
+        pending_audit_gap_ids = None
+
         async def _audit_gaps_op(db):
-            return await audit_gap_candidates(db, state, llm, task_id, gap_ids=[gap.id for gap in gaps])
+            return await audit_gap_candidates(db, state, llm, task_id, gap_ids=audit_gap_ids)
 
         audit_input_version = hashlib.sha256(json.dumps({
             "gap_ids": sorted(gap.id for gap in gaps),
+            # Which gaps this run actually judges is part of its identity: after
+            # narrowing, only the rewritten gaps are audited.
+            "audited_gap_ids": sorted(audit_gap_ids),
             # Narrowing rewrites a gap's claimed delta; the audit judges exactly
             # that claim, so it belongs in the audit's input identity. Otherwise a
             # narrowed gap would be skipped as "already audited".
@@ -711,10 +730,10 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             # must invalidate a previously stamped audit run.
             "gap_search_policy_version": GAP_SEARCH_POLICY_VERSION,
         }, sort_keys=True).encode()).hexdigest()
-        await phase_service.execute_phase(
-            db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
-        )
-        current_gap_ids = [gap.id for gap in gaps]
+        if audit_gap_ids:
+            await phase_service.execute_phase(
+                db, task_id, "audit_gaps", _audit_gaps_op, input_version=audit_input_version
+            )
         state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
             GapCandidate.task_id == task_id,
             GapCandidate.contract_id == state.contract_id,
@@ -733,6 +752,8 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                 narrowed = narrow_audited_gaps(db, state, task_id)
                 if narrowed:
                     narrow_iterations += 1
+                    # Only the rewritten gaps need a new verdict.
+                    pending_audit_gap_ids = narrowed
                     logger.info("Task %s: narrowed %d audited gap(s), re-auditing "
                                 "(narrowing pass %d/%d)", task_id[:8], len(narrowed),
                                 narrow_iterations, _MAX_NARROW_ITERATIONS)
