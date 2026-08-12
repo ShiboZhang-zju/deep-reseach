@@ -16,6 +16,16 @@ _SUPPORTING_RELATIONS = {"supports", "partially_answers"}
 _ADMISSIBLE_STATUSES = {"verified", "upgraded", "abstract_only"}
 _LIMITATION_SIGNAL_TYPES = {"limitation", "negative_result"}
 _MIN_RELATION_RELEVANCE = 0.5
+# The admitted evidence pool grows with every search round, but the prompt has
+# to stay inside the model's context window. Observed on a real run: 9 admitted
+# units in round 1, 74 in round 3, and a round-4 prompt the backend rejected at
+# 40961 tokens against a 40960-token window — which failed a two-hour task
+# outright. Selection is therefore bounded per question, per paper and overall,
+# and rotates across questions so one heavily covered question cannot crowd the
+# others out of the prompt.
+_MAX_EVIDENCE_PER_QUESTION = 8
+_MAX_EVIDENCE_PER_PAPER_PER_QUESTION = 2
+_MAX_PROMPT_EVIDENCE = 40
 # Bumped to v3 when "covered" questions became eligible for mining: the policy
 # version is what invalidates gaps already stamped for a round, so a change to
 # the admission rules must bump it or the new rules never take effect on a
@@ -174,6 +184,77 @@ def _format_evidence(evidence: list[EvidenceUnit],
     return "\n".join(lines)
 
 
+def _evidence_priority(item: EvidenceUnit) -> tuple:
+    """Rank evidence by how much it can contribute to a defensible gap.
+
+    A gap needs a documented shortcoming and independent papers behind it, so
+    limitation-type and full-text-locatable units come first; the ID breaks ties
+    to keep selection deterministic across runs.
+    """
+    return (
+        0 if item.evidence_type in _LIMITATION_SIGNAL_TYPES else 1,
+        0 if _is_fulltext_locatable(item) else 1,
+        0 if item.verification_status in {"verified", "upgraded"} else 1,
+        -float(item.extraction_confidence or 0.0),
+        item.id,
+    )
+
+
+def select_prompt_evidence(
+    passed_admissions: dict[str, "QuestionEvidenceAdmission"],
+    evidence_by_id: dict[str, EvidenceUnit],
+    per_question: int = _MAX_EVIDENCE_PER_QUESTION,
+    per_paper: int = _MAX_EVIDENCE_PER_PAPER_PER_QUESTION,
+    total: int = _MAX_PROMPT_EVIDENCE,
+) -> tuple[list[EvidenceUnit], dict[str, list[str]]]:
+    """Pick a bounded evidence subset to offer the model, and its question links.
+
+    Every downstream gate still has to be satisfiable from what is offered, so
+    each question contributes its highest-value units first (limitation signals,
+    full-text spans) while a per-paper cap keeps at least two independent papers
+    in view. Questions are then interleaved round-robin, so the global cap
+    truncates the long tail rather than whole questions.
+    """
+    shortlists: dict[str, list[EvidenceUnit]] = {}
+    for question_id in sorted(passed_admissions):
+        admission = passed_admissions[question_id]
+        candidates = sorted(
+            (evidence_by_id[evidence_id]
+             for evidence_id in admission.admissible_evidence_ids
+             if evidence_id in evidence_by_id),
+            key=_evidence_priority,
+        )
+        per_paper_seen: dict[str, int] = {}
+        shortlist: list[EvidenceUnit] = []
+        for item in candidates:
+            if per_paper_seen.get(item.paper_id, 0) >= per_paper:
+                continue
+            per_paper_seen[item.paper_id] = per_paper_seen.get(item.paper_id, 0) + 1
+            shortlist.append(item)
+            if len(shortlist) >= per_question:
+                break
+        shortlists[question_id] = shortlist
+
+    selected: dict[str, EvidenceUnit] = {}
+    max_depth = max((len(items) for items in shortlists.values()), default=0)
+    for depth in range(max_depth):
+        if len(selected) >= total:
+            break
+        for shortlist in shortlists.values():
+            if len(selected) >= total:
+                break
+            if depth < len(shortlist):
+                item = shortlist[depth]
+                selected.setdefault(item.id, item)
+
+    question_ids_by_evidence: dict[str, list[str]] = {}
+    for question_id in sorted(passed_admissions):
+        for evidence_id in passed_admissions[question_id].admissible_evidence_ids:
+            if evidence_id in selected:
+                question_ids_by_evidence.setdefault(evidence_id, []).append(question_id)
+    return list(selected.values()), question_ids_by_evidence
+
+
 async def mine_gap_candidates(
     db,
     state: ResearchState,
@@ -260,15 +341,19 @@ async def mine_gap_candidates(
         db.commit()
         return []
 
-    allowed_evidence_ids = {
+    admissible_evidence_ids = {
         evidence_id for admission in passed_admissions.values()
         for evidence_id in admission.admissible_evidence_ids
     }
-    evidence = [evidence_by_id[evidence_id] for evidence_id in allowed_evidence_ids]
-    question_ids_by_evidence: dict[str, list[str]] = {}
-    for question_id, admission in passed_admissions.items():
-        for evidence_id in admission.admissible_evidence_ids:
-            question_ids_by_evidence.setdefault(evidence_id, []).append(question_id)
+    evidence, question_ids_by_evidence = select_prompt_evidence(
+        passed_admissions, evidence_by_id)
+    if not evidence:
+        db.commit()
+        return []
+    # Only what the model was actually shown may be cited. Validating against
+    # the whole admitted pool would accept IDs the prompt never offered, which
+    # is indistinguishable from a fabricated citation.
+    allowed_evidence_ids = {item.id for item in evidence}
     question_text = "\n".join(
         f"- Question ID: {question.id}\n  Type: {question.question_type}\n  Question: {question.question}"
         for question in questions if question.id in passed_admissions
@@ -291,6 +376,7 @@ async def mine_gap_candidates(
         allowed_for_candidate = {
             evidence_id for question_id in candidate_question_ids
             for evidence_id in passed_admissions.get(question_id, QuestionEvidenceAdmission("", "FAIL")).admissible_evidence_ids
+            if evidence_id in allowed_evidence_ids
         }
         cited_evidence_ids = list(dict.fromkeys(candidate.supporting_evidence_ids))
         # Drop citations that were never offered instead of discarding the whole
@@ -369,6 +455,7 @@ async def mine_gap_candidates(
         "contract_id": contract.id,
         "candidate_count": len(created),
         "evidence_count": len(evidence),
+        "admissible_evidence_count": len(admissible_evidence_ids),
         "supported_gap_types": sorted(_SUPPORTED_GAP_TYPES),
     })
     db.commit()

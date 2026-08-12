@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
 
 import pytest
 
@@ -275,3 +276,109 @@ def test_admission_blocks_verified_contradiction():
     result = evaluate_gap_mining_admission(question, links, evidence)
     assert result.status == "UNKNOWN"
     assert "UNRESOLVED_VERIFIED_CONTRADICTION" in result.reason_codes
+
+
+# --- Bounded evidence selection for the mining prompt -------------------------
+#
+# The admitted pool grows with every search round while the context window does
+# not. A real run went from 9 admitted units in round 1 to 194 in round 4, whose
+# prompt the backend rejected outright (40961 tokens against a 40960 window) and
+# the whole task was failed.
+
+
+@dataclass
+class _FakeEvidence:
+    id: str
+    paper_id: str
+    evidence_type: str = "comparison"
+    verification_status: str = "verified"
+    extraction_confidence: float = 0.8
+    normalized_claim: str = "claim"
+    original_span: str = "span"
+    source_chunk_hash: str = "hash"
+    page_number: int = 3
+    page_start: int | None = None
+    span_start: int = 10
+    span_end: int = 40
+    section: str = "results"
+    conditions_json: str = "{}"
+
+
+def _passing_admission(question_id: str, evidence_ids: list[str]):
+    from app.agent.steps.mine_gaps import QuestionEvidenceAdmission
+
+    return QuestionEvidenceAdmission(
+        question_id, "PASS", [], list(evidence_ids), list(evidence_ids),
+    )
+
+
+def test_prompt_evidence_is_bounded_and_shared_across_questions():
+    from app.agent.steps.mine_gaps import select_prompt_evidence
+
+    evidence_by_id = {}
+    admissions = {}
+    for question_index in range(4):
+        ids = []
+        for evidence_index in range(30):
+            item = _FakeEvidence(
+                id=f"q{question_index}-e{evidence_index:02d}",
+                paper_id=f"q{question_index}-p{evidence_index % 10}",
+                evidence_type="limitation" if evidence_index == 0 else "comparison",
+            )
+            evidence_by_id[item.id] = item
+            ids.append(item.id)
+        admissions[f"q{question_index}"] = _passing_admission(f"q{question_index}", ids)
+
+    selected, links = select_prompt_evidence(admissions, evidence_by_id,
+                                             per_question=8, per_paper=2, total=20)
+
+    assert len(selected) == 20
+    # Every admitted question is represented, so a global cap truncates the long
+    # tail instead of silently dropping whole questions from the prompt.
+    assert {item.id.split("-")[0] for item in selected} == {"q0", "q1", "q2", "q3"}
+    # A gap needs a documented shortcoming, so each question's limitation unit is
+    # offered first.
+    assert {f"q{index}-e00" for index in range(4)} <= {item.id for item in selected}
+    assert all(links[item.id] for item in selected)
+
+
+def test_per_paper_cap_keeps_independent_papers_in_view():
+    from app.agent.steps.mine_gaps import select_prompt_evidence
+
+    evidence_by_id = {}
+    ids = []
+    for index in range(10):
+        item = _FakeEvidence(
+            id=f"e{index:02d}",
+            # Nine units from one paper and one from another: without a per-paper
+            # cap the prompt could offer a single paper, and no candidate could
+            # then satisfy the two-paper gate.
+            paper_id="p1" if index < 9 else "p2",
+            evidence_type="limitation" if index in (0, 9) else "comparison",
+        )
+        evidence_by_id[item.id] = item
+        ids.append(item.id)
+
+    selected, _ = select_prompt_evidence({"q": _passing_admission("q", ids)}, evidence_by_id,
+                                         per_question=4, per_paper=2, total=10)
+
+    assert len({item.paper_id for item in selected}) == 2
+    assert len(selected) == 3
+
+
+def test_prompt_evidence_selection_is_deterministic():
+    from app.agent.steps.mine_gaps import select_prompt_evidence
+
+    evidence_by_id = {}
+    ids = []
+    for index in range(12):
+        item = _FakeEvidence(id=f"e{index:02d}", paper_id=f"p{index % 4}")
+        evidence_by_id[item.id] = item
+        ids.append(item.id)
+    admissions = {"q1": _passing_admission("q1", ids[:6]),
+                  "q2": _passing_admission("q2", ids[6:])}
+
+    first = [item.id for item in select_prompt_evidence(admissions, evidence_by_id, total=5)[0]]
+    second = [item.id for item in select_prompt_evidence(admissions, evidence_by_id, total=5)[0]]
+
+    assert first == second
