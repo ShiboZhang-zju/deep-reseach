@@ -28,10 +28,12 @@ flowchart TD
 
     O --> O1{有缺口?}
     O1 -- 否 --> R2[O2 定向补检索<br/>缺 limitation 时检索 limitations of X] --> O
-    O1 -- 是 --> P[Gap Audit 对抗审计<br/>近邻对比确认缺口是否成立]
+    O1 -- 是 --> P[Gap Audit 对抗审计<br/>近邻对比确认缺口是否成立<br/>无新对照则关为不可判定]
 
     P --> P1{有存活缺口?}
-    P1 -- 否 --> R3[O2 定向补检索] --> O
+    P1 -- 否 --> P2{有可收窄的缺口?}
+    P2 -- 是 --> P3[收窄缺口主张<br/>采用审计给出的 remaining_delta] --> P
+    P2 -- 否 --> R3[O2 定向补检索] --> O
     P1 -- 是 --> Q[生成 Intervention 干预方案<br/>硬闸门: 证据/新颖性/可行性]
 
     Q --> Q1{有通过闸门的方案?}
@@ -45,34 +47,64 @@ flowchart TD
     R4 -.预算耗尽.-> T
 ```
 
-> 图中 O2/O7 为本次优化引入的能力：O2 定向补检索回环让闸门失败时自动补检索重试而非直接终止；O7 在入库前按主题相似度过滤离题论文。所有终止路径都会产出 Landscape Brief。
+> 图中 O2/O7 为链路优化引入的能力：O2 定向补检索回环让闸门失败时自动补检索重试而非直接终止；O7 在入库前按主题相似度过滤离题论文。所有终止路径都会产出 Landscape Brief。
+
+## 快速开始
+
+```bash
+# 1. 配置：复制 .env.example 到项目根目录的 .env，至少填好 LLM 端点与 Embedding
+cp .env.example .env
+
+# 2. 后端
+cd backend
+pip install -r requirements.txt
+python -m alembic upgrade head          # 建库 / 升级到最新迁移
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# 3. 前端（另开一个终端）
+cd frontend
+npm install
+npm run dev
+
+# 4. 测试
+cd backend && python -m pytest -q
+```
+
+发起一次研究：`POST /api/tasks`（body 含研究方向），再 `POST /api/tasks/{id}/start`。任务终态为 `more_research_required` 时可直接再次 `start` 续跑，已入库的论文与证据会被复用。
+
+> 单次完整运行约 20-60 分钟，主要花在证据抽取与外部检索上；`AGENT_TIMEOUT_SECONDS` 需留足（默认配置为 10800）。进度增量提交，超时或中断都可续跑。
 
 ## 技术栈
 
 | 层 | 选型 |
 |----|------|
 | 后端框架 | FastAPI (Python 3.11+) |
-| 数据库 | SQLite |
+| 数据库 | SQLite（WAL）+ Alembic 迁移 |
 | ORM | SQLAlchemy 2.0 |
-| LLM | 多 provider 可切换，默认 Venus LLM Proxy（兼容 OpenAI API，模型 gpt-4o-2024-11-20） |
+| LLM | 多 provider 可切换；当前部署为本地 Qwen3.5-397B-A17B（OpenAI 兼容端点，40960 上下文） |
 | 论文数据源 | Semantic Scholar + arXiv + OpenAlex + Crossref + Unpaywall + CORE（无 key 时走免费额度） |
-| 向量检索 | ChromaDB + 可插拔 Embedding 后端（默认 OpenAI 兼容 API，绕开本地 PyTorch） |
+| 向量检索 | ChromaDB + 可插拔 Embedding 后端（当前用 DashScope `text-embedding-v4` / 1024 维，绕开本地 PyTorch） |
 | 前端 | Vite + React + TypeScript + Tailwind CSS |
 | Agent 架构 |轻量自研 Loop（不依赖 LangGraph） |
 
 ## 核心参数
 
-| 参数 | 默认值 |
-|------|--------|
-| 最大检索轮数 | 5 轮 |
-| 每轮生成 Query 数 | 3-5 个 |
-| 每源每 Query 返回论文数 | 15篇 |
-| 研究问题分解数量 | 5-12 个 |
-| O2 定向补检索：每原因上限 | 2 次 |
-| O2 定向补检索：全局轮数上限 | 3 轮 |
-| O7 相似度预过滤阈值 | 0.35 |
-| 评分批内校准最小批量 | 5 篇 |
-| 实验方案输出格式 | Markdown + JSON 双格式 |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| 最大检索轮数 | 5 轮（当前 .env 设为 3） | |
+| 每轮生成 Query 数 | 3-5 个 | |
+| 每源每 Query 返回论文数 | 15 篇 | |
+| 研究问题分解数量 | 5-12 个 | |
+| 每轮抽取证据的论文数 | 30 篇（当前 .env 设为 15） | 抽取是单轮耗时主体，约 50s/篇 |
+| 每篇论文送入 LLM 的 chunk 数 | 6 | 按 section 轮转分配，见「证据供给」 |
+| LLM 上下文 / 预留输出 | 40960 / 4096 tokens | 输入准入上限 = 两者之差再留 512 余量 |
+| Gap 挖掘注入证据上限 | 每问题 8 条 / 每问题内每论文 2 条 / 全局 40 条 | prompt 规模必须与轮次无关 |
+| Gap 收窄次数上限 | 单 Gap 2 次 | |
+| O2 定向补检索：每原因上限 | 2 次 | |
+| O2 定向补检索：全局轮数上限 | 3 轮 | |
+| O7 相似度预过滤阈值 | 0.35 | |
+| 评分批内校准最小批量 | 5 篇 | |
+| 实验方案输出格式 | Markdown + JSON 双格式 | |
 
 ## 终止条件（满足任一即停止）
 
@@ -87,17 +119,53 @@ flowchart TD
 | 场景 | 处理 |
 |------|------|
 | 单个数据源失败 | 记录错误并跳过该源，继续其他数据源 |
+| 数据源返回 429 | 交给源级 cooldown 接管，不做短间隔退避重试（限流通常是出口 IP 级别的，重试只会加剧） |
 | 全部数据源失败 | 本轮重试一次 |
 | 重试后仍失败 | 任务标记为 `failed`，等待用户重新启动或修改配置 |
-| LLM 调用失败 | 重试 3 次（指数退避），仍失败则标记本轮为 `failed` |
+| LLM 调用失败（可重试） | 重试 3 次（指数退避） |
+| LLM 返回非法 JSON | 追加一次纠正轮次；只回显 400 字符摘录，保证重试请求不大于首轮 |
+| LLM prompt 超出上下文 | 抛 `LLMContextOverflow`（与"服务故障"区分），由调用方缩小输入 |
+| Gap 挖掘阶段失败 | 降级为 `more_research_required` 并照常产出 Landscape Brief，已完成的检索/证据/覆盖度全部保留、可续跑 |
+| 单个 Gap 的审计决策非法 | 只废弃该条决策，其余 Gap 的结论保留（失败粒度与输出粒度对齐） |
+
+## LLM 请求预算与上下文管理
+
+本地部署的上下文窗口是硬约束（40960），且后端在两种情况下都只回一个笼统的 400：输入本身过长，或 `输入 + max_tokens` 超过窗口。以下机制保证 prompt 规模与轮次无关、且失败可归因：
+
+- **输入准入**：发送前按字符估算 prompt 规模，超过 `上下文 - 预留输出 - 512` 即拒绝并抛 `LLMContextOverflow`，而不是等一个无法归因的 400。
+- **估算自校准**：字符估算没有单一正确除数（UUID 密集文本实测约 1.8 字符/token，散文约 4），因此用后端返回的 `usage.prompt_tokens` 持续校准比值，取最坏近期观测并缓慢衰减；后端拒绝时还会从报错里的实测 prompt 规模反向校准。
+- **输出额度**：`LLM_MAX_OUTPUT_TOKENS` 是准入时预留的**下限**而非上限。短 prompt 会按「上下文 − prompt 上界」申请更大的输出额度（报告类输出远超 4k tokens），且该上界按估算 ×1.5 + 2048 计算——因为后端拒绝 `输入 + max_tokens > 上下文`，用估算值直接计算会在估算偏低时越界。
+- **额度自愈**：若因 `输入 + max_tokens` 超限被拒，先用预留下限重发一次（额度是本系统自己选的，不该让某个阶段为此失败），prompt 本身过大才上报。
+- **注入有界**：凡是"把某张表的全部行拼进 prompt"的步骤都必须有界。Gap 挖掘按每问题/每论文/全局三层上限选取证据，并在问题之间轮转，使全局上限截断长尾而不是让整个问题从 prompt 中消失；校验引用时只认实际注入的证据 ID，否则模型引用一个从未展示过的 ID 会与凭空编造无法区分。
+
+## 证据供给与关系语义
+
+Gap 能否挖出来，取决于抽取阶段是否供给了准入所需的证据类型：
+
+- **chunk 预算按 section 轮转**：每篇论文 6 个 chunk 的预算在各 section 间轮转分配（conclusion 优先级最高），而不是按 section 全局排序后截断。PDF 解析把 Discussion / Limitations / Threats to Validity / Future Work 都归入 `conclusion`，而 Gap 准入要求每个研究问题至少有一条局限性信号；按全局优先级排序时，长 method 段会吃满整篇论文的预算，实测导致 conclusion 段一条证据都进不了模型。
+- **section 提示**：conclusion 段要求把边界、失败条件、未测设定标为 `limitation` / `negative_result`；method / experiment 段要求记录实际评估的设定、数据集、基线，以及**文本中明确写出**的限制，并禁止推断文本未陈述的内容（span 定位校验是硬保障）。
+- **supporting 语义单一来源**：`app/agent/evidence_relations.py` 统一定义哪些 `relation_type` 算证实（`supports`、`partially_answers`）、哪些算反证，以及 0.5 的最低相关性门槛，覆盖度与 Gap 挖掘共用。此前两者定义不一致（覆盖度只认 `supports`，把 `partially_answers` 当背景），而匹配 prompt 恰恰把 `partially_answers` 定义为"部分回答/指出局限"、兜底启发式又把每条 `limitation` 映射到它——实测同一批证据在覆盖度侧算 0.15、在挖掘侧却可准入。
+
+## Gap 生命周期
+
+```
+candidate → auditing → confirmed → surviving        # 通过对抗审计，进入下游
+                    ↘ partially_closed → audited    # 被近邻部分覆盖，收窄后重审
+                    ↘ closed → rejected             # 已被现有工作覆盖
+```
+
+- **收窄**（`steps/narrow_gaps.py`）：采用审计给出的 remaining_delta 作为新的 claimed_delta，把近邻已覆盖的内容并入 existing_coverage，回到 auditing 重新争取 confirmed；不调用 LLM，无具体 delta 则不收窄，单 Gap 上限 2 次。
+- **只重审有新输入的 Gap**：收窄只改写一个 Gap 的主张，因此下一轮审计只判定被收窄的那些。重审一个输入未变的 Gap 会用同样的对抗 query 得到同样的结论。
+- **不可判定终结**：若上一次已判定的审计要求 `more_search`，而本轮的 claim 与近邻集合完全未变，说明这个诉求无法被满足（例如外部检索源被限流、拿不到任何新对照），该 Gap 直接关闭为不可判定（`audit_result` 保持 `uncertain`，`rejection_reason` 记 `novelty_undecidable`），不再消耗预算。它会作为"未获证实"被如实记录，而不是被静默丢弃。
+- 审计规则或准入规则变更时必须递增 `GAP_MINING_POLICY_VERSION` / `GAP_SEARCH_POLICY_VERSION`，否则续跑会命中阶段幂等直接复用旧结论。
 
 ## 项目结构
 
 ```
 deep-research/
 ├── README.md
+├── .env                             # 实际配置（不入库）
 ├── .env.example
-├── docker-compose.yml
 │
 ├── backend/
 │   ├── requirements.txt
@@ -120,21 +188,34 @@ deep-research/
 │   │   │
 │   │   ├── agent/
 │   │   │   ├── __init__.py
-│   │   │   ├── runner.py            # Agent Loop 主调度（精简版，仅编排逻辑）
+│   │   │   ├── runner.py            # Agent Loop 主调度（仅编排逻辑）
 │   │   │   ├── state.py             # ResearchState 数据结构
 │   │   │   ├── policy.py             # 终止条件判断
+│   │   │   ├── evidence_relations.py # supporting/反证关系与最低相关性的单一定义
 │   │   │   ├── prompts.py           # 所有 LLM prompt 模板
 │   │   │   └── steps/               # 各步骤独立模块（可单测）
-│   │   │       ├── __init__.py
-│   │   │       ├── clarify_topic.py    # 方向澄清
-│   │   │       ├── generate_queries.py # 生成检索 Query
-│   │   │       ├── search_papers.py    # 多源检索 + 去重 + 保存
-│   │   │       ├── score_papers.py    # 评分（含 authority 调整）
-│   │   │       ├── summarize_round.py # 轮次摘要 + 知识缺口
-│   │   │       ├── build_clusters.py  # 论文聚类（Wiki 优先，LLM 兜底）
-│   │   │       ├── generate_report.py # 报告生成（STORM 两步式）
-│   │   │       ├── generate_ideas.py  # Idea 生成 + 5层验证
-│   │   │       └── generate_experiment.py # 实验方案 + 深评
+│   │   │       ├── clarify_topic.py           # 方向澄清
+│   │   │       ├── build_contract.py          # Research Contract（方向 + 资源约束）
+│   │   │       ├── decompose_research_space.py # 分解 Research Questions
+│   │   │       ├── generate_queries.py        # 生成检索 Query
+│   │   │       ├── search_papers.py           # 多源检索 + 去重 + 保存
+│   │   │       ├── score_papers.py            # 评分（含跨论文校准）
+│   │   │       ├── summarize_round.py         # 轮次摘要
+│   │   │       ├── extract_evidence.py        # 抽取 Evidence Units（section 轮转预算）
+│   │   │       ├── update_coverage.py         # 问题-证据覆盖矩阵
+│   │   │       ├── readiness_gate.py          # 进入机会流水线的准入判定
+│   │   │       ├── mine_gaps.py               # 挖掘 Gap Candidates（证据注入有界）
+│   │   │       ├── audit_gaps.py              # 对抗审计（近邻对比 / 不可判定终结）
+│   │   │       ├── narrow_gaps.py             # 收窄 partially_closed 的 Gap
+│   │   │       ├── targeted_research.py       # O2 定向补检索
+│   │   │       ├── generate_interventions.py  # 干预方案 + 可行性硬闸门
+│   │   │       ├── generate_minimal_experiments.py # 最小实验方案
+│   │   │       ├── generate_landscape_brief.py # 领域态势简报（所有终止路径）
+│   │   │       ├── analyze_papers.py          # PDF 全文分析
+│   │   │       ├── build_clusters.py          # 论文聚类（Wiki 优先，LLM 兜底）
+│   │   │       ├── generate_report.py         # 报告生成（STORM 两步式）
+│   │   │       ├── generate_ideas.py          # Idea 生成（V1 链路保留）
+│   │   │       └── generate_experiment.py     # 实验方案 + 深评（V1 链路保留）
 │   │   │
 │   │   ├── llm/
 │   │   │   ├── __init__.py
@@ -181,13 +262,9 @@ deep-research/
 │   │       ├── scoring_service.py   # 论文评分
 │   │       └── event_service.py     # SSE 事件推送
 │   │
-│   ├── tests/
-│   │   ├── __init__.py
-│   │   ├── test_agent.py
-│   │   ├── test_sources.py
-│   │   └── test_api.py
+│   ├── tests/                       # 262 个测试（pytest -q）
 │   │
-│   └── alembic/                     # 数据库迁移（可选）
+│   └── alembic_migrations/          # 数据库迁移（Alembic，0001 → 0017）
 │
 └── frontend/
     ├── package.json
@@ -218,6 +295,29 @@ deep-research/
 
 ## 数据库表设计
 
+### Pipeline V2 表一览
+
+V2 的关键状态全部结构化落库，而不是塞进 `state_json`，这样每个结论都能回溯到证据、且续跑幂等：
+
+| 表 | 作用 |
+|----|------|
+| `research_contracts` | 结构化研究方向 + 资源约束；按输入哈希幂等，改写方向会 supersede 旧版本 |
+| `research_questions` | 由 Contract 分解出的 5-12 个可检索问题（含 importance / status） |
+| `evidence_units` | 可回溯的证据单元：normalized_claim + 原文 span + chunk hash + 页码 + verification_status |
+| `question_evidence_links` | 问题-证据关系（relation_type + relevance_score） |
+| `coverage_records` | 每个问题的覆盖度快照（按贡献 supporting 证据的**不同论文数**驱动） |
+| `gap_candidates` | 研究缺口候选（claimed_delta / existing_coverage / status / mining_policy_version） |
+| `gap_evidence_links` | 缺口引用的证据（仅允许引用 prompt 实际展示过的证据） |
+| `gap_audits` | 对抗审计记录（近邻、审计结论、recommended_action、audited_claimed_delta） |
+| `neighbor_comparisons` | 缺口与近邻论文的逐篇对比，按 (gap_id, paper_id) upsert |
+| `intervention_candidates` | 干预方案 + 三道硬闸门结果 + confidence_tier |
+| `search_query_records` / `search_query_papers` | 每条检索 query 的执行记录与命中论文，审计的检索准入依赖它 |
+| `phase_runs` | 阶段级幂等与重试记录（phase_name + input_version + status） |
+| `paper_analyses` / `paper_chunks` / `paper_roles` / `paper_citations` | PDF 全文分析、RAG 分块、论文角色、引用关系 |
+| `wiki_pages` | LLM Wiki 增量编译的 Markdown 页面 |
+
+> `phase_runs.input_version` 必须包含「该阶段自身的策略版本 + 被判定对象的当前内容」。只写前者会导致规则改了却跳过阶段，只写后者会导致改了规则仍复用旧结论。
+
 ### `research_tasks` — 研究任务
 
 | 字段 | 类型 | 说明 |
@@ -239,15 +339,23 @@ deep-research/
 pending                       # 已创建，未启动
 clarifying                    # 正在分析方向是否明确
 waiting_for_clarification     # 等待用户回答澄清问题
+building_contract             # 构建 Research Contract（V2）
+decomposing                   # 分解 Research Questions（V2）
 searching                     # 检索循环中（含 O2 定向补检索）
 summarizing                   # 生成本轮摘要
+extracting_evidence           # 抽取 Evidence Units（V2）
+updating_coverage             # 更新问题-证据覆盖矩阵（V2）
+analyzing_papers              # PDF 全文分析
 mining_gaps                   # 挖掘证据支撑的研究缺口（V2）
 auditing_gaps                 # 对研究缺口做对抗审计（V2）
 synthesizing_ideas            # 生成干预方案（V2）
+generating_ideas              # 生成 Idea（V1 链路）
+judging_ideas                 # Idea 深度评估
 generating_experiment         # 生成最小实验方案
 reporting                     # 生成研究报告
 waiting_for_user_review       # 等待用户查看报告/缺口/创意并反馈
 more_research_required        # 证据不足/无存活缺口，已产出 Landscape Brief（V2）
+insufficient_evidence         # 证据不足以支撑任何缺口（V2）
 abstained                     # 系统主动弃权，未产出可信 Idea（V2）
 done                          # 完成
 stopped                       # 用户手动停止
@@ -493,22 +601,29 @@ final_score = idea_score - 0.08 × risk
 
 ## LLM Provider 架构
 
-默认使用 Venus LLM Proxy（兼容 OpenAI API 格式），支持多 provider 切换。
+Provider 通过 OpenAI 兼容协议对接，可切换。当前部署指向本地 Qwen3.5-397B-A17B。
 
 ```python
-# 抽象基类
+# 抽象基类（app/llm/base.py）
 class LLMProvider(ABC):
     @abstractmethod
-    async def chat(self, messages, response_format="text") -> str: ...
+    async def chat(self, messages, temperature=0.7) -> str: ...
 
     @abstractmethod
     async def chat_json(self, messages, schema: type[BaseModel]) -> BaseModel: ...
 
-# Venus Provider（默认，兼容 OpenAI API）
+    # 预算与估算校准（所有 provider 共用）
+    def calibrate_token_estimate(self, estimated: int, measured: int) -> None: ...
+
+class LLMBudgetExceeded(RuntimeError): ...   # 超出单任务调用/token 预算
+class LLMContextOverflow(RuntimeError): ...  # prompt 本身放不进上下文窗口
+
+# 默认 provider（OpenAI 兼容；名字沿用 venus_*，实际端点由 .env 决定）
 class VenusProvider(LLMProvider):
-    # base_url = http://v2.open.venus.oa.com/llmproxy
-    # token = ENV_VENUS_OPENAPI_SECRET_ID + "@4083"
-    # model = gpt-4o-2024-11-20
+    # base_url = VENUS_LLM_PROXY_URL   例：http://<host>:8080/openapi
+    # model    = VENUS_LLM_MODEL       例：Qwen3.5-397B-A17B-...
+    # extra_body 透传厂商参数：top_k / repetition_penalty /
+    #            chat_template_kwargs.enable_thinking
     ...
 
 # 工厂模式
@@ -517,11 +632,9 @@ class LLMFactory:
     def create(provider_name: str) -> LLMProvider:
         # venus / openai / deepseek / qwen / claude
         ...
-
-# 配置切换
-# .env: LLM_PROVIDER=venus
-# 代码中: llm = LLMFactory.create(settings.llm_provider)
 ```
+
+> **本地 Qwen 的两个坑**：不传 `chat_template_kwargs.enable_thinking=False` 时，`content` 为 `null`、内容全在 `reasoning` 字段（`json.loads(None)` 会抛 TypeError，因此 provider 统一按空响应处理）；网关把真实错误嵌在 `forward bad request` 信封里（外层 `code: -3007`、`message` 为空），日志需保留足够长度才能归因。
 
 ## 前端页面布局
 
@@ -546,12 +659,15 @@ class LLMFactory:
 ## 环境变量
 
 ```env
-# LLM Provider
+# LLM Provider（OpenAI 兼容协议；provider 名沿用 venus，端点由下面三项决定）
 LLM_PROVIDER=venus
-# Venus LLM Proxy（兼容 OpenAI API 格式）
-ENV_VENUS_OPENAPI_SECRET_ID=你的token
-VENUS_LLM_PROXY_URL=http://v2.open.venus.oa.com/llmproxy
-VENUS_LLM_MODEL=gpt-4o-2024-11-20
+ENV_VENUS_OPENAPI_SECRET_ID=            # 走本地端点时可留空
+VENUS_LLM_PROXY_URL=http://<host>:8080/openapi
+VENUS_LLM_MODEL=Qwen3.5-397B-A17B-W8A8-P800-Functional-Agent
+
+# 上下文预算（必须与实际模型一致，否则超长 prompt 只会得到笼统的 400）
+LLM_CONTEXT_TOKENS=40960
+LLM_MAX_OUTPUT_TOKENS=4096              # 准入时预留的输出下限，不是上限
 
 # OpenAI（备用 provider）
 OPENAI_API_KEY=
@@ -565,20 +681,30 @@ SEMANTIC_SCHOLAR_API_KEY=
 # OpenAlex / Crossref：填邮箱即可进入 polite pool，限速更宽松（无需审批，即时生效）
 OPENALEX_EMAIL=your@email.com
 CROSSREF_EMAIL=your@email.com
+CORE_API_KEY=
 
-# Embedding 后端（本次优化：可插拔，默认走 OpenAI 兼容 API，绕开 Windows PyTorch segfault）
+# Embedding 后端（可插拔，走 OpenAI 兼容 API 绕开 Windows PyTorch segfault）
 EMBEDDING_BACKEND=api                    # api | local
-EMBEDDING_API_URL=# 留空则从 VENUS_LLM_PROXY_URL 派生 /embeddings
-EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_DIM=1536
+EMBEDDING_API_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
+EMBEDDING_KEY=                           # 独立的 embedding key，留空则回退到 openai/venus
+EMBEDDING_MODEL=text-embedding-v4
+EMBEDDING_DIM=1024                       # 必须与所选模型一致
 
 # Agent 参数
-MAX_ROUNDS=5
+MAX_ROUNDS=3
 QUERIES_PER_ROUND=5
 PAPERS_PER_SOURCE_PER_QUERY=15
 HIGH_PRIORITY_TARGET=15
+AGENT_TIMEOUT_SECONDS=10800              # 抽取约 50s/篇，是单次运行耗时主体
 
-# 优化参数（本次引入）
+# 证据抽取
+EVIDENCE_MAX_PAPERS=15                   # 每轮抽取的论文数
+EVIDENCE_BATCH_SIZE=4                    # 每批论文数，同时也是批内并发度
+EVIDENCE_MAX_CHUNKS_PER_PAPER=6          # 按 section 轮转分配
+EVIDENCE_CHUNK_CONCURRENCY=4
+ENABLE_RAG_INDEXING=false                # 关闭 RAG 索引后仍会抽取证据
+
+# 优化参数
 MAX_REMEDIATION_ATTEMPTS=2               # O2 每个失败原因的定向补检索上限
 MAX_REMEDIATION_ROUNDS_TOTAL=3           # O2 全局定向补检索轮数上限
 SEARCH_PREFILTER_MIN_SIMILARITY=0.35     # O7 入库前主题相似度过滤阈值（0 关闭）
@@ -596,6 +722,8 @@ PORT=8000
 # 设置后，POST/PUT/DELETE /api/tasks 请求需携带 X-API-Key 头
 API_KEY=
 ```
+
+> 改动 `.env` 后必须重启 uvicorn：配置在进程启动时读入。数据库结构变更后执行 `python -m alembic upgrade head`。
 
 ## SQLite 配置
 
@@ -616,75 +744,64 @@ engine = create_engine(
 
 > MVP 阶段可接受。如后续需多用户并发，建议迁移至 PostgreSQL。
 
-## Agent Loop 伪代码
+## Agent Loop 伪代码（Pipeline V2）
 
 ```python
 async def run_task(task_id: str):
     state = load_or_create_state(task_id)
 
-    # 1. 方向澄清
+    # 1. 方向澄清 → Research Contract → Research Questions
     clarity = await clarify_topic(state)
     if not clarity.is_clear:
         save_clarification_questions(task_id, clarity.questions)
         update_task_status(task_id, "waiting_for_clarification")
         return  # 等待用户回答后再次调用
 
-    update_task_status(task_id, "searching")
+    contract = await build_contract(state)              # 幂等：按输入哈希
+    questions = await decompose_research_space(contract) # 5-12 个可检索问题
 
-    # 2. 检索 loop
-    while True:
-        stop, reason = should_stop(state)
-        if stop:
-            state.stop_reason = reason
-            break
-
+    # 2. 证据积累循环
+    while not should_stop(state):
         state.current_round += 1
-        update_task_status(task_id, "searching")
-
         queries = await generate_queries(state)
-        candidates = await search_papers(queries)       # 多源并行
-        papers = normalize_papers(candidates)
-        papers = deduplicate_papers(papers, existing_ids=state.collected_paper_ids)
+        papers = deduplicate(await search_papers(queries))
+        scored = await score_papers(state, save(papers))
 
-        saved = save_papers_and_links(task_id, papers, state.current_round)
-        scored = await score_papers(state, saved)
+        await extract_evidence(state, scored)   # section 轮转预算，落 Evidence Units
+        await update_coverage(state, questions) # 按贡献证据的不同论文数计覆盖度
+        save_state(task_id, state)              # 增量提交，超时可续跑
 
-        update_task_status(task_id, "summarizing")
-        round_summary = await summarize_round(state, scored)
-        gaps = await analyze_gaps(state, scored)
+    # 3. 机会流水线：每个闸门失败都可回到定向补检索，预算耗尽则出简报
+    if not readiness_gate(state).passed:
+        return await terminate_with_brief(state, "more_research_required")
 
-        update_state(state, queries, scored, round_summary, gaps)
-        save_state(task_id, state)  # 持久化 state_json
+    for _ in range(pipeline_budget):
+        gaps = await mine_gaps(state)                    # 注入证据有界
+        await audit_gaps(state, gaps)                    # 仅审输入有变化的 Gap
+        surviving = [g for g in gaps if g.status == "surviving"]
+        if not surviving:
+            if narrow_audited_gaps(state):               # 收窄后重审
+                continue
+            if await try_remediate(state, "no_surviving_gap"):
+                continue
+            return await terminate_with_brief(state, "more_research_required")
 
-    # 3. 报告和 Ideas
-    update_task_status(task_id, "reporting")
-    report = await generate_report(state)
+        interventions = await generate_interventions(state, surviving)
+        passed = [i for i in interventions if i.gate_status != "FAIL"]
+        if not passed:
+            if await try_remediate(state, "no_intervention"):
+                continue
+            return await terminate_with_brief(state, "more_research_required")
 
-    update_task_status(task_id, "generating_ideas")
-    ideas = await generate_ideas(state)
-    judged = await judge_ideas_initially(state, ideas)
+        await generate_minimal_experiments(state, passed)  # 形成 Research Idea
+        break
 
-    save_report(task_id, report)
-    save_ideas(task_id, judged)
-
+    # 4. 任何终止路径都产出 Landscape Brief；不允许 auto-promote
+    await generate_landscape_brief(state)
     update_task_status(task_id, "waiting_for_user_review")
-
-
-async def generate_experiment_for_selected_ideas(task_id: str, idea_ids: list[str]):
-    update_task_status(task_id, "judging_ideas")
-    reviews = await judge_ideas_deeply(task_id, idea_ids)
-    good_ideas = [r for r in reviews if r.decision == "go"]
-
-    if not good_ideas:
-        update_task_status(task_id, "waiting_for_user_review")
-        return {"status": "need_more_research", "reason": "No selected idea is ready for experiment."}
-
-    update_task_status(task_id, "generating_experiment")
-    plans = await generate_experiment_plans(task_id, good_ideas)
-
-    update_task_status(task_id, "done")
-    return plans
 ```
+
+> 关键约束：不允许 auto-promote（`final_score` 由用户评审阶段决定）、允许"零可信 Idea"的诚实结论、Generator 与 Auditor 隔离、每个阶段经 `phase_runs` 幂等把关。
 
 ## 开发计划
 
@@ -720,6 +837,43 @@ async def generate_experiment_for_selected_ideas(task_id: str, idea_ids: list[st
 - [x] **前端 V2 适配**：新增"研究缺口"页签（结构化字段 + A/B 分档 + 审计状态），Idea 卡片增加 A/B/C 置信度徽章
 - [x] **测试**：后端 182 个测试通过（新增 O2、Embedding 单元测试）
 
+### 运行稳定性与证据供给（最新一轮）
+
+**目标**：让链路在真实运行中不因单点失败作废整轮成果，并让上游供给真正满足 Gap 准入。
+
+- [x] **上下文预算体系**：显式预留输出额度、发送前输入准入、估算按实测 usage 自校准、输出额度按 prompt 上界计算并在被拒时自愈、超限与服务故障分类（详见「LLM 请求预算与上下文管理」）
+- [x] **Gap 挖掘注入有界**：每问题/每论文/全局三层上限 + 问题间轮转；校验只认实际注入的证据 ID
+- [x] **失败粒度对齐**：挖掘阶段失败降级为 `more_research_required` 并保留全部检索/证据/覆盖度，不再作废整轮
+- [x] **审计不再空转**：收窄后只重审被收窄的 Gap；`more_search` 无法被满足时关闭为不可判定（新增 `gap_audits.audited_claimed_delta`，迁移 0017）
+- [x] **证据供给对齐准入**：抽取的 chunk 预算按 section 轮转（conclusion 优先），修复 section 名硬编码为空串导致 section 提示从未生效的缺陷
+- [x] **关系语义统一**：新增 `agent/evidence_relations.py` 作为 supporting 语义与最低相关性的单一来源，覆盖度与挖掘共用
+- [x] **测试**：后端 262 个测试通过
+
+### 实测运行画像（RAG 主题，单卡资源约束）
+
+一次完整链路：**1 轮检索、22.4 分钟**，终态 `evidence_grounded_ideas_ready`，产出 2 个干预 / 2 个 A 档 Idea / 2 份最小实验方案。修复前同一主题需要 2 轮、60 分钟。
+
+| 阶段 | 耗时 | 占比 |
+|------|------|------|
+| 证据抽取 | 11-13 分钟（15 篇，约 50s/篇） | 约 60% |
+| 多源检索 | 约 4 分钟/轮 | 约 18% |
+| Gap 审计（含对抗检索） | 3-4 分钟 | 约 16% |
+| 澄清 / 契约 / 分解 / 挖掘 / 干预 / 实验 | 各 0.1-0.7 分钟 | 其余 |
+
+> LLM 单次调用仅 1-2 秒，数百次调用都不是瓶颈；耗时集中在证据抽取与外部检索的网络往返。
+
+**已知瓶颈（下一步方向）**：
+
+1. **limitation 证据仍不足**：`NO_LIMITATION_SIGNAL` 是 Gap 准入的首要拒因。根因不在提示词，而在多数论文没解析出 conclusion 段（PDF 下载/解析失败后走 abstract 兜底），需要先查 PDF 可用率与 section 识别率。
+2. **单轮产出对 PDF 可用率高度敏感**：同主题两次运行的证据总数相差 3 倍（108 vs 36）。
+3. **耗时统计有盲区**：`agent_traces.duration_ms` 恒为 0，且定向补检索内的抽取不建 `phase_runs` 记录。
+4. **`readiness_gate` 的 covered 判据是 `coverage_score > 0`**，字段名 `high_importance_covered_count` 与实际含义不符，容易被误读为质量门槛。
+5. **外部检索源在部分出口 IP 上被整体限流**（OpenAlex 对匿名请求、UA 带 mailto、mailto 查询参数三种方式一律 429），审计的近邻只能靠已入库论文补足。
+
+### 早期 MVP 规划（历史，已被上面三轮实现取代）
+
+> 以下清单是项目初期的分期计划，其内容已由 P0 工程化、Pipeline V2 重构与链路优化覆盖，保留仅作背景参考。
+
 ### MVP 0: 后端最小闭环
 
 **目标**：后端 API + Agent Loop + 基础论文检索 → 跑通完整链路
@@ -754,14 +908,15 @@ async def generate_experiment_for_selected_ideas(task_id: str, idea_ids: list[st
 - [ ] 多 LLM Provider 支持
 - [ ] PostgreSQL 迁移（如需多用户）
 
-## MVP 非目标
+## 当前非目标
 
-第一版暂不支持：
+以下能力暂不支持：
 
-1. PDF 全文下载和解析（只用 title + abstract + citation metadata）
-2. 自动运行真实实验（只生成实验方案文档）
-3. 多用户权限系统
-4. Google Scholar 抓取（无官方稳定 API）
-5. 引用网络深度扩展（引用论文/被引用论文的递归检索）
-6. 向量数据库 / Embedding 检索
-7. LangGraph / AutoGen 等重型 Agent 框架
+1. 自动运行真实实验（只生成实验方案文档）
+2. 多用户权限系统
+3. Google Scholar 抓取（无官方稳定 API）
+4. 引用网络的递归深度扩展（当前只做一跳引用关系）
+5. LangGraph / AutoGen 等重型 Agent 框架
+6. PostgreSQL / 多用户并发（SQLite WAL 足够单用户场景）
+
+> 早期非目标中的 PDF 全文解析、Embedding 向量检索、多 LLM Provider 已经实现。

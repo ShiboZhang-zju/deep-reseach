@@ -33,6 +33,10 @@ env/
 # ===== Test artifacts =====
 backend/tests/audit_report.txt
 
+# ===== Local scratch scripts (one-off probes, task starters, diagnostics) =====
+backend/_*.py
+backend/_*.txt
+
 # ===== Node.js / Frontend =====
 node_modules/
 frontend/dist/
