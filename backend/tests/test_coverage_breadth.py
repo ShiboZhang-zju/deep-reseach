@@ -123,3 +123,60 @@ async def test_same_unit_count_scores_higher_when_spread_across_papers(temp_db, 
     assert broad[0]["new_coverage"] > narrow[0]["new_coverage"]
     db_narrow.close()
     db_broad.close()
+
+
+async def _run_with_relation(db, monkeypatch, task_id, relation, relevance=0.9):
+    from app.agent.state import ResearchState
+    from app.agent.steps import update_coverage as module
+
+    async def _matcher(llm, question, evidence_index):
+        return [(index, relation, relevance) for index in range(len(evidence_index))]
+
+    monkeypatch.setattr(module, "_llm_match_evidence", _matcher)
+    state = ResearchState(task_id=task_id, current_round=1)
+    return await module.update_coverage_matrix(db, state, object(), task_id, round_number=1)
+
+
+@pytest.mark.asyncio
+async def test_partially_answers_corroborates_a_question(temp_db, monkeypatch):
+    """Coverage and gap mining must agree on what counts as support.
+
+    The matcher's prompt defines `partially_answers` as "partially answers /
+    points out a limitation", and the heuristic fallback maps every `limitation`
+    unit to it. Coverage used to file it under background: a real run returned 21
+    such links and zero `supports`, leaving all twelve questions at 0.15 while the
+    same evidence was admissible for mining.
+    """
+    db = temp_db()
+    task, _ = _seed(db, paper_count=6, units_per_paper=1)
+
+    deltas = await _run_with_relation(db, monkeypatch, task.id, "partially_answers")
+
+    assert deltas[0]["supporting"] == 6
+    assert deltas[0]["distinct_supporting_papers"] == 6
+    assert deltas[0]["new_coverage"] > 0.15
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_weak_matches_do_not_corroborate(temp_db, monkeypatch):
+    """Below the shared relevance floor, a link is background for both consumers."""
+    db = temp_db()
+    task, _ = _seed(db, paper_count=6, units_per_paper=1)
+
+    deltas = await _run_with_relation(db, monkeypatch, task.id, "supports", relevance=0.2)
+
+    assert deltas[0]["supporting"] == 0
+    assert deltas[0]["distinct_supporting_papers"] == 0
+    db.close()
+
+
+def test_both_consumers_share_one_relation_definition():
+    """The split that caused the 0.15-vs-1.00 discrepancy must not reappear."""
+    from app.agent.evidence_relations import MIN_RELATION_RELEVANCE, SUPPORTING_RELATIONS
+    from app.agent.steps import mine_gaps, update_coverage
+
+    assert update_coverage.SUPPORTING_RELATIONS is SUPPORTING_RELATIONS
+    assert mine_gaps.SUPPORTING_RELATIONS is SUPPORTING_RELATIONS
+    assert update_coverage.MIN_RELATION_RELEVANCE == mine_gaps.MIN_RELATION_RELEVANCE
+    assert MIN_RELATION_RELEVANCE == 0.5

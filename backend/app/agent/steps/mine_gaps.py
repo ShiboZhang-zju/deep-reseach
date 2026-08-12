@@ -4,6 +4,11 @@ import json
 import logging
 from dataclasses import dataclass, field
 
+from app.agent.evidence_relations import (
+    CONTRADICTING_RELATIONS,
+    MIN_RELATION_RELEVANCE,
+    SUPPORTING_RELATIONS,
+)
 from app.agent.state import ResearchState
 from app.db.models import EvidenceUnit, QuestionEvidenceLink, ResearchContract, ResearchQuestion
 from app.db.repositories import gap_repo, paper_repo
@@ -12,10 +17,8 @@ from app.schemas.schemas import GapCandidateList
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_GAP_TYPES = {"boundary_gap", "missing_evaluation"}
-_SUPPORTING_RELATIONS = {"supports", "partially_answers"}
 _ADMISSIBLE_STATUSES = {"verified", "upgraded", "abstract_only"}
 _LIMITATION_SIGNAL_TYPES = {"limitation", "negative_result"}
-_MIN_RELATION_RELEVANCE = 0.5
 # The admitted evidence pool grows with every search round, but the prompt has
 # to stay inside the model's context window. Observed on a real run: 9 admitted
 # units in round 1, 74 in round 3, and a round-4 prompt the backend rejected at
@@ -73,11 +76,11 @@ def evaluate_gap_mining_admission(question, links, evidence_by_id) -> QuestionEv
     supporting, contradicting = [], []
     for link in links:
         item = evidence_by_id.get(link.evidence_id)
-        if not item or (link.relevance_score or 0) < _MIN_RELATION_RELEVANCE:
+        if not item or (link.relevance_score or 0) < MIN_RELATION_RELEVANCE:
             continue
-        if link.relation_type in _SUPPORTING_RELATIONS and item.verification_status in _ADMISSIBLE_STATUSES:
+        if link.relation_type in SUPPORTING_RELATIONS and item.verification_status in _ADMISSIBLE_STATUSES:
             supporting.append(item)
-        if link.relation_type == "contradicts" and item.verification_status in {"verified", "upgraded"}:
+        if link.relation_type in CONTRADICTING_RELATIONS and item.verification_status in {"verified", "upgraded"}:
             contradicting.append(item)
     papers = sorted({item.paper_id for item in supporting})
     spans = sum(_is_fulltext_locatable(item) for item in supporting)

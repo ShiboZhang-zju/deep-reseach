@@ -10,6 +10,11 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from app.agent.evidence_relations import (
+    CONTRADICTING_RELATIONS,
+    MIN_RELATION_RELEVANCE,
+    SUPPORTING_RELATIONS,
+)
 from app.agent.state import ResearchState
 from app.db.models import (
     EvidenceUnit, ResearchQuestion, CoverageRecord,
@@ -93,11 +98,16 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
             )
             db.add(link)
 
-            if relation_type == "supports":
+            # A weak match corroborates nothing, and gap-mining admission would
+            # reject it anyway; counting it here made coverage look better than
+            # the evidence the pipeline can actually use.
+            if (relevance or 0.0) < MIN_RELATION_RELEVANCE:
+                background += 1
+            elif relation_type in SUPPORTING_RELATIONS:
                 supporting += 1
                 if eu.paper_id:
                     supporting_papers.add(eu.paper_id)
-            elif relation_type == "contradicts":
+            elif relation_type in CONTRADICTING_RELATIONS:
                 contradicting += 1
                 if eu.paper_id:
                     contradicting_papers.add(eu.paper_id)
@@ -259,10 +269,11 @@ async def _llm_match_evidence(llm, question, evidence_index):
                            question.id[:8], batch_start, e)
             for i, eu in enumerate(batch):
                 if eu.evidence_type in _get_relevant_evidence_types(question.question_type):
-                    # 0.5 is the minimum relevance gap-mining admission accepts
-                    # (mine_gaps._MIN_RELATION_RELEVANCE); a lower value would
-                    # make every fallback link silently inadmissible.
-                    results.append((batch_start + i, _determine_relation(eu, question), 0.5))
+                    # MIN_RELATION_RELEVANCE is the weakest match that either
+                    # coverage or gap-mining admission accepts; a lower value here
+                    # would make every fallback link silently inadmissible.
+                    results.append((batch_start + i, _determine_relation(eu, question),
+                                    MIN_RELATION_RELEVANCE))
 
     return results
 
