@@ -944,6 +944,10 @@ class GapAudit(Base):
     # continue / narrow / more_search / reject
     rejection_reason = Column(Text)
     # If recommended_action == reject, why?
+    audited_claimed_delta = Column(Text)
+    # The gap's claimed_delta at the time of this audit. An audit judges exactly
+    # that claim, so a later run needs it to tell "nothing changed, the verdict
+    # would be identical" apart from "the claim was narrowed, judge it again".
 
     # Audit metadata
     audit_round = Column(Integer, nullable=False, default=0)

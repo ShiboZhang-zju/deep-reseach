@@ -11,7 +11,7 @@ from app.agent.state import ResearchState
 from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
-from app.db.models import (EvidenceUnit, GapCandidate, Paper, QuestionEvidenceLink,
+from app.db.models import (EvidenceUnit, GapAudit, GapCandidate, Paper, QuestionEvidenceLink,
                           SearchQueryPaper, SearchQueryRecord, TaskPaper)
 from app.db.repositories import gap_repo, paper_repo, task_repo
 from app.db.repositories.search_query_repo import save_search_query
@@ -19,11 +19,13 @@ from app.db.repositories.search_query_repo import save_search_query
 logger = logging.getLogger(__name__)
 
 _MAX_NEIGHBORS = 5
-# Bumped to v2 when corpus papers from the same research questions became
-# admissible comparison material. Like the mining policy version, this is what
-# invalidates audits already stamped for a round, so an admission-rule change
-# must bump it or resumed tasks keep their old verdicts.
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v2"
+# v2 made corpus papers from the same research questions admissible comparison
+# material; v3 closes a gap as undecidable when a repeated adversarial round
+# brings no new material for the same claim. Like the mining policy version,
+# this is what invalidates audits already stamped for a round, so an
+# admission-or-verdict rule change must bump it or resumed tasks keep their old
+# verdicts.
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v3"
 
 
 class AuditDecisionInvalid(ValueError):
@@ -316,6 +318,44 @@ async def audit_gap_candidates(
     db.commit()
     return results
 
+def _latest_decided_audit(db, gap_id: str) -> GapAudit | None:
+    """The most recent audit that actually had comparison material to judge.
+
+    Audits blocked at search admission are excluded: they describe a retrieval
+    problem, not a verdict, and their neighbor list has a different meaning.
+    """
+    return (db.query(GapAudit)
+            .filter(GapAudit.gap_id == gap_id,
+                    GapAudit.search_admission_status == "PASS",
+                    GapAudit.search_policy_version == GAP_SEARCH_POLICY_VERSION)
+            .order_by(GapAudit.created_at.desc())
+            .first())
+
+
+def _audit_input_repeats(previous: GapAudit | None, gap: GapCandidate,
+                         neighbors: list[Paper]) -> bool:
+    """True when re-judging this gap cannot reach a different verdict.
+
+    `more_search` asks for new comparison material. If a fresh adversarial round
+    surfaced exactly the same neighbors for exactly the same claim, that request
+    has been answered with "there is nothing new" — repeating it replays
+    identical queries for an identical verdict.
+
+    An audit recorded before the claim was tracked (`audited_claimed_delta` is
+    NULL) is treated as different input on purpose: it cannot be shown that the
+    claim is unchanged, and guessing here would close a gap that deserves a
+    verdict.
+    """
+    if previous is None or previous.recommended_action != "more_search":
+        return False
+    if previous.audited_claimed_delta is None:
+        return False
+    if previous.audited_claimed_delta != (gap.claimed_delta or ""):
+        return False
+    return set(json.loads(previous.neighbor_paper_ids_json or "[]")) == {
+        paper.id for paper in neighbors}
+
+
 async def audit_gap_candidate(
     db,
     state: ResearchState,
@@ -359,10 +399,39 @@ async def audit_gap_candidate(
             recommended_action="more_search", audit_round=audit_round,
             search_policy_version=GAP_SEARCH_POLICY_VERSION, search_admission_status=admission.status,
             search_admission_reasons=admission.reason_codes, search_query_ids=admission.query_ids,
+            audited_claimed_delta=gap.claimed_delta or "",
         )
         db.commit()
         return GapAuditResult(gap.id, "uncertain", "more_search", "")
     neighbors = select_gap_specific_neighbors(db, gap, admission.completed_query_ids)
+    if _audit_input_repeats(_latest_decided_audit(db, gap.id), gap, neighbors):
+        # A previous audit asked for more search and got none: same claim, same
+        # neighbors. Observed cost of not detecting this: one gap audited four
+        # times with an identical query set for an identical "uncertain", about
+        # nineteen minutes of a run spent re-deciding a settled question while
+        # the external sources were rate-limited. Close it as undecidable so the
+        # remaining budget goes to gaps that can still be judged; the gap is
+        # reported as unproven rather than silently dropped.
+        gap.status = "rejected"
+        reason = ("novelty_undecidable: adversarial round "
+                  f"{audit_round} surfaced no new comparison material for the same claim")
+        gap_repo.create_gap_audit(
+            db, gap_id=gap.id, task_id=task_id, adversarial_queries=queries,
+            audit_result="uncertain", neighbor_paper_ids=[paper.id for paper in neighbors],
+            recommended_action="reject", rejection_reason=reason, audit_round=audit_round,
+            search_policy_version=GAP_SEARCH_POLICY_VERSION, search_admission_status=admission.status,
+            search_admission_reasons=admission.reason_codes, search_query_ids=admission.query_ids,
+            audited_claimed_delta=gap.claimed_delta or "",
+        )
+        paper_repo.save_trace(db, task_id, "gap_audit_undecidable", "decision", output_data={
+            "gap_id": gap.id,
+            "neighbor_count": len(neighbors),
+            "reason": reason,
+        })
+        logger.info("Gap %s: closing as undecidable — no new comparison material "
+                    "after a repeated adversarial round", gap.id[:8])
+        db.commit()
+        return GapAuditResult(gap.id, "uncertain", "reject", "")
     decision = await llm.chat_json([
         {"role": "system", "content": _AUDIT_SYSTEM},
         {"role": "user", "content": _AUDIT_USER.format(
@@ -397,6 +466,7 @@ async def audit_gap_candidate(
             search_policy_version=GAP_SEARCH_POLICY_VERSION,
             search_admission_status=admission.status,
             search_admission_reasons=admission.reason_codes, search_query_ids=admission.query_ids,
+            audited_claimed_delta=gap.claimed_delta or "",
         )
         paper_repo.save_trace(db, task_id, "gap_audit_invalid_decision", "decision", output_data={
             "gap_id": gap.id, "error": str(err),
@@ -462,6 +532,7 @@ async def audit_gap_candidate(
         search_admission_status=admission.status,
         search_admission_reasons=admission.reason_codes,
         search_query_ids=admission.query_ids,
+        audited_claimed_delta=gap.claimed_delta or "",
     )
     paper_repo.save_trace(db, task_id, "audit_gap_candidate", "decision", output_data={
         "gap_id": gap.id,

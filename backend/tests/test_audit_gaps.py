@@ -245,3 +245,140 @@ async def test_uncertain_audit_never_survives(temp_db):
     assert gap_repo.get_gap(db, gap.id).status == "auditing"
     assert gap_repo.list_gap_audits(db, gap.id)[0].recommended_action == "more_search"
     db.close()
+
+
+class ExplodingAuditLLM:
+    """Fails if consulted, proving a verdict was reached without an LLM call."""
+
+    async def chat_json(self, messages, schema):
+        raise AssertionError("the audit must not re-consult the model on identical input")
+
+
+def _pin_admission_and_neighbors(monkeypatch, db, gap):
+    """Give the audit a fixed PASS admission over one fixed neighbor.
+
+    What is under test is how the audit decides when its input repeats, not how
+    admission is computed (that has its own tests), and real adversarial search
+    returns different papers on every call.
+    """
+    from app.agent.steps import audit_gaps as module
+    from app.db.models import Paper, TaskPaper
+
+    neighbor = Paper(title="Neighbor B", abstract="Evaluates generic long-context recall.",
+                     citation_count=20)
+    db.add(neighbor)
+    db.flush()
+    db.add(TaskPaper(task_id=gap.task_id, paper_id=neighbor.id, discovered_round=1,
+                     final_score=0.8, priority="high"))
+    db.commit()
+
+    admission = module.GapSearchAdmission(
+        gap.id, "PASS", [], ["q1"], ["q1"], [], ["overlap"], 1, [neighbor.id], [neighbor.id])
+    monkeypatch.setattr(module, "evaluate_gap_search_admission",
+                        lambda db, gap, query_ids: admission)
+    monkeypatch.setattr(module, "select_gap_specific_neighbors",
+                        lambda db, gap, query_ids, limit=5: [neighbor])
+    return neighbor
+
+
+@pytest.mark.asyncio
+async def test_repeated_audit_without_new_material_is_closed_as_undecidable(temp_db, monkeypatch):
+    """`more_search` that cannot be satisfied must end, not loop.
+
+    Production case (task 3286cf05): with the external sources rate-limited, one
+    gap was audited four times with an identical query set and an identical
+    "uncertain / more_search" verdict — about nineteen minutes of a run spent
+    re-deciding a settled question.
+    """
+    from app.agent.state import ResearchState
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.models import AgentTrace
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+
+    await audit_gap_candidates(db, state, UncertainAuditLLM(), task.id, perform_search=False)
+    first = gap_repo.list_gap_audits(db, gap.id)[-1]
+    assert first.recommended_action == "more_search"
+    assert first.audited_claimed_delta == gap.claimed_delta
+    assert first.neighbor_paper_ids_json != "[]"
+
+    # A later round re-audits the same claim and finds the same neighbors.
+    state.current_round = 3
+    results = await audit_gap_candidates(db, state, ExplodingAuditLLM(), task.id,
+                                         perform_search=False)
+
+    assert [item.recommended_action for item in results] == ["reject"]
+    assert gap_repo.get_gap(db, gap.id).status == "rejected"
+    latest = gap_repo.list_gap_audits(db, gap.id)[-1]
+    assert latest.audit_result == "uncertain", "it was never decided, only closed"
+    assert "novelty_undecidable" in (latest.rejection_reason or "")
+    assert db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "gap_audit_undecidable").count() == 1
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_narrowed_claim_is_rejudged_even_with_the_same_neighbors(temp_db, monkeypatch):
+    """Narrowing changes what is being claimed, so the verdict must be re-earned.
+
+    This is the inverse guard: skipping a re-audit here would silently discard
+    the entire point of narrowing a gap.
+    """
+    from app.agent.state import ResearchState
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+    await audit_gap_candidates(db, state, UncertainAuditLLM(), task.id, perform_search=False)
+
+    gap = gap_repo.get_gap(db, gap.id)
+    gap.claimed_delta = "固定预算下状态变化的恢复延迟边界"
+    db.commit()
+
+    state.current_round = 3
+    results = await audit_gap_candidates(db, state, ConfirmingAuditLLM(), task.id,
+                                         perform_search=False)
+
+    assert [item.audit_result for item in results] == ["confirmed"]
+    assert gap_repo.get_gap(db, gap.id).status == "surviving"
+    db.close()
+
+
+def test_audits_recorded_before_the_claim_was_tracked_do_not_close_a_gap():
+    """A NULL `audited_claimed_delta` means "unknown", not "unchanged".
+
+    Legacy audit rows predate the column; treating them as a match would close
+    gaps that were never compared on equal terms.
+    """
+    from types import SimpleNamespace
+
+    from app.agent.steps.audit_gaps import _audit_input_repeats
+
+    gap = SimpleNamespace(claimed_delta="delta")
+    neighbors = [SimpleNamespace(id="p1")]
+    legacy = SimpleNamespace(recommended_action="more_search", audited_claimed_delta=None,
+                             neighbor_paper_ids_json='["p1"]')
+    assert _audit_input_repeats(legacy, gap, neighbors) is False
+
+    same = SimpleNamespace(recommended_action="more_search", audited_claimed_delta="delta",
+                           neighbor_paper_ids_json='["p1"]')
+    assert _audit_input_repeats(same, gap, neighbors) is True
+
+    # A verdict that was actually reached is not a stalled search.
+    decided = SimpleNamespace(recommended_action="narrow", audited_claimed_delta="delta",
+                              neighbor_paper_ids_json='["p1"]')
+    assert _audit_input_repeats(decided, gap, neighbors) is False
+
+    # New comparison material means the question is open again.
+    grown = SimpleNamespace(recommended_action="more_search", audited_claimed_delta="delta",
+                            neighbor_paper_ids_json='["p1", "p2"]')
+    assert _audit_input_repeats(grown, gap, neighbors) is False
+    assert _audit_input_repeats(None, gap, neighbors) is False

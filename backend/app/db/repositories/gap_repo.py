@@ -221,6 +221,7 @@ def create_gap_audit(
     audit_round: int = 0,
     search_policy_version: str = "", search_admission_status: str = "UNKNOWN",
     search_admission_reasons: list[str] | None = None, search_query_ids: list[str] | None = None,
+    audited_claimed_delta: str | None = None,
 ) -> GapAudit:
     """Create a gap audit record. Validates task consistency."""
     gap = db.get(GapCandidate, gap_id)
@@ -251,6 +252,7 @@ def create_gap_audit(
         search_admission_status=search_admission_status,
         search_admission_reasons_json=json.dumps(search_admission_reasons or []),
         search_query_ids_json=json.dumps(search_query_ids or []),
+        audited_claimed_delta=audited_claimed_delta,
     )
     db.add(audit)
     db.flush()
