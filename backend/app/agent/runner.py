@@ -59,7 +59,7 @@ from app.agent.steps.narrow_gaps import MAX_NARROW_ATTEMPTS, narrow_audited_gaps
 # smaller claim.
 _MAX_NARROW_ITERATIONS = MAX_NARROW_ATTEMPTS * 4
 from app.llm.factory import get_llm
-from app.llm.base import LLMBudgetExceeded
+from app.llm.base import LLMBudgetExceeded, LLMContextOverflow
 from app.services.event_service import emit_event, emit_event_with_cleanup
 
 logger = logging.getLogger(__name__)
@@ -655,9 +655,29 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         async def _mine_gaps_op(db):
             return await mine_gap_candidates(db, state, llm, task_id)
 
-        gaps = await phase_service.execute_phase(
-            db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
-        )
+        try:
+            gaps = await phase_service.execute_phase(
+                db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
+            )
+        except LLMBudgetExceeded:
+            raise
+        except Exception as mining_err:
+            # Mining is a single LLM call over an evidence pool that grows with
+            # every round, so it is where a prompt first outgrows the context
+            # window. Failing the task discarded several rounds of retrieval,
+            # evidence and coverage — hours of work — over a recoverable
+            # input-size problem. Keep the output and let the task be resumed.
+            reason = ("gap_mining_prompt_too_large"
+                      if isinstance(mining_err, LLMContextOverflow)
+                      else f"gap_mining_failed: {str(mining_err)[:160]}")
+            logger.error("Task %s: gap mining failed (%s); degrading to "
+                         "more_research_required instead of discarding the run",
+                         task_id[:8], mining_err)
+            db.rollback()
+            state = task_repo.get_state(db, task_id)
+            await _terminate_more_research(db, state, task_id,
+                                          "more_research_required", reason)
+            return
         if gaps is None:
             gaps = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
                     if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
