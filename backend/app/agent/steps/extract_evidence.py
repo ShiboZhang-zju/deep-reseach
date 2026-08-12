@@ -255,6 +255,33 @@ async def _extract_from_paper(db, llm, task_id, paper, tp, pdf_path, round_numbe
     return evidence_count
 
 
+def interleave_section_chunks(by_section: dict[str, list], max_chunks: int,
+                              section_priority: dict[str, int]) -> list:
+    """Spend a paper's chunk budget across sections instead of on the longest one.
+
+    Sections are visited in priority order and contribute one chunk per pass, so
+    the budget truncates each section's tail rather than dropping whole sections.
+    Gap mining needs both halves of a paper: limitation statements (conclusion /
+    discussion) and measured comparisons (method / experiment).
+    """
+    ordered = sorted(by_section, key=lambda name: section_priority.get(name, 5))
+    selected: list = []
+    depth = 0
+    while len(selected) < max_chunks:
+        progressed = False
+        for name in ordered:
+            if len(selected) >= max_chunks:
+                break
+            chunks = by_section[name]
+            if depth < len(chunks):
+                selected.append(chunks[depth])
+                progressed = True
+        if not progressed:
+            break
+        depth += 1
+    return selected
+
+
 async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, round_number) -> int:
     """Extract evidence from PDF sections with page numbers and chunk hashes.
 
@@ -268,13 +295,16 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
     chunk_concurrency = max(1, settings.evidence_chunk_concurrency)
 
     # 1) Collect candidate chunks across sections (bounded), de-duplicating and
-    #    skipping already-extracted chunks. The most information-dense sections
-    #    (method/experiment/conclusion) are prioritized over introduction.
+    #    skipping already-extracted chunks.
     section_priority = {
-        "method": 0, "experiment": 1, "conclusion": 2,
+        # Conclusion first: it aggregates Discussion / Limitations / Threats to
+        # Validity / Future Work, and gap mining cannot admit a research question
+        # without a limitation-type signal. Method and experiment then supply the
+        # comparisons, datasets and metrics the same admission needs.
+        "conclusion": 0, "method": 1, "experiment": 2,
         "abstract": 3, "introduction": 4,
     }
-    candidates = []  # (priority, sec_name, chunk_text, chunk_hash)
+    by_section: dict[str, list] = {}
     seen_hashes: set[str] = set()
     for sec_name, sec_text in sections.items():
         if not sec_text.strip():
@@ -295,11 +325,14 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
             ).first()
             if existing:
                 continue
-            candidates.append((prio, sec_name, chunk_text, chunk_hash))
+            by_section.setdefault(sec_name, []).append((prio, sec_name, chunk_text, chunk_hash))
 
-    # Keep only the top `max_chunks` by section priority.
-    candidates.sort(key=lambda c: c[0])
-    candidates = candidates[:max_chunks]
+    # Take chunks round-robin across sections instead of by global priority. A
+    # long method section used to consume the whole per-paper budget, so
+    # conclusions never reached the model at all: on a real run
+    # limitation/negative_result units were 8% of the extracted evidence and 9 of
+    # 12 research questions were then rejected for NO_LIMITATION_SIGNAL.
+    candidates = interleave_section_chunks(by_section, max_chunks, section_priority)
     if not candidates:
         db.flush()
         return 0
@@ -309,10 +342,10 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
     #    these coroutines share one event loop; DB writes happen after gather).
     sem = asyncio.Semaphore(chunk_concurrency)
 
-    async def _extract_one(chunk_text):
+    async def _extract_one(section_name, chunk_text):
         async with sem:
             try:
-                result = await _llm_extract_evidence(llm, paper, chunk_text, "")
+                result = await _llm_extract_evidence(llm, paper, chunk_text, section_name)
                 # _llm_extract_evidence returns an EvidenceExtractionList model;
                 # the actual units are on .evidence_units.
                 return result.evidence_units
@@ -320,8 +353,11 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
                 logger.debug("Chunk extraction failed for paper %s: %s", paper.id[:8], e)
                 return []
 
+    # The section name drives the per-section extraction hints. It used to be
+    # hard-coded to "", so the hints written for conclusion and abstract — the
+    # two sections that carry limitation statements — never applied to anything.
     extraction_results = await asyncio.gather(
-        *[_extract_one(c[2]) for c in candidates]
+        *[_extract_one(c[1], c[2]) for c in candidates]
     )
 
     evidence_count = 0
@@ -460,6 +496,16 @@ async def _llm_extract_evidence(llm, paper, text_chunk, section):
             "Future Work. Prioritize extracting every stated boundary, failure condition, "
             "assumption, and acknowledged untested setting as evidence_type "
             "\"limitation\", \"negative_result\", or \"future_work\"."
+        )
+    elif section in ("method", "experiment"):
+        section_hint = (
+            "\n\nNote: Besides what the work achieves, record the boundaries it states here: the "
+            "settings, datasets, model scales and baselines it actually evaluates, and any "
+            "restriction or assumption that is literally written in the text (\"we assume ...\", "
+            "\"only for ...\", \"we do not evaluate ...\"). Measured comparisons against named "
+            "baselines are what make a claim checkable — classify those as \"comparison\" and "
+            "stated restrictions as \"limitation\". Never infer a restriction that the text does "
+            "not state."
         )
     messages = [
         {"role": "system", "content": EVIDENCE_EXTRACT_SYSTEM},
