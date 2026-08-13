@@ -19,13 +19,23 @@ from app.db.repositories.search_query_repo import save_search_query
 logger = logging.getLogger(__name__)
 
 _MAX_NEIGHBORS = 5
+# Neighbors whose highest semantic similarity falls below this bound did not
+# meaningfully cover the gap's domain, so a "confirmed" verdict resting on such
+# neighbors is a retrieval miss rather than a novelty signal.
+_MIN_NEIGHBOR_SIMILARITY = 0.3
+# A high novelty_confidence combined with a low-similarity neighbor set is the
+# contradictory signal that flags retrieval failure (observed: 5 application-
+# domain neighbors at max similarity 0.15 yet novelty_confidence 0.95).
+_HIGH_NOVELTY = 0.8
 # v2 made corpus papers from the same research questions admissible comparison
 # material; v3 closes a gap as undecidable when a repeated adversarial round
-# brings no new material for the same claim. Like the mining policy version,
-# this is what invalidates audits already stamped for a round, so an
-# admission-or-verdict rule change must bump it or resumed tasks keep their old
-# verdicts.
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v3"
+# brings no new material for the same claim; v4 generates English adversarial
+# queries (anchored on mechanism/capability rather than surface keywords) and
+# downgrades confirmed verdicts whose neighbors are semantically too distant to
+# have ruled prior work out. Like the mining policy version, this is what
+# invalidates audits already stamped for a round, so an admission-or-verdict
+# rule change must bump it or resumed tasks keep their old verdicts.
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v4"
 
 
 class AuditDecisionInvalid(ValueError):
@@ -45,6 +55,15 @@ A gap is:
 - partially_closed when they cover part of it and a concrete remaining delta exists;
 - closed when a neighbor covers the core problem, capability, and evaluation claim;
 - uncertain when the supplied evidence cannot decide.
+
+Important: absence of coverage is only evidence of novelty when the neighbors are
+actually relevant prior work on the gap's own research problem. If every neighbor
+belongs to a different research domain than the gap (for example, the gap is about
+systems-level training efficiency but all neighbors are application-domain papers
+such as medical segmentation or deepfake detection), then the comparison material
+is insufficient — the audit has not actually ruled out prior work. In that case you
+MUST return uncertain / more_search and assign a low novelty_confidence, rather than
+confirmed. Also set a low similarity_score for such off-domain neighbors.
 
 recommended_action must be exactly one of these four values, and nothing else:
 - "continue" for a confirmed gap;
@@ -150,6 +169,67 @@ def build_adversarial_queries(gap: GapCandidate) -> list[AdversarialQuerySpec]:
     ]
     seen = set()
     return [spec for spec in specs if spec.query_text and not (spec.query_text.lower() in seen or seen.add(spec.query_text.lower()))]
+
+
+class GapQueryGenSchema(BaseModel):
+    exact_gap: str = Field(description="English query matching the gap's exact claimed delta")
+    alternative_coverage: str = Field(description="English query for alternative methods that might already cover the observed problem")
+    claim_falsification: str = Field(description="English query targeting the falsification condition / strongest prior work")
+
+
+_QUERY_GEN_SYSTEM = """You are generating English academic search queries for an adversarial gap audit.
+The gap description may be in Chinese or mixed language. Produce queries that would retrieve the
+most relevant PRIOR WORK that could already close this gap, focusing on systems- and
+mechanism-level work rather than surface application papers.
+
+Rules:
+- Output English only.
+- Anchor each query on the gap's core mechanism/capability (e.g. memory offloading, quantization,
+  gradient checkpointing, distributed training) rather than surface keywords (e.g. adapter, benchmark).
+- Translate the gap's concepts into standard English technical vocabulary; do not invent new terms."""
+
+_QUERY_GEN_USER = """Candidate gap:
+- Setting: {target_setting}
+- Observed problem: {observed_problem}
+- Missing capability: {missing_capability}
+- Claimed delta: {claimed_delta}
+- Falsification condition: {falsification_condition}
+
+Produce the three English search queries."""
+
+
+async def generate_english_adversarial_queries(llm, gap: GapCandidate) -> list[AdversarialQuerySpec]:
+    """Generate English search queries anchored on the gap's mechanism/capability.
+
+    Raw concatenation of the gap's (often Chinese) fields produced queries that
+    matched surface keywords (e.g. "adapter") across application domains while
+    missing the systems-level prior work (e.g. ZeRO-Offload, QLoRA CPU offloading)
+    the audit was meant to find. English, mechanism-anchored queries fix the
+    language/recall mismatch; on failure we fall back to raw concatenation.
+    """
+    try:
+        gen = await llm.chat_json([
+            {"role": "system", "content": _QUERY_GEN_SYSTEM},
+            {"role": "user", "content": _QUERY_GEN_USER.format(
+                target_setting=gap.target_setting or "",
+                observed_problem=gap.observed_problem or "",
+                missing_capability=gap.missing_capability or "",
+                claimed_delta=gap.claimed_delta or "",
+                falsification_condition=gap.falsification_condition or "",
+            )},
+        ], GapQueryGenSchema)
+        specs = [
+            AdversarialQuerySpec("exact_gap", (gen.exact_gap or "").strip()),
+            AdversarialQuerySpec("alternative_coverage", (gen.alternative_coverage or "").strip()),
+            AdversarialQuerySpec("claim_falsification", (gen.claim_falsification or "").strip()),
+        ]
+        specs = [spec for spec in specs if spec.query_text]
+        if specs:
+            return specs
+    except Exception as exc:
+        logger.warning("Gap %s: English query generation failed (%s), falling back to raw concatenation", gap.id[:8], exc)
+    return build_adversarial_queries(gap)
+
 
 def collect_same_question_neighbors(db, gap) -> list[str]:
     """Papers already in the corpus that speak to the same research questions.
@@ -370,7 +450,7 @@ async def audit_gap_candidate(
 
     gap.status = "auditing"
     audit_round = state.current_round + 1
-    query_specs = build_adversarial_queries(gap)
+    query_specs = await generate_english_adversarial_queries(llm, gap)
     queries = [spec.query_text for spec in query_specs]
     executions = []
     for spec in query_specs:
@@ -448,7 +528,7 @@ async def audit_gap_candidate(
     ], GapAuditDecisionSchema)
 
     try:
-        dropped_evidence_ids = _validate_audit_decision(decision, gap, neighbors, db)
+        dropped_evidence_ids, dropped_comparisons = _validate_audit_decision(decision, gap, neighbors, db)
     except AuditDecisionInvalid as err:
         # A malformed decision is a failure of this one audit, not of the run.
         # Raising here used to abort the whole task and discard every gap,
@@ -475,6 +555,14 @@ async def audit_gap_candidate(
         })
         db.commit()
         return GapAuditResult(gap.id, "uncertain", "more_search", "")
+    if dropped_comparisons:
+        logger.warning("Gap %s: dropped %d comparison(s) citing unknown neighbor "
+                       "paper(s): %s", gap.id[:8], len(dropped_comparisons),
+                       dropped_comparisons)
+        paper_repo.save_trace(db, task_id, "gap_audit_dropped_comparisons", "decision",
+                              output_data={"gap_id": gap.id,
+                                           "dropped_comparison_paper_ids": dropped_comparisons,
+                                           "audit_result": decision.audit_result})
     if dropped_evidence_ids:
         logger.warning("Gap %s: dropped %d unusable evidence ID(s) from the audit "
                        "decision: %s", gap.id[:8], len(dropped_evidence_ids),
@@ -483,6 +571,35 @@ async def audit_gap_candidate(
                               output_data={"gap_id": gap.id,
                                            "dropped_evidence_ids": dropped_evidence_ids,
                                            "audit_result": decision.audit_result})
+    # Relevance guard (v4): a confirmed verdict is only meaningful when the
+    # neighbors are actual prior work on the gap's own problem. If every
+    # neighbor is semantically distant (low similarity) yet the model still
+    # claims high novelty, the audit almost certainly failed to retrieve the
+    # real comparison material. Downgrade to uncertain so a later round retries
+    # with better queries instead of stamping a false "novel".
+    if (decision.audit_result == "confirmed"
+            and decision.novelty_confidence > _HIGH_NOVELTY
+            and decision.comparisons
+            and max((c.similarity_score for c in decision.comparisons), default=1.0) < _MIN_NEIGHBOR_SIMILARITY):
+        max_sim = max(c.similarity_score for c in decision.comparisons)
+        original_novelty = decision.novelty_confidence
+        decision.audit_result = "uncertain"
+        decision.recommended_action = "more_search"
+        decision.novelty_confidence = min(original_novelty, 0.5)
+        decision.rejection_reason = (
+            "neighbor semantic relevance too low to rule out prior work "
+            f"(max similarity {max_sim:.2f}); retrieval may have missed mechanism-level work"
+        )
+        paper_repo.save_trace(db, task_id, "gap_audit_low_relevance_downgrade", "decision",
+                              output_data={
+                                  "gap_id": gap.id,
+                                  "max_neighbor_similarity": max_sim,
+                                  "original_novelty_confidence": original_novelty,
+                                  "downgraded_to": "uncertain",
+                              })
+        logger.warning("Gap %s: downgrading confirmed->uncertain (max neighbor "
+                       "similarity %.2f below %.2f)", gap.id[:8], max_sim,
+                       _MIN_NEIGHBOR_SIMILARITY)
     for comparison in decision.comparisons:
         gap_repo.create_neighbor_comparison(            db,
             gap_id=gap.id,
@@ -570,18 +687,23 @@ def _gap_evidence_ids(db, gap_id: str, relation_type: str) -> list[str]:
     ]
 
 
-def _validate_audit_decision(decision, gap, neighbors, db) -> list[str]:
+def _validate_audit_decision(decision, gap, neighbors, db) -> tuple[list[str], list[str]]:
     """Enforce the audit contract, naming the offending value on failure.
 
-    Returns the evidence IDs that were dropped as unusable. The distinction is
-    deliberate: a comparison is bound to one specific neighbour paper, so a wrong
-    paper ID would attach a verdict to the wrong work and must invalidate the
-    decision. The evidence_for/against lists are supporting annotations — the
-    verdict rests on audit_result, remaining_delta and the per-neighbour
-    comparisons — so an unusable ID there is dropped and recorded instead of
-    discarding an otherwise sound audit. Observed in production: a model copied
-    one UUID with a corrupted segment (…-44a2-b4-… instead of …-42b4-…) and a
-    complete partially_closed verdict was downgraded to uncertain because of it.
+    Returns a tuple of (dropped_evidence_ids, dropped_comparison_paper_ids). The
+    strict-reject vs drop-and-continue distinction is deliberate: audit_result /
+    recommended_action are the verdict itself, so an invalid value rejects the
+    decision. A comparison bound to an unknown paper is unusable — it either
+    attaches a verdict to the wrong work or cites a hallucinated ID — so that
+    single comparison is dropped and recorded, and the remaining comparisons
+    still carry the verdict. Only when EVERY comparison is unusable is the
+    decision rejected (no comparison material left). The evidence_for/against
+    lists are supporting annotations, so an unusable ID there is likewise
+    dropped rather than discarding an otherwise sound audit. Observed in
+    production: a model copied one UUID with a corrupted segment (…-44a2-b4-…
+    instead of …-42b4-…) and a complete partially_closed verdict was downgraded
+    to uncertain; and a hallucinated neighbor paper ID discarded the whole
+    decision, leaving no surviving gap after audit.
     """
     if decision.audit_result not in {"confirmed", "partially_closed", "closed", "uncertain"}:
         raise AuditDecisionInvalid(f"invalid audit_result: {decision.audit_result!r}")
@@ -592,8 +714,11 @@ def _validate_audit_decision(decision, gap, neighbors, db) -> list[str]:
     unknown_papers = sorted({item.paper_id for item in decision.comparisons
                              if item.paper_id not in valid_paper_ids})
     if unknown_papers:
-        raise AuditDecisionInvalid(
-            f"comparison cites unknown neighbor paper(s): {unknown_papers}")
+        decision.comparisons = [item for item in decision.comparisons
+                                if item.paper_id in valid_paper_ids]
+        if not decision.comparisons:
+            raise AuditDecisionInvalid(
+                f"all comparisons cite unknown neighbor papers: {unknown_papers}")
     valid_evidence_ids = {link.evidence_id for link in gap_repo.list_gap_evidence(db, gap.id)}
     dropped = sorted(
         set(decision.evidence_for_gap_ids + decision.evidence_against_gap_ids)
@@ -603,4 +728,4 @@ def _validate_audit_decision(decision, gap, neighbors, db) -> list[str]:
                                         if item in valid_evidence_ids]
         decision.evidence_against_gap_ids = [item for item in decision.evidence_against_gap_ids
                                             if item in valid_evidence_ids]
-    return dropped
+    return dropped, unknown_papers

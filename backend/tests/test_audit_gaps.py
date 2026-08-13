@@ -230,6 +230,81 @@ async def test_malformed_audit_decision_degrades_one_gap_instead_of_failing_the_
     db.close()
 
 
+class HallucinatedComparisonPaperLLM:
+    """Returns a sound verdict but cites one hallucinated paper ID in comparisons."""
+
+    async def chat_json(self, messages, schema):
+        from app.agent.steps.audit_gaps import GapAuditDecisionSchema, NeighborAuditSchema
+
+        text = messages[1]["content"]
+        evidence_id = ast.literal_eval(next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("Supporting evidence IDs:")))[0]
+        paper_id = next(line.split(": ", 1)[1] for line in text.splitlines() if "Paper ID:" in line)
+        return GapAuditDecisionSchema(
+            audit_result="confirmed",
+            recommended_action="continue",
+            remaining_delta="近邻论文未评估固定预算下的状态变化边界。",
+            nearest_neighbor_summary="近邻只报告通用问答性能。",
+            differentiation_summary="候选 Gap 关注状态变化边界评测。",
+            evidence_for_gap_ids=[evidence_id],
+            novelty_confidence=0.8,
+            audit_confidence=0.8,
+            comparisons=[
+                NeighborAuditSchema(
+                    paper_id=paper_id,
+                    similarity_score=0.7,
+                    shared_problem="都研究 Agent Memory。",
+                    shared_mechanism="都使用记忆压缩。",
+                    shared_evaluation="都报告问答准确率。",
+                    covered_claims=["一般准确率评估"],
+                    uncovered_claims=["状态变化边界评测"],
+                    overlap_ratio=0.4,
+                    overlap_risk=0.3,
+                ),
+                NeighborAuditSchema(
+                    paper_id="00000000-0000-0000-0000-000000000000",
+                    similarity_score=0.9,
+                    shared_problem="幻觉近邻。",
+                    shared_mechanism="幻觉机制。",
+                    shared_evaluation="幻觉评测。",
+                    covered_claims=["全部覆盖"],
+                    uncovered_claims=[],
+                    overlap_ratio=1.0,
+                    overlap_risk=1.0,
+                ),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_hallucinated_comparison_paper_dropped_not_discard_verdict(temp_db):
+    """A comparison citing an unknown paper is dropped, not the whole verdict.
+
+    Production case (task c192efd5): the model hallucinated a neighbor paper ID
+    in one comparison, and the whole decision was rejected, leaving no surviving
+    gap after audit and triggering an O2 remediation loop.
+    """
+    from app.agent.state import ResearchState
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.models import AgentTrace
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+
+    results = await audit_gap_candidates(db, state, HallucinatedComparisonPaperLLM(), task.id,
+                                         perform_search=True)
+
+    assert [item.audit_result for item in results] == ["confirmed"]
+    assert state.surviving_gap_ids == [gap.id]
+    assert gap_repo.get_gap(db, gap.id).status == "surviving"
+    assert len(gap_repo.list_neighbor_comparisons(db, gap.id)) == 1
+    assert db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "gap_audit_dropped_comparisons").count() == 1
+    db.close()
+
+
 @pytest.mark.asyncio
 async def test_uncertain_audit_never_survives(temp_db):
     from app.agent.state import ResearchState
