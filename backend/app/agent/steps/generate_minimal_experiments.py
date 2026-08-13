@@ -15,8 +15,15 @@ logger = logging.getLogger(__name__)
 _MIN_EXPERIMENT_SYSTEM = """You design a minimal decisive experiment for a research intervention.
 The experiment must test the stated mechanism before proposing a full paper evaluation.
 Use only supplied paper IDs as related work. Specify a falsifiable hypothesis, controls, metrics,
-success condition, and failure condition. Do not invent dataset or baseline names; use generic
-roles when the evidence does not identify a specific valid name."""
+success condition, and failure condition.
+
+For dataset and baselines, be concrete enough to actually run:
+- Prefer a specific real, well-known public dataset or baseline (e.g. from the supplied
+  evidence, or widely-used ones such as Alpaca, FLAN, OpenOrca, GLUE, ImageNet).
+- Never fabricate a specific-looking name that does not exist; if you are not certain,
+  name a real widely-known candidate and mark it as "candidate (verify availability)".
+- Do not fall back to a vague placeholder like "a standard instruction-tuning corpus";
+  a vague placeholder cannot be executed."""
 
 _MIN_EXPERIMENT_USER = """Gap:
 - Observed problem: {observed_problem}

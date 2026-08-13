@@ -141,7 +141,11 @@ For every gap:
   "negative_result": a gap needs a documented shortcoming, not only comparisons;
 - state what existing work already covers and the smallest missing capability;
 - write a falsifiable condition that would close the gap;
-- do not propose a solution or invent paper findings.
+- do not propose a solution or invent paper findings;
+- write every gap field in English (target setting, observed problem, existing
+  coverage, missing capability, claimed delta, falsification condition). The
+  downstream adversarial search and audit run against English academic
+  databases, and Chinese gap text degrades their retrieval recall.
 Return an empty list when the evidence is insufficient."""
 
 _GAP_MINING_USER = """Research topic: {topic}

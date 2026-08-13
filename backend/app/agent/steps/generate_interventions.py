@@ -209,10 +209,21 @@ def _evaluate_hard_gates(gap, audit, evidence_ids, candidate, contract) -> dict:
     cost_text = (candidate.implementation_cost or "").lower()
     text = f"{core_text} {cost_text}"
     training_terms = ("fine-tune", "finetune", "fine tune", "training", "train ", "训练", "微调")
-    benchmark_terms = ("benchmark", "large dataset", "基准", "大规模数据集")
+    # A bare "benchmark" used to hard-FAIL interventions like a "benchmarking
+    # protocol" / "micro-benchmark" that are ordinary single-GPU experiments,
+    # not the large-scale benchmark construction the contract forbids. Split
+    # the two notions apart so only an explicitly large-scale effort fails.
+    large_benchmark_terms = ("large benchmark", "large-scale", "large scale",
+                             "large dataset", "大型", "大规模", "超大")
+    small_benchmark_terms = ("micro-benchmark", "micro benchmark", "microbenchmark",
+                             "small benchmark", "small-scale", "small scale",
+                             "benchmarking protocol", "controlled benchmark",
+                             "微基准", "小规模", "受控", "单机", "single-gpu")
+    mentions_benchmark = ("benchmark" in text or "基准" in text)
 
     mentions_training = any(token in text for token in training_terms)
-    mentions_benchmark = any(token in text for token in benchmark_terms)
+    mentions_large_benchmark = any(token in text for token in large_benchmark_terms)
+    mentions_small_benchmark = any(token in text for token in small_benchmark_terms)
 
     if contract.allow_model_training is False and mentions_training:
         # Only hard-FAIL when training is clearly central (appears in the core
@@ -225,10 +236,15 @@ def _evaluate_hard_gates(gap, audit, evidence_ids, candidate, contract) -> dict:
             feasibility_status = "WARN"
             feasibility_reason = "方案提及训练/微调但可能仅为辅助步骤，需人工确认是否可在约束内替换"
     elif contract.allow_large_benchmark is False and mentions_benchmark:
-        core_benchmark = any(token in core_text for token in benchmark_terms)
-        feasibility_status = "FAIL" if core_benchmark else "WARN"
-        feasibility_reason = ("Contract 不允许构建大型 Benchmark" if core_benchmark
-                              else "方案提及基准/大规模数据集，需确认规模是否在约束内")
+        if mentions_large_benchmark and not mentions_small_benchmark:
+            feasibility_status = "FAIL"
+            feasibility_reason = "Contract 不允许构建大型 Benchmark"
+        elif mentions_small_benchmark:
+            feasibility_status = "PASS"
+            feasibility_reason = "方案为受控小规模基准实验（micro-benchmark），符合 Contract 约束"
+        else:
+            feasibility_status = "WARN"
+            feasibility_reason = "方案提及基准/数据集，需确认规模是否在约束内"
     elif contract.gpu_available is False and any(token in core_text for token in ("gpu", "train", "fine-tune", "训练", "微调")):
         feasibility_status = "WARN"
         feasibility_reason = "无 GPU 资源，需确认方案是否有免训练替代路径"
