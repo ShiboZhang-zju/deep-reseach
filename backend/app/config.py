@@ -135,8 +135,14 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 10       # Aliyun DashScope caps embeddings batch at 20; keep <=20
     # O7: drop retrieved papers whose title+abstract cosine similarity to the
     # research topic is below this threshold, before they enter the store.
-    # Set to 0 to disable prefiltering.
-    search_prefilter_min_similarity: float = 0.35
+    # Set to 0 to disable prefiltering. Raised from 0.35: a run with 401 papers
+    # saw 77% land as low-priority noise (only top-N ever get LLM-scored and
+    # top-30 ever get evidence-extracted), so the pool was far too loose.
+    search_prefilter_min_similarity: float = 0.45
+    # Papers without an abstract cannot contribute evidence unless their PDF is
+    # fetched (which frequently fails), so demand a stronger title-only match
+    # before admitting them. Falls back to the base threshold if lower.
+    search_prefilter_no_abstract_min_similarity: float = 0.55
 
     # Evidence extraction (P0/P1/P2/P4)
     # Max papers to extract evidence from per round. Lower for quick validation

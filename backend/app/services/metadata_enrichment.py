@@ -38,7 +38,7 @@ async def _s2_lookup_single(doi: str = "", title: str = "") -> dict | None:
 
     Returns dict with citationCount, year, venue, externalIds or None on failure.
     """
-    fields = "title,year,venue,citationCount,externalIds,openAccessPdf"
+    fields = "title,abstract,year,venue,citationCount,externalIds,openAccessPdf"
     url = None
     if doi:
         url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields={fields}"
@@ -80,7 +80,7 @@ async def _openalex_lookup(doi: str = "") -> dict | None:
     if not doi:
         return None
 
-    url = f"https://api.openalex.org/works/doi:{doi}?select=cited_by_count,publication_year,primary_location,locations"
+    url = f"https://api.openalex.org/works/doi:{doi}?select=cited_by_count,publication_year,primary_location,locations,abstract_inverted_index"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url, headers={"User-Agent": "DeepResearch/1.0 (mailto:research@example.com)"})
@@ -91,6 +91,18 @@ async def _openalex_lookup(doi: str = "") -> dict | None:
                 "citation_count": data.get("cited_by_count", 0),
                 "year": data.get("publication_year"),
             }
+            # Rebuild abstract from the inverted index so no-abstract papers can
+            # still feed the evidence pipeline after enrichment.
+            inv_idx = data.get("abstract_inverted_index")
+            if inv_idx:
+                word_positions = []
+                for word, positions in inv_idx.items():
+                    for pos in positions:
+                        word_positions.append((pos, word))
+                word_positions.sort()
+                abstract = " ".join(w for _, w in word_positions)
+                if abstract:
+                    result["abstract"] = abstract
             # Extract venue from primary_location
             primary = data.get("primary_location") or {}
             source = primary.get("source") or {}
@@ -128,6 +140,8 @@ async def _enrich_one(paper: Paper) -> dict | None:
                 result["venue"] = oa_data["venue"]
             if oa_data.get("openalex_id") and not paper.openalex_id:
                 result["openalex_id"] = oa_data["openalex_id"]
+            if oa_data.get("abstract") and not paper.abstract:
+                result["abstract"] = oa_data["abstract"]
 
     # Fallback: S2 by DOI or title
     needs_more = (
@@ -153,8 +167,34 @@ async def _enrich_one(paper: Paper) -> dict | None:
             s2_id = s2_data.get("paperId", "")
             if s2_id and not paper.semantic_scholar_id:
                 result["semantic_scholar_id"] = s2_id
+            if s2_data.get("abstract") and not (result.get("abstract") or paper.abstract):
+                result["abstract"] = s2_data["abstract"]
 
     return result if result else None
+
+
+async def _commit_with_retry(db, max_retries: int = 6, base_delay: float = 0.25):
+    """Commit with exponential backoff on SQLite write-lock contention.
+
+    Enrichment runs as a fire-and-forget background task writing to the same
+    SQLite file as the main pipeline. WAL allows concurrent readers but only a
+    single writer, so a commit can transiently collide with the main loop's own
+    write and raise "database is locked". Retry briefly instead of aborting the
+    whole batch, which silently lost every metadata update.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    for attempt in range(max_retries):
+        try:
+            db.commit()
+            return
+        except OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(base_delay * (2 ** attempt))
+            db.rollback()
 
 
 async def enrich_papers_metadata(paper_ids: list[str], db_session=None) -> dict:
@@ -188,6 +228,7 @@ async def enrich_papers_metadata(paper_ids: list[str], db_session=None) -> dict:
         logger.info("Enriching metadata for %d papers (of %d total)", len(to_enrich), len(papers))
 
         semaphore = asyncio.Semaphore(3)  # limit concurrent API calls
+        commit_lock = asyncio.Lock()      # serialize commits (SQLite single writer)
         enriched = 0
         failed = 0
 
@@ -199,29 +240,33 @@ async def enrich_papers_metadata(paper_ids: list[str], db_session=None) -> dict:
                     if updates:
                         for field, value in updates.items():
                             setattr(paper, field, value)
+                        # Commit per paper as a short transaction, serialized
+                        # behind a lock and retried on lock contention. A single
+                        # batch commit held the write lock long enough to collide
+                        # with the main pipeline and raise "database is locked",
+                        # silently losing the whole batch.
+                        if own_session:
+                            async with commit_lock:
+                                await _commit_with_retry(db)
                         enriched += 1
                         logger.debug("Enriched paper %s: %s", paper.id[:8],
                                     list(updates.keys()))
-                    else:
-                        # No enrichment available — not a failure
-                        pass
                 except Exception as e:
                     logger.debug("Enrich failed for paper %s: %s", paper.id[:8], e)
                     failed += 1
+                    if own_session:
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
 
         # Process in small batches to avoid overwhelming the API
         batch_size = 10
         for i in range(0, len(to_enrich), batch_size):
             batch = to_enrich[i:i + batch_size]
             await asyncio.gather(*[enrich_and_save(p) for p in batch])
-            # Commit after each batch
-            if own_session:
-                db.commit()
             # Small delay between batches to be polite
             await asyncio.sleep(0.5)
-
-        if own_session:
-            db.commit()
 
         logger.info("Metadata enrichment done: enriched=%d, failed=%d, skipped=%d",
                     enriched, failed, len(papers) - len(to_enrich))

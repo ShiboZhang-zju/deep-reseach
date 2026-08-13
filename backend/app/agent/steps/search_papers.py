@@ -218,6 +218,13 @@ async def _prefilter_by_similarity(raw_papers: list, state: ResearchState,
     across queries to avoid recomputation.
     """
     threshold = settings.search_prefilter_min_similarity
+    # Papers without an abstract can't feed the evidence pipeline (abstract is
+    # the fallback when PDF fetch fails), so hold them to a stronger title-only
+    # match instead of admitting weak no-abstract noise into the store.
+    no_abstract_threshold = max(
+        threshold,
+        getattr(settings, "search_prefilter_no_abstract_min_similarity", threshold),
+    )
     if threshold <= 0 or not raw_papers:
         return raw_papers
 
@@ -247,7 +254,9 @@ async def _prefilter_by_similarity(raw_papers: list, state: ResearchState,
             dropped = 0
             for rp, vec in zip(raw_papers, vecs[1:]):
                 sim = cosine_similarity(topic_vec, vec)
-                if sim >= threshold:
+                has_abstract = bool(getattr(rp, "abstract", ""))
+                effective = threshold if has_abstract else no_abstract_threshold
+                if sim >= effective:
                     kept.append(rp)
                 else:
                     dropped += 1
