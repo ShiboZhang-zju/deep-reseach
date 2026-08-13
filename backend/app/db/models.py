@@ -635,6 +635,11 @@ class CoverageRecord(Base):
     confidence = Column(Float, default=0.0)
     supporting_evidence_count = Column(Integer, default=0)
     contradicting_evidence_count = Column(Integer, default=0)
+    # Coverage breadth — how many *distinct papers* speak to the question. This
+    # is the driver of coverage_score (not the evidence-unit counts), so it must
+    # be queryable instead of living only inside a trace JSON blob.
+    distinct_supporting_papers = Column(Integer, default=0)
+    distinct_contradicting_papers = Column(Integer, default=0)
     direct_neighbor_count = Column(Integer, default=0)
     unresolved_aspects_json = Column(Text, default="[]")
     unavailable_reason = Column(Text)

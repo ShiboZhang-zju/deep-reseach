@@ -490,15 +490,12 @@ async def run_task(task_id: str):
                 # whatever was actually collected (papers, evidence, coverage)
                 # instead of dying silently. Best-effort: never let brief
                 # generation mask the real failure reason.
-                try:
-                    await generate_landscape_brief(
-                        db, state, task_id, "failed", f"readiness_failed: {readiness.reason}")
-                except Exception as brief_err:
-                    logger.warning("Task %s: landscape brief on readiness failure "
-                                   "could not be generated (non-fatal): %s",
-                                   task_id[:8], brief_err)
+                await _generate_landscape_brief_phase(
+                    db, state, task_id, "failed", f"readiness_failed: {readiness.reason}")
                 task_repo.update_status(db, task_id, "failed")
                 task_repo.update_stop_reason(db, task_id, f"readiness_failed: {readiness.reason}")
+                state.current_phase = "completed"
+                task_repo.save_state(db, task_id, state)
                 emit_event(task_id, "error", {
                     "message": f"Phase 2 readiness gate failed: {readiness.reason}",
                     "missing_questions": readiness.missing_question_ids,
@@ -595,6 +592,26 @@ async def run_task(task_id: str):
         db.close()
 
 
+async def _generate_landscape_brief_phase(db, state: ResearchState, task_id: str,
+                                          status: str, reason: str):
+    """Generate a landscape brief wrapped in a PhaseRun for runtime tracking.
+
+    The brief is the terminal artifact of a run, so it deserves the same
+    PhaseRun record (and phase-level duration trace) as every other phase.
+    Failure is non-fatal: a missing brief must never mask the run's real outcome.
+    """
+    async def _op(db):
+        return await generate_landscape_brief(db, state, task_id, status, reason)
+    try:
+        await phase_service.execute_phase(
+            db, task_id, "generate_landscape_brief", _op,
+            input_version=f"{status}:{reason}",
+        )
+    except Exception as exc:
+        logger.warning("Task %s: landscape brief phase failed (non-fatal): %s",
+                       task_id[:8], exc)
+
+
 async def _terminate_more_research(db, state: ResearchState, task_id: str,
                                     status: str, reason: str):
     """Emit landscape brief + set a terminal 'more research' style status.
@@ -602,9 +619,13 @@ async def _terminate_more_research(db, state: ResearchState, task_id: str,
     Centralizes the 6 former inline termination exits so O2 remediation logic
     lives in one place.
     """
-    await generate_landscape_brief(db, state, task_id, status, reason)
+    await _generate_landscape_brief_phase(db, state, task_id, status, reason)
     task_repo.update_status(db, task_id, status)
     task_repo.update_stop_reason(db, task_id, reason)
+    # The run is terminal: sync the phase marker so state_json no longer points
+    # at a mid-pipeline phase (e.g. update_coverage_round_1) after completion.
+    state.current_phase = "completed"
+    task_repo.save_state(db, task_id, state)
     payload = {"status": status, "reason": reason}
     emit_event(task_id, "status", payload)
     db.commit()
@@ -835,10 +856,12 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             return
 
         # --- Success ---
-        await generate_landscape_brief(db, state, task_id,
-                                       "waiting_for_user_review", "evidence_grounded_ideas_ready")
+        await _generate_landscape_brief_phase(
+            db, state, task_id, "waiting_for_user_review", "evidence_grounded_ideas_ready")
         task_repo.update_status(db, task_id, "waiting_for_user_review")
         task_repo.update_stop_reason(db, task_id, "evidence_grounded_ideas_ready")
+        state.current_phase = "completed"
+        task_repo.save_state(db, task_id, state)
         emit_event(task_id, "status", {
             "status": "waiting_for_user_review",
             "reason": "evidence_grounded_ideas_ready",

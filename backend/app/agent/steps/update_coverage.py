@@ -155,10 +155,15 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
         if cr is None:
             cr = CoverageRecord(task_id=task_id, question_id=question.id)
             db.add(cr)
+        # Round to 2 decimals: `0.4 + n*0.1 + m*0.05` otherwise stores float
+        # noise such as 0.7000000000000001.
+        coverage = round(coverage, 2)
         cr.coverage_score = coverage
         cr.confidence = min(1.0, total_relevant * 0.15)
         cr.supporting_evidence_count = supporting
         cr.contradicting_evidence_count = contradicting
+        cr.distinct_supporting_papers = distinct_supporting
+        cr.distinct_contradicting_papers = distinct_contradicting
         cr.direct_neighbor_count = 0
         cr.unresolved_aspects_json = json.dumps([], ensure_ascii=False)
         cr.round_number = round_number

@@ -193,6 +193,8 @@ def _to_coverage_out(c: CoverageRecord) -> CoverageRecordOut:
         confidence=c.confidence if c.confidence is not None else 0.0,
         supporting_evidence_count=c.supporting_evidence_count or 0,
         contradicting_evidence_count=c.contradicting_evidence_count or 0,
+        distinct_supporting_papers=getattr(c, "distinct_supporting_papers", 0) or 0,
+        distinct_contradicting_papers=getattr(c, "distinct_contradicting_papers", 0) or 0,
         direct_neighbor_count=c.direct_neighbor_count or 0,
         unresolved_aspects=json.loads(c.unresolved_aspects_json or "[]"),
         unavailable_reason=c.unavailable_reason,

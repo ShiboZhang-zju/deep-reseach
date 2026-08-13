@@ -8,11 +8,12 @@ import dataclasses
 import hashlib
 import json
 import logging
+import time
 
 from pydantic import BaseModel
 
 from app.db.session import SessionLocal
-from app.db.repositories import phase_repo
+from app.db.repositories import paper_repo, phase_repo
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,10 @@ async def execute_phase(db, task_id: str, phase_name: str, operation,
     pr = phase_repo.start_phase(db, task_id, phase_name, input_version, round_number)
     db.commit()
 
+    started = time.perf_counter()
     try:
         result = await operation(db)
+        duration_ms = int((time.perf_counter() - started) * 1000)
         output_ver = compute_output_version(result)
         payload = stable_phase_payload(result)
         output_json_str = json.dumps(
@@ -101,10 +104,22 @@ async def execute_phase(db, task_id: str, phase_name: str, operation,
                                   output_version=output_ver,
                                   output_summary=summary,
                                   output_json=output_json_str)
+        # Phase-level duration trace so runtime is queryable. The per-step
+        # traces inside a phase historically never populated duration_ms, which
+        # left no structured way to see how long each phase actually took.
+        paper_repo.save_trace(db, task_id, phase_name, "phase_duration",
+                              round_number=round_number, duration_ms=duration_ms)
         db.commit()
         return result
     except Exception as e:
+        duration_ms = int((time.perf_counter() - started) * 1000)
         phase_repo.fail_phase(db, pr.id, str(e))
+        try:
+            paper_repo.save_trace(db, task_id, phase_name, "phase_duration",
+                                  round_number=round_number, duration_ms=duration_ms,
+                                  output_data={"error": str(e)[:500]})
+        except Exception:
+            pass
         db.commit()
         raise
 

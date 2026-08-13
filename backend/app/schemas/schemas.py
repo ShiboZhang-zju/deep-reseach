@@ -593,6 +593,8 @@ class CoverageRecordOut(BaseModel):
     confidence: float = 0.0
     supporting_evidence_count: int = 0
     contradicting_evidence_count: int = 0
+    distinct_supporting_papers: int = 0
+    distinct_contradicting_papers: int = 0
     direct_neighbor_count: int = 0
     unresolved_aspects: list[str] = Field(default_factory=list)
     unavailable_reason: str | None = None
