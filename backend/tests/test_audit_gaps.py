@@ -146,15 +146,16 @@ def _seed_gap(db):
 
 
 @pytest.mark.asyncio
-async def test_confirmed_audit_creates_comparison_and_survives(temp_db):
+async def test_confirmed_audit_creates_comparison_and_survives(temp_db, monkeypatch):
     from app.agent.state import ResearchState
     from app.agent.steps.audit_gaps import audit_gap_candidates
     from app.db.repositories import gap_repo
 
     db = temp_db()
     task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
     state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
-    results = await audit_gap_candidates(db, state, ConfirmingAuditLLM(), task.id, perform_search=True)
+    results = await audit_gap_candidates(db, state, ConfirmingAuditLLM(), task.id, perform_search=False)
 
     assert results[0].audit_result == "confirmed"
     assert state.surviving_gap_ids == [gap.id]
@@ -165,7 +166,7 @@ async def test_confirmed_audit_creates_comparison_and_survives(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_mistyped_evidence_id_does_not_discard_a_sound_verdict(temp_db):
+async def test_mistyped_evidence_id_does_not_discard_a_sound_verdict(temp_db, monkeypatch):
     """A miscopied evidence UUID is an annotation defect, not a bad verdict.
 
     Production case (task 3286cf05): the model wrote
@@ -179,10 +180,11 @@ async def test_mistyped_evidence_id_does_not_discard_a_sound_verdict(temp_db):
 
     db = temp_db()
     task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
     state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
 
     results = await audit_gap_candidates(db, state, MistypedEvidenceIdAuditLLM(), task.id,
-                                         perform_search=True)
+                                         perform_search=False)
 
     assert [item.audit_result for item in results] == ["partially_closed"]
     audit = gap_repo.list_gap_audits(db, gap.id)[-1]
@@ -197,7 +199,7 @@ async def test_mistyped_evidence_id_does_not_discard_a_sound_verdict(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_malformed_audit_decision_degrades_one_gap_instead_of_failing_the_run(temp_db):
+async def test_malformed_audit_decision_degrades_one_gap_instead_of_failing_the_run(temp_db, monkeypatch):
     """A decision outside the audit contract must not abort the whole task.
 
     Production case (task 5e040ad5): the first run that ever produced gap
@@ -211,10 +213,11 @@ async def test_malformed_audit_decision_degrades_one_gap_instead_of_failing_the_
 
     db = temp_db()
     task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
     state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
 
     results = await audit_gap_candidates(db, state, MalformedAuditLLM(), task.id,
-                                         perform_search=True)
+                                         perform_search=False)
 
     assert [item.audit_result for item in results] == ["uncertain"]
     assert state.surviving_gap_ids == []
@@ -276,7 +279,7 @@ class HallucinatedComparisonPaperLLM:
 
 
 @pytest.mark.asyncio
-async def test_hallucinated_comparison_paper_dropped_not_discard_verdict(temp_db):
+async def test_hallucinated_comparison_paper_dropped_not_discard_verdict(temp_db, monkeypatch):
     """A comparison citing an unknown paper is dropped, not the whole verdict.
 
     Production case (task c192efd5): the model hallucinated a neighbor paper ID
@@ -290,10 +293,11 @@ async def test_hallucinated_comparison_paper_dropped_not_discard_verdict(temp_db
 
     db = temp_db()
     task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
     state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
 
     results = await audit_gap_candidates(db, state, HallucinatedComparisonPaperLLM(), task.id,
-                                         perform_search=True)
+                                         perform_search=False)
 
     assert [item.audit_result for item in results] == ["confirmed"]
     assert state.surviving_gap_ids == [gap.id]
