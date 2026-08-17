@@ -19,7 +19,15 @@ Observed problem -> failure mechanism -> intervention -> intermediate effect -> 
 Do not invent papers, datasets, or evidence IDs.
 dependency_paper_ids may only contain IDs taken verbatim from the "Neighbor paper IDs"
 list in the context; the "Evidence IDs" are evidence units, not papers, and must never
-appear there. Leave dependency_paper_ids empty when no neighbor paper is required."""
+appear there. Leave dependency_paper_ids empty when no neighbor paper is required.
+
+CRITICAL — diversify the failure mechanisms: when you produce more than one
+intervention, each one MUST target a DISTINCT failure mechanism. Do not emit
+multiple variants of the same mechanism (e.g. three flavours of "early stopping").
+Pull distinct mechanisms from the observed problem and the evidence (for example:
+a saturation-boundary gap, a missing-information problem, and a feedback-quality
+problem are three separate mechanisms). If the surviving gap only supports one
+genuinely distinct mechanism, generate one intervention rather than padding."""
 
 _INTERVENTION_USER = """Surviving gap:
 - ID: {gap_id}

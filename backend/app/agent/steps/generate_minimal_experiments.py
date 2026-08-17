@@ -79,6 +79,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
     ).all()
     idea_ids = []
     experiment_ids = []
+    seen_titles: set[str] = set()
     for intervention in interventions:
         gap = db.get(GapCandidate, intervention.gap_id)
         if not gap:
@@ -101,8 +102,19 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 max_runtime_minutes=contract.max_runtime_minutes,
             )},
         ], MinimalExperimentSchema)
+        # De-duplicate titles: two interventions over the same gap can collapse
+        # to an identical experiment title, which surfaces as duplicate ideas in
+        # the UI. Append a short mechanism disambiguator when a title repeats.
+        final_title = plan.title
+        if final_title in seen_titles:
+            mech = (intervention.failure_mechanism or "").strip()
+            suffix = mech[:40] if mech else "variant"
+            final_title = f"{final_title} — {suffix}"
+            while final_title in seen_titles:
+                final_title = f"{final_title} (2)"
+        seen_titles.add(final_title)
         idea = paper_repo.save_idea(db, task_id, {
-            "title": plan.title,
+            "title": final_title,
             "description": plan.summary,
             "motivation": gap.observed_problem,
             "method_sketch": intervention.proposed_intervention,

@@ -106,12 +106,22 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
     total_papers = db.query(func.count(TaskPaper.id)).filter(
         TaskPaper.task_id == task_id,
     ).scalar() or 0
+    scored_papers = db.query(func.count(TaskPaper.id)).filter(
+        TaskPaper.task_id == task_id, TaskPaper.priority.isnot(None),
+    ).scalar() or 0
     high_papers = db.query(func.count(TaskPaper.id)).filter(
         TaskPaper.task_id == task_id, TaskPaper.priority == "high",
     ).scalar() or 0
+    evidence_papers = db.query(func.count(func.distinct(EvidenceUnit.paper_id))).filter(
+        EvidenceUnit.task_id == task_id,
+    ).scalar() or 0
 
     lines.append("## 论文概览\n")
-    lines.append(f"共收集论文 {total_papers} 篇，其中高优先级 {high_papers} 篇。\n")
+    lines.append(f"入库论文 {total_papers} 篇，其中完成评分 {scored_papers} 篇"
+                 f"（高优先级 {high_papers} 篇），已抽取证据覆盖 {evidence_papers} 篇。\n")
+    if total_papers > scored_papers:
+        lines.append(f"另有 {total_papers - scored_papers} 篇为定向补检索召回、尚未评分，"
+                     "未进入证据抽取池（不计入有效分析范围）。\n")
     if roles:
         lines.append("论文角色分布：" + "，".join(f"{role}: {cnt}" for role, cnt in roles) + "。\n")
 
