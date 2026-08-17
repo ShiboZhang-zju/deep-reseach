@@ -26,7 +26,7 @@ class UnpaywallSource:
     base_url = "https://api.unpaywall.org/v2/{doi}"
 
     def __init__(self, email: str | None = None):
-        self.email = email or settings.openalex_email or settings.crossref_email or "research@example.com"
+        self.email = email or settings.openalex_email or settings.crossref_email or "shoboz996@gmail.com"
 
     async def _lookup_doi(self, client: httpx.AsyncClient, doi: str) -> str:
         """Return best-effort open-access PDF URL for a DOI, or empty string."""

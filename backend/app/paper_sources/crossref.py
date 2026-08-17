@@ -26,7 +26,7 @@ class CrossrefSource(PaperSource):
             return resp.json()
 
     async def search(self, query: str, limit: int = 15) -> list[RawPaper]:
-        mailto = settings.crossref_email or settings.openalex_email or "research@example.com"
+        mailto = settings.crossref_email or settings.openalex_email or "shoboz996@gmail.com"
         headers = {"User-Agent": f"DeepResearch/1.0 (mailto:{mailto})"}
 
         try:
