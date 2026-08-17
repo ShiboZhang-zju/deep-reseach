@@ -43,9 +43,23 @@ MODELS: list[ModelConfig] = [
             "chat_template_kwargs": {"enable_thinking": False},
         },
     ),
+    # Fallback backend used when the primary's inference worker is down
+    # (observed: connection refused on its upstream :8021 port). Same
+    # Qwen3.6-35B-A3B family, deployed on a separate host.
+    ModelConfig(
+        name="Qwen3.6-35B-A3B-P800-test-image",
+        base_url="http://28.252.230.68:8080/openapi",
+        model="Qwen3.6-35B-A3B-P800-test-image",
+        extra_body={
+            "top_k": 50,
+            "repetition_penalty": 1.05,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    ),
 ]
 
 _DEFAULT_MODEL = MODELS[0]
+_FALLBACK_MODEL = MODELS[1]
 
 
 class Settings(BaseSettings):
@@ -54,6 +68,11 @@ class Settings(BaseSettings):
     env_venus_openapi_secret_id: str = ""
     venus_llm_proxy_url: str = _DEFAULT_MODEL.base_url
     venus_llm_model: str = _DEFAULT_MODEL.model
+    # Fallback backend used when the primary endpoint fails (transport/service
+    # errors only, not context/budget errors). Empty model string disables the
+    # fallback so the primary behaves exactly as before.
+    fallback_venus_llm_proxy_url: str = _FALLBACK_MODEL.base_url
+    fallback_venus_llm_model: str = _FALLBACK_MODEL.model
 
     # OpenAI fallback
     openai_api_key: str = ""

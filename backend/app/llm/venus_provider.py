@@ -42,12 +42,12 @@ _PASSED_TOKENS_RE = re.compile(r"passed (\d+) input tokens")
 class VenusProvider(LLMProvider):
     """Calls the Venus LLM Proxy which is OpenAI-API compatible."""
 
-    def __init__(self):
+    def __init__(self, base_url: str | None = None, model: str | None = None):
         super().__init__()
-        self.base_url = settings.venus_llm_proxy_url
+        self.base_url = base_url or settings.venus_llm_proxy_url
         token = settings.env_venus_openapi_secret_id
         self.token = f"{token}@4083" if token else ""
-        self.model = settings.venus_llm_model
+        self.model = model or settings.venus_llm_model
         # Extra sampling / template params forwarded to OpenAI-compatible
         # backends that accept them (e.g. local Qwen: top_k, repetition_penalty,
         # chat_template_kwargs.enable_thinking). Configurable so switching model
