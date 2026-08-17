@@ -75,6 +75,9 @@ class Paper(Base):
     openalex_id = Column(Text)
     url = Column(Text)
     pdf_url = Column(Text)
+    # Open-access flag: None = unknown, True = OA, False = paywalled. Used by
+    # scoring to deprioritise paywalled papers that cannot be fetched.
+    is_oa = Column(Boolean, nullable=True)
     citation_count = Column(Integer, default=0)
     sources_json = Column(Text)
     raw_json = Column(Text)

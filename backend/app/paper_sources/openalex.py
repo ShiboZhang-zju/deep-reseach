@@ -83,6 +83,17 @@ class OpenAlexSource(PaperSource):
             if venue_obj:
                 venue = venue_obj.get("display_name", "") or ""
 
+            # Open-access info OpenAlex already returns for free: the is_oa flag
+            # and the best OA PDF location. Capturing these lets scoring
+            # deprioritise paywalled papers that cannot be fetched, and lets the
+            # PDF download chain use the OA link directly instead of guessing.
+            oa = item.get("open_access") or {}
+            is_oa = oa.get("is_oa") if isinstance(oa, dict) else None
+            best_oa = item.get("best_oa_location") or {}
+            oa_pdf = ""
+            if isinstance(best_oa, dict):
+                oa_pdf = best_oa.get("pdf_url", "") or ""
+
             papers.append(RawPaper(
                 title=item.get("display_name", "") or "",
                 abstract=abstract_str,
@@ -92,7 +103,8 @@ class OpenAlexSource(PaperSource):
                 doi=doi,
                 openalex_id=item.get("id", "").replace("https://openalex.org/", "") or "",
                 url=item.get("id", "") or "",
-                pdf_url="",
+                pdf_url=oa_pdf,
+                is_oa=is_oa,
                 citation_count=item.get("cited_by_count", 0) or 0,
                 source=self.name,
                 raw_data={"openalex_id": item.get("id", "")},

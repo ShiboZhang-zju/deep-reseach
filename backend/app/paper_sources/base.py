@@ -22,6 +22,11 @@ class RawPaper:
     openalex_id: str = ""
     url: str = ""
     pdf_url: str = ""
+    # Open-access flag: None = unknown, True = open access, False = paywalled.
+    # A paywalled paper without an arXiv preprint or an OA pdf_url cannot be
+    # downloaded, so it should be deprioritised at scoring time rather than
+    # admitted into the evidence pool only to fail PDF fetch later.
+    is_oa: bool | None = None
     citation_count: int = 0
     source: str = ""
     raw_data: dict = field(default_factory=dict)

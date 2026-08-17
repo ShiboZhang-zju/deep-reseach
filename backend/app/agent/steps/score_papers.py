@@ -85,6 +85,11 @@ async def score_papers(db, state: ResearchState, llm, task_id: str, round_num: i
                 score += 2.0
             if paper.abstract:  # has abstract to score at all
                 score += 0.5
+            # Paywalled with no OA route (no arXiv preprint, no OA pdf_url) can
+            # never yield full text, so deprioritise it instead of admitting it
+            # into the evidence pool only to fail PDF fetch later.
+            if paper.is_oa is False and not paper.arxiv_id and not paper.pdf_url:
+                score -= 2.0
             return score
 
         ranked = sorted(paper_map.items(), key=lambda kv: _heuristic(kv[1]), reverse=True)

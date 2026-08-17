@@ -39,6 +39,7 @@ def normalize_paper(raw: RawPaper, extra_sources: list[str] | None = None) -> di
         "openalex_id": raw.openalex_id or None,
         "url": raw.url,
         "pdf_url": raw.pdf_url,
+        "is_oa": raw.is_oa,
         "citation_count": raw.citation_count,
         "sources_json": json.dumps(sources, ensure_ascii=False),
         "normalized_title": normalize_title(raw.title),
