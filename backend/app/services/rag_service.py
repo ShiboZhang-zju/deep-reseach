@@ -448,6 +448,28 @@ async def _fetch_crossref_pdf(doi: str) -> bytes | None:
     return None
 
 
+async def _fetch_aclanthology_pdf(doi: str) -> bytes | None:
+    """Try ACL Anthology for NLP/CL papers (DOI prefix 10.18653/v1/...).
+
+    RAG / NLP papers mostly live on ACL Anthology rather than arXiv or an
+    open-access repository, so the generic sources miss them and they fall back
+    to abstract-only evidence. ACL Anthology serves a direct PDF per entry.
+    """
+    import re
+    if not doi:
+        return None
+    m = re.match(r"10\.18653/v1/(.+)$", doi.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    acl_id = m.group(1).strip().rstrip("/")
+    if not acl_id:
+        return None
+    pdf = await _try_download(f"https://aclanthology.org/{acl_id}.pdf")
+    if pdf:
+        logger.info("ACL Anthology PDF downloaded for %s", acl_id)
+    return pdf
+
+
 async def download_pdf_multi_source(paper) -> bytes | None:
     """Try multiple sources to download a paper's PDF.
     
@@ -508,6 +530,10 @@ async def download_pdf_multi_source(paper) -> bytes | None:
     # 7. Try Crossref links
     if not pdf_bytes and paper.doi:
         pdf_bytes = await _fetch_crossref_pdf(paper.doi)
+    
+    # 7b. Try ACL Anthology (NLP/CL papers with 10.18653/v1/ DOIs)
+    if not pdf_bytes and paper.doi:
+        pdf_bytes = await _fetch_aclanthology_pdf(paper.doi)
     
     # 8. Try Sci-Hub (last resort) — DISABLED by default (P0-4: legal compliance)
     if not pdf_bytes and paper.doi and settings.enable_scihub:
