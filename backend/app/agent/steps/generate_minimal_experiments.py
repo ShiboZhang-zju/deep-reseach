@@ -64,6 +64,22 @@ class MinimalExperimentResult:
         return {"idea_ids": self.idea_ids, "experiment_ids": self.experiment_ids}
 
 
+def _build_idea_motivation(gap: GapCandidate, intervention: InterventionCandidate) -> str:
+    """Compose a per-idea motivation that differs across interventions.
+
+    Two interventions over the same gap used to share gap.observed_problem
+    verbatim, surfacing as duplicate-looking ideas. Fold in the intervention's
+    distinct failure mechanism so each idea states why *this* direction matters.
+    """
+    observed = (gap.observed_problem or "").strip()
+    mechanism = (intervention.failure_mechanism or "").strip()
+    if not observed:
+        return mechanism or "(motivation not specified)"
+    if not mechanism:
+        return observed
+    return f"{observed}\n\nThis direction specifically targets the failure mechanism: {mechanism}."
+
+
 async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: str) -> MinimalExperimentResult:
     """Persist conditional ideas and small falsifiable experiments from passed interventions."""
     from app.db.models import ResearchContract
@@ -116,7 +132,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
         idea = paper_repo.save_idea(db, task_id, {
             "title": final_title,
             "description": plan.summary,
-            "motivation": gap.observed_problem,
+            "motivation": _build_idea_motivation(gap, intervention),
             "method_sketch": intervention.proposed_intervention,
             "expected_contribution": intervention.measurable_outcome,
             "related_paper_ids_json": json.dumps(paper_ids, ensure_ascii=False),
@@ -129,6 +145,23 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             # intervention so the user sees A/B ranked directions.
             "confidence_tier": getattr(intervention, "confidence_tier", "C") or "C",
         })
+        # Score the idea so its quality is quantifiable instead of leaving
+        # novelty/feasibility/... as NULL. Reuse the V1 scoring prompt; even the
+        # weak fallback model gives directional signal, and the graded tier keeps
+        # the O1 A/B/C ranking on top of it.
+        try:
+            from app.agent.steps.generate_ideas import _score_idea
+            score = await _score_idea(db, state, llm, idea)
+            idea_score_val = (
+                0.20 * score.novelty + 0.20 * score.feasibility + 0.20 * score.significance +
+                0.20 * score.evidence_support + 0.10 * score.differentiation +
+                0.05 * score.experimentability + 0.05 * score.potential_impact
+            )
+            final_score = idea_score_val - 0.08 * score.risk
+            paper_repo.update_idea_scores(db, idea.id, score.model_dump(), final_score, "conditional_go")
+        except Exception as e:
+            logger.warning("Task %s: idea scoring failed (non-fatal) for '%s': %s",
+                           task_id[:8], idea.title[:40], e)
         steps = [
             *plan.steps,
             f"Success condition: {plan.success_condition}",
