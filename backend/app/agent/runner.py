@@ -794,7 +794,12 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             else:
                 logger.info("Task %s: narrowing budget exhausted (%d passes), "
                             "falling back to remediation", task_id[:8], narrow_iterations)
-            if await _try_remediate(db, state, llm, task_id, "no_surviving_gap_after_audit"):
+            # Pass the audited gaps' claimed deltas so the remediation search can
+            # anchor its queries on the exact mechanism the audit failed to find
+            # comparisons for, instead of a broad topic sweep.
+            gap_claims = [g.claimed_delta for g in gaps if g.claimed_delta]
+            if await _try_remediate(db, state, llm, task_id,
+                                    "no_surviving_gap_after_audit", context=gap_claims):
                 continue
             await _terminate_more_research(db, state, task_id,
                                            "more_research_required", "no_surviving_gap_after_audit")
@@ -888,17 +893,20 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                                    "more_research_required", "remediation_budget_exhausted")
 
 
-async def _try_remediate(db, state: ResearchState, llm, task_id: str, reason: str) -> bool:
+async def _try_remediate(db, state: ResearchState, llm, task_id: str, reason: str,
+                         context: list[str] | None = None) -> bool:
     """Attempt one O2 directed remediation round for `reason`.
 
     Returns True if a remediation round ran (caller should retry the pipeline),
     False if remediation is not allowed/exhausted (caller should terminate).
+    `context` carries reason-specific material (e.g. the audited gaps' claimed
+    deltas) so the LLM can anchor the remediation queries on it.
     """
     if not can_remediate(state, reason):
         logger.info("Task %s: no remediation for '%s' (disabled/exhausted)", task_id[:8], reason)
         return False
     logger.info("Task %s: O2 remediation triggered for '%s'", task_id[:8], reason)
-    result = await run_targeted_research_round(db, state, llm, task_id, reason)
+    result = await run_targeted_research_round(db, state, llm, task_id, reason, context=context)
     if not result.attempted:
         return False
     logger.info("Task %s: remediation added %d papers, %d evidence (exhausted=%s)",

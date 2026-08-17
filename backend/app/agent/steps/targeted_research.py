@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from pydantic import BaseModel, Field
+
 from app.config import settings
 from app.agent.state import ResearchState
 from app.db.repositories import paper_repo, task_repo
@@ -54,12 +56,15 @@ _REASON_PLAYBOOK: dict[str, tuple[str, list[str]]] = {
         ],
     ),
     # Gap survived mining but audit could not confirm — we lack external neighbors.
+    # Seed phrases target *method-level* comparisons (the direct neighbors the
+    # audit needs), not a broad "recent advances" sweep that recalls mostly
+    # low-priority, off-mechanism papers.
     "no_surviving_gap_after_audit": (
         "direct_neighbor",
         [
-            "{topic} recent advances",
-            "comparison methods {topic}",
-            "{topic} benchmark evaluation",
+            "{topic} method comparison",
+            "{topic} ablation study",
+            "{topic} mechanism analysis",
         ],
     ),
     # Interventions failed hard gates — need stronger evidence / feasibility anchors.
@@ -125,8 +130,58 @@ def _build_seed_queries(reason_key: str, topic: str) -> list[str]:
     return seeds
 
 
+class RemediationQuerySchema(BaseModel):
+    queries: list[str] = Field(description="English search queries, one per line")
+
+
+_REMEDIATION_QUERY_SYSTEM = """You are generating academic search queries for a targeted literature search.
+A research gap could not be confirmed as novel because the audit could not find
+direct method-level comparisons. Generate search queries that would retrieve the
+most relevant prior work that could already close these specific gaps.
+
+Rules:
+- Output English only.
+- Anchor each query on a gap's specific mechanism or claim, not the broad topic.
+- Derive terms from the supplied gap descriptions; do not invent new concepts."""
+
+_REMEDIATION_QUERY_USER = """Topic: {topic}
+Gaps that need direct comparison material:
+{gap_claims}
+
+Generate {n} concise search queries (3-8 words each)."""
+
+
+async def _generate_remediation_queries(
+    llm, topic: str, reason_key: str, gap_claims: list[str], n: int
+) -> list[str] | None:
+    """Use the LLM to turn the gaps' actual claims into precise search queries.
+
+    The deterministic seed templates only know the topic, so they recall broad
+    "recent advances" style papers and pile up low-priority results. The gaps'
+    claimed deltas carry the exact mechanism the audit failed to find comparisons
+    for, so the LLM can anchor queries on it. Returns None on any failure so the
+    caller keeps the template queries.
+    """
+    try:
+        gen = await llm.chat_json([
+            {"role": "system", "content": _REMEDIATION_QUERY_SYSTEM},
+            {"role": "user", "content": _REMEDIATION_QUERY_USER.format(
+                topic=topic,
+                gap_claims="\n".join(f"- {c}" for c in gap_claims[:5]),
+                n=n,
+            )},
+        ], RemediationQuerySchema)
+        queries = [q.strip() for q in gen.queries if q and q.strip()]
+        if queries:
+            return queries[:n]
+    except Exception as exc:
+        logger.warning("Remediation query generation failed (%s); using templates", exc)
+    return None
+
+
 async def run_targeted_research_round(
-    db, state: ResearchState, llm, task_id: str, reason: str
+    db, state: ResearchState, llm, task_id: str, reason: str,
+    context: list[str] | None = None,
 ) -> RemediationResult:
     """RunONE directed search round aimed at `reason`, then return outcome.
 
@@ -138,7 +193,15 @@ async def run_targeted_research_round(
 
     intent, _templates = _REASON_PLAYBOOK[key]
     topic = state.normalized_topic or state.user_input or ""
-    seeds = _build_seed_queries(key, topic)
+
+    # Prefer LLM-generated queries that use the gaps' actual claims (context);
+    # fall back to the deterministic templates when context is missing or the
+    # LLM call fails.
+    seeds = None
+    if context and llm is not None:
+        seeds = await _generate_remediation_queries(llm, topic, key, context, len(_templates))
+    if not seeds:
+        seeds = _build_seed_queries(key, topic)
 
     # Bump round counter — a remediation round is a real search round.
     state.current_round += 1
