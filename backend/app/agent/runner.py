@@ -412,11 +412,23 @@ async def run_task(task_id: str):
 
         # Phase 1.5: Check search result before proceeding
         if search_result.status == "failed":
-            logger.error("Task %s: search loop failed (%s), stopping", task_id[:8], search_result.reason)
-            task_repo.update_status(db, task_id, "failed")
-            task_repo.update_stop_reason(db, task_id, search_result.reason)
-            emit_event(task_id, "error", {"message": f"Search failed: {search_result.reason}"})
-            db.commit()
+            # If at least one round completed before the loop failed (e.g. a
+            # transient LLM outage mid-task), the retrieval/evidence/coverage
+            # work is still valuable — degrade to a landscape brief instead of
+            # discarding it. Only a first-round failure with nothing collected
+            # is a hard failure.
+            if search_result.completed_rounds > 0:
+                logger.warning("Task %s: search loop failed after %d round(s) (%s); degrading to brief",
+                               task_id[:8], search_result.completed_rounds, search_result.reason)
+                await _terminate_more_research(db, state, task_id, "more_research_required",
+                                               f"search_failed: {search_result.reason}")
+            else:
+                logger.error("Task %s: search loop failed on first round (%s), stopping",
+                             task_id[:8], search_result.reason)
+                task_repo.update_status(db, task_id, "failed")
+                task_repo.update_stop_reason(db, task_id, search_result.reason)
+                emit_event(task_id, "error", {"message": f"Search failed: {search_result.reason}"})
+                db.commit()
             return
 
         if search_result.status == "more_research_required":
