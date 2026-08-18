@@ -24,20 +24,37 @@ logger = logging.getLogger(__name__)
 _PHENOMENON_SYSTEM = """You validate the *phenomenon* a surviving research gap depends on, before any method is designed.
 
 A gap is worth pursuing only if the phenomenon it claims is real and large enough to matter.
-Pin that phenomenon down and design the cheapest experiment that could falsify it.
+Pin that phenomenon down and design the cheapest experiment that could falsify it. The
+experiment must directly test the mechanism behind the gap's claimed delta — not a
+related-but-different angle.
 
 For the gap, produce:
 - phenomenon: the concrete, measurable empirical claim the gap rests on (e.g. "models that
   pass sparse tests often fail dense tests on the same program"), NOT a vague statement.
+- mechanism_under_test: the exact mechanism this experiment probes. It MUST be a direct
+  translation of the gap's claimed delta / residual gap — not a nearby topic.
+- supports_gap_claim: quote which sentence of the gap's claim a PASSING experiment would
+  support. If you cannot name the specific claim it supports, the experiment is off-target;
+  say so explicitly rather than padding.
 - critical_unknown: the one fact that, if unknown, makes the whole direction uncertain.
+- expected_observation: what you expect to see if the phenomenon is real.
+- alternative_explanation: the most plausible OTHER reason the same observation could occur
+  (a confound the experiment must rule out, or at least acknowledge).
+- comparator: the H0/H1 framing — name the two things being compared (e.g. "H0: self-generated
+  validator and independent oracle show no reliability gap; H1: self-generated validator has a
+  higher false-positive rate than the independent oracle"). "Statistically significant" is
+  meaningless without naming the comparison.
 - oracle_experiment: the cheapest falsification experiment — what to measure, on what data,
-  comparing what against what. It must be runnable without building a new method.
+  comparing what against what. Runnable without building a new method.
 - kill_criterion: the quantitative threshold below which the phenomenon is too small to be
-  worth a method paper (e.g. "if fewer than 5% of sparse-pass samples fail dense tests, abandon").
+  worth a method paper.
+- kill_criterion_basis: where the threshold comes from — exactly one of prior_literature,
+  baseline_variance, or minimum_meaningful_effect — plus the specific number/range behind it.
+  Do NOT emit an arbitrary round number (e.g. "10%") with no source.
 - measurement: the exact metric/quantity that quantifies the phenomenon's size.
 
-Do NOT design a method or a solution. Do NOT invent papers or datasets. If the phenomenon
-cannot be made concrete and measurable, say so explicitly rather than padding."""
+Do NOT design a method or a solution. Do NOT invent papers or datasets. If a field cannot be
+grounded, say so explicitly rather than padding with a plausible-sounding number."""
 
 _PHENOMENON_USER = """Surviving gap:
 - Setting: {target_setting}
@@ -56,9 +73,15 @@ Produce the phenomenon validation plan."""
 
 class PhenomenonPlanSchema(BaseModel):
     phenomenon: str = Field(min_length=5)
+    mechanism_under_test: str = Field(min_length=5)
+    supports_gap_claim: str = Field(min_length=5)
     critical_unknown: str = Field(min_length=5)
+    expected_observation: str = Field(min_length=5)
+    alternative_explanation: str = Field(min_length=5)
+    comparator: str = Field(min_length=5)
     oracle_experiment: str = Field(min_length=5)
     kill_criterion: str = Field(min_length=5)
+    kill_criterion_basis: str = Field(min_length=5)
     measurement: str = Field(min_length=3)
 
 
@@ -116,9 +139,15 @@ async def generate_phenomenon_plans(
             contract_id=contract.id,
             gap_id=gap.id,
             phenomenon=plan.phenomenon,
+            mechanism_under_test=plan.mechanism_under_test,
+            supports_gap_claim=plan.supports_gap_claim,
             critical_unknown=plan.critical_unknown,
+            expected_observation=plan.expected_observation,
+            alternative_explanation=plan.alternative_explanation,
+            comparator=plan.comparator,
             oracle_experiment=plan.oracle_experiment,
             kill_criterion=plan.kill_criterion,
+            kill_criterion_basis=plan.kill_criterion_basis,
             measurement=plan.measurement,
             pipeline_version=state.pipeline_version,
         )

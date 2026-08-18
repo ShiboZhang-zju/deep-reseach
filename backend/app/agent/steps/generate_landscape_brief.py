@@ -180,9 +180,15 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
             plan = plans_by_gap.get(g.id)
             if plan:
                 lines.append(f"  - 待验证现象: {(plan.phenomenon or '')[:140].replace(chr(10), ' ')}")
+                if plan.mechanism_under_test:
+                    lines.append(f"  - 被测机制: {(plan.mechanism_under_test or '')[:140].replace(chr(10), ' ')}")
+                if plan.supports_gap_claim:
+                    lines.append(f"  - 支持的 Gap claim: {(plan.supports_gap_claim or '')[:140].replace(chr(10), ' ')}")
                 lines.append(f"  - 证伪实验: {(plan.oracle_experiment or '')[:140].replace(chr(10), ' ')}")
                 if plan.kill_criterion:
                     lines.append(f"  - 放弃判据: {(plan.kill_criterion or '')[:140].replace(chr(10), ' ')}")
+                if plan.kill_criterion_basis:
+                    lines.append(f"  - 阈值依据: {(plan.kill_criterion_basis or '')[:140].replace(chr(10), ' ')}")
         lines.append("")
 
     # --- 5b. Graded candidate directions (O1) ---

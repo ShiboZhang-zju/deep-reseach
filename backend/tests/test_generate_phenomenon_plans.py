@@ -37,9 +37,15 @@ class PhenomenonLLM:
         from app.agent.steps.generate_phenomenon_plans import PhenomenonPlanSchema
         return PhenomenonPlanSchema(
             phenomenon="models pass sparse tests but fail dense tests on the same program",
+            mechanism_under_test="sparse-to-dense test-suite discrimination of self-correction",
+            supports_gap_claim="the claimed delta that benchmarks lack discriminative hidden tests",
             critical_unknown="whether sparse-pass/dense-fail is common enough to matter",
+            expected_observation="a meaningful share of sparse-pass samples fail dense tests",
+            alternative_explanation="models overfit the sparse suite rather than being incidentally correct",
+            comparator="H0: sparse-pass and dense-pass rates are equal; H1: dense-pass rate is lower",
             oracle_experiment="measure sparse-pass vs dense-pass rate on existing self-correction benchmarks",
             kill_criterion="if fewer than 5% of sparse-pass samples fail dense tests, abandon the direction",
+            kill_criterion_basis="minimum_meaningful_effect: a <5% gap is too small to justify a new eval protocol",
             measurement="sparse-pass -> dense-fail rate",
         )
 
