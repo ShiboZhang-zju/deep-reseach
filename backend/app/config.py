@@ -286,6 +286,7 @@ class Settings(BaseSettings):
     family_coverage_high: float = 0.8
     family_coverage_medium: float = 0.6
     family_stability_floor: float = 0.3         # per-family floor -> flag that family, not the whole gap
+    family_instability_more_search_budget: int = 2  # max family-instability-triggered more_search rounds
 
     @property
     def effective_openalex_rate_per_min(self) -> int:

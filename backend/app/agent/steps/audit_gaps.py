@@ -800,6 +800,31 @@ async def audit_gap_candidate(
             gap.residual_gap = " ".join(
                 c.claim_text for c in atomic_claims if c.id in id_set)
 
+        # P1-1 blind-spot fix: a claim-level "confirmed" is not trustworthy when
+        # the family-internal retrieval is highly unstable (same family's variants
+        # recall disjoint Top-K) — the audit may have missed the real prior art.
+        # Downgrade to more_search, but bounded by a budget so a persistently
+        # unstable family cannot loop forever.
+        if derived_result == "confirmed":
+            from app.config import settings
+            diagnostics = _compute_npa_diagnostics(db, gap)
+            if (diagnostics.instable_families
+                    and diagnostics.median_family_stability is not None
+                    and diagnostics.median_family_stability < settings.family_stability_floor):
+                more_search_count = sum(
+                    1 for a in gap_repo.list_gap_audits(db, gap.id)
+                    if a.recommended_action == "more_search")
+                if more_search_count < settings.family_instability_more_search_budget:
+                    decision.audit_result = "uncertain"
+                    decision.recommended_action = "more_search"
+                    paper_repo.save_trace(
+                        db, task_id, "gap_audit_family_instability", "decision",
+                        output_data={
+                            "gap_id": gap.id,
+                            "instable_families": diagnostics.instable_families,
+                            "median_family_stability": diagnostics.median_family_stability,
+                        })
+
     action = decision.recommended_action
     if action == "continue" and decision.audit_result == "confirmed":
         gap.status = "surviving"
@@ -876,14 +901,30 @@ def _median(values):
     return (s[n // 2 - 1] + s[n // 2]) / 2.0
 
 
-def _compute_search_confidence(db, gap) -> tuple[float | None, float | None, str]:
-    """Four-state search confidence (P1-1), all mechanical.
+@dataclass
+class NPADiagnostics:
+    family_coverage: float
+    family_stabilities: dict[str, float | None]   # family -> stability@5
+    median_family_stability: float | None
+    cross_round_stability: float | None
+    stability_at_k: dict[int, float | None]        # k -> median family stability @k (diagnostic)
+    search_confidence: str
+    instable_families: list[str]                   # stability@5 < floor
+
+
+def _compute_npa_diagnostics(db, gap) -> NPADiagnostics:
+    """Four-state search confidence + NPA stability diagnostics (P1-1), mechanical.
 
     States: INSUFFICIENT_OBSERVATION / high / medium / low.
     Driven by (a) query-family coverage, (b) MEDIAN family-internal stability
     (same family, different query variants -> Top-K overlap), and (c) cross-round
     global Top-K stability. The first audit round has no cross-round data and
     returns INSUFFICIENT_OBSERVATION, never low. Thresholds come from settings.
+
+    Also records @5/@10/@20 family stability so the "query wording sensitivity"
+    signal can be diagnosed later: if @5 is low but @20 recovers, the instability
+    is rank-boundary sensitivity; if both are low, it is deeper. This does NOT by
+    itself prove "lexical mismatch" — that needs raw recall/ranking inspection.
     """
     from app.config import settings
     records = db.query(SearchQueryRecord).filter(
@@ -892,7 +933,7 @@ def _compute_search_confidence(db, gap) -> tuple[float | None, float | None, str
     families = sorted({r.query_family for r in records if r.query_family})
     family_coverage = min(1.0, len(families) / 5.0)
 
-    def _query_topk(query_id, k=5):
+    def _query_topk(query_id, k):
         rows = db.query(SearchQueryPaper.paper_id).filter(
             SearchQueryPaper.query_id == query_id,
         ).order_by(SearchQueryPaper.rank).limit(k).all()
@@ -903,18 +944,26 @@ def _compute_search_confidence(db, gap) -> tuple[float | None, float | None, str
         if r.query_family:
             queries_by_family[r.query_family].append(r.id)
 
-    family_stabilities = []
-    for family in families:
-        topks = [t for t in (_query_topk(qid) for qid in queries_by_family[family]) if t]
-        if len(topks) >= 2:
-            jacs = []
-            for i in range(len(topks)):
-                for j in range(i + 1, len(topks)):
-                    a, b = topks[i], topks[j]
-                    jacs.append(len(a & b) / max(1, len(a | b)))
-            family_stabilities.append(_median(jacs))
+    def _family_stabilities(k):
+        out = {}
+        for family in families:
+            topks = [t for t in (_query_topk(qid, k) for qid in queries_by_family[family]) if t]
+            if len(topks) >= 2:
+                jacs = []
+                for i in range(len(topks)):
+                    for j in range(i + 1, len(topks)):
+                        a, b = topks[i], topks[j]
+                        jacs.append(len(a & b) / max(1, len(a | b)))
+                out[family] = _median(jacs)
+            else:
+                out[family] = None
+        return out
 
-    median_family = _median(family_stabilities) if family_stabilities else None
+    family_stabilities = _family_stabilities(5)
+    valid = [s for s in family_stabilities.values() if s is not None]
+    median_family = _median(valid) if valid else None
+    instable_families = [f for f, s in family_stabilities.items()
+                         if s is not None and s < settings.family_stability_floor]
 
     comparisons = gap_repo.list_neighbor_comparisons(db, gap.id)
     current_topk = {c.paper_id for c in comparisons[:5]}
@@ -926,6 +975,12 @@ def _compute_search_confidence(db, gap) -> tuple[float | None, float | None, str
     if len(audits) >= 2:
         prev_topk = set(json.loads(audits[1].neighbor_paper_ids_json or "[]")[:5])
     cross_round = (len(current_topk & prev_topk) / 5.0) if (prev_topk and current_topk) else None
+
+    stability_at_k = {}
+    for k in (5, 10, 20):
+        stabs = _family_stabilities(k)
+        vals = [s for s in stabs.values() if s is not None]
+        stability_at_k[k] = _median(vals) if vals else None
 
     if cross_round is None:
         confidence = "INSUFFICIENT_OBSERVATION"
@@ -939,10 +994,19 @@ def _compute_search_confidence(db, gap) -> tuple[float | None, float | None, str
     else:
         confidence = "low"
 
-    return family_coverage, median_family, confidence
+    return NPADiagnostics(
+        family_coverage=family_coverage,
+        family_stabilities=family_stabilities,
+        median_family_stability=median_family,
+        cross_round_stability=cross_round,
+        stability_at_k=stability_at_k,
+        search_confidence=confidence,
+        instable_families=instable_families,
+    )
 
 
-def _record_nearest_prior_art(db, gap: GapCandidate, decision) -> None:
+def _record_nearest_prior_art(db, gap: GapCandidate, decision,
+                              diagnostics: NPADiagnostics | None = None) -> None:
     """Materialise a surviving gap's nearest-prior-art provenance + P1-1 NPA
     stability and four-state search confidence.
 
@@ -952,10 +1016,23 @@ def _record_nearest_prior_art(db, gap: GapCandidate, decision) -> None:
     differentiation summary only when atomic claims are absent.
     """
     comparisons = gap_repo.list_neighbor_comparisons(db, gap.id)
-    family_coverage, median_family, confidence = _compute_search_confidence(db, gap)
-    gap.family_coverage = family_coverage
-    gap.npa_stability = median_family
-    gap.search_confidence = confidence
+    if diagnostics is None:
+        diagnostics = _compute_npa_diagnostics(db, gap)
+    gap.family_coverage = diagnostics.family_coverage
+    gap.npa_stability = diagnostics.median_family_stability
+    gap.search_confidence = diagnostics.search_confidence
+    # Record @5/@10/@20 stability for later diagnosis/calibration. Query wording
+    # sensitivity is real, but its CAUSE (lexical mismatch vs rank-boundary
+    # sensitivity) needs this raw signal — never a conclusion from one number.
+    paper_repo.save_trace(db, gap.task_id, "gap_npa_stability_diagnostic", "decision",
+                          output_data={
+                              "gap_id": gap.id,
+                              "stability_at_k": diagnostics.stability_at_k,
+                              "family_stabilities": diagnostics.family_stabilities,
+                              "cross_round_stability": diagnostics.cross_round_stability,
+                              "instable_families": diagnostics.instable_families,
+                              "search_confidence": diagnostics.search_confidence,
+                          })
     if not comparisons:
         gap.nearest_prior_art_paper_id = None
         gap.nearest_prior_art_title = None
