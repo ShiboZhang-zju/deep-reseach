@@ -293,20 +293,30 @@ class GapSearchAdmission:
     candidate_paper_ids: list[str]
     external_neighbor_ids: list[str]
 
+VALID_QUERY_FAMILIES = ("exact_gap", "synonym", "mechanism", "benchmark", "method_neighbor")
+
+
 def build_adversarial_queries(gap: GapCandidate) -> list[AdversarialQuerySpec]:
+    """Fallback: raw concatenation across the 5 families (no synonym expansion)."""
+    base = " ".join(filter(None, [gap.target_setting, gap.missing_capability, gap.claimed_delta]))
     specs = [
-        AdversarialQuerySpec("exact_gap", " ".join(filter(None, [gap.target_setting, gap.missing_capability, gap.claimed_delta]))),
-        AdversarialQuerySpec("alternative_coverage", " ".join(filter(None, [gap.observed_problem, "method evaluation benchmark"]))),
-        AdversarialQuerySpec("claim_falsification", gap.falsification_condition or gap.description),
+        AdversarialQuerySpec("exact_gap", base),
+        AdversarialQuerySpec("synonym", " ".join(filter(None, [gap.missing_capability, "standard terminology prior work"]))),
+        AdversarialQuerySpec("mechanism", " ".join(filter(None, [gap.observed_problem, "failure mechanism"]))),
+        AdversarialQuerySpec("benchmark", " ".join(filter(None, [gap.target_setting, "benchmark evaluation"]))),
+        AdversarialQuerySpec("method_neighbor", " ".join(filter(None, [gap.missing_capability, "method"]))),
     ]
     seen = set()
     return [spec for spec in specs if spec.query_text and not (spec.query_text.lower() in seen or seen.add(spec.query_text.lower()))]
 
 
-class GapQueryGenSchema(BaseModel):
-    exact_gap: str = Field(description="English query matching the gap's exact claimed delta")
-    alternative_coverage: str = Field(description="English query for alternative methods that might already cover the observed problem")
-    claim_falsification: str = Field(description="English query targeting the falsification condition / strongest prior work")
+class QueryFamilySchema(BaseModel):
+    family: str = Field(description="One of: exact_gap, synonym, mechanism, benchmark, method_neighbor")
+    queries: list[str] = Field(default_factory=list, min_length=1, max_length=3)
+
+
+class GapQueryGenList(BaseModel):
+    families: list[QueryFamilySchema] = Field(default_factory=list)
 
 
 _QUERY_GEN_SYSTEM = """You are generating English academic search queries for an adversarial gap audit.
@@ -314,11 +324,21 @@ The gap description may be in Chinese or mixed language. Produce queries that wo
 most relevant PRIOR WORK that could already close this gap, focusing on systems- and
 mechanism-level work rather than surface application papers.
 
+Produce EXACTLY these 5 query families, each with 2-3 distinct English query variants:
+- exact_gap: the gap's own claimed delta / missing capability, stated in English.
+- synonym: the SAME concept rewritten with standard academic synonyms and broader/narrower
+  terminology (e.g. "accidental correctness" -> "test adequacy", "hidden test robustness",
+  "mutation testing", "specification coverage"). This family defends against lexical mismatch
+  — prior work that uses different terms for the same idea.
+- mechanism: queries anchored on the SAME failure mechanism, ignoring surface wording.
+- benchmark: queries for work sharing the SAME evaluation setting / benchmark / task family.
+- method_neighbor: queries for work using the SAME intervention or an adjacent method family.
+
 Rules:
 - Output English only.
-- Anchor each query on the gap's core mechanism/capability (e.g. memory offloading, quantization,
-  gradient checkpointing, distributed training) rather than surface keywords (e.g. adapter, benchmark).
-- Translate the gap's concepts into standard English technical vocabulary; do not invent new terms."""
+- Translate the gap's concepts into standard English technical vocabulary; do not invent new terms.
+- Each family's variants must genuinely differ (different phrasing / angle), not trivially reorder
+  the same words — they drive a family-internal stability check."""
 
 _QUERY_GEN_USER = """Candidate gap:
 - Setting: {target_setting}
@@ -327,17 +347,13 @@ _QUERY_GEN_USER = """Candidate gap:
 - Claimed delta: {claimed_delta}
 - Falsification condition: {falsification_condition}
 
-Produce the three English search queries."""
+Produce 5 query families, each with 2-3 English query variants."""
 
 
 async def generate_english_adversarial_queries(llm, gap: GapCandidate) -> list[AdversarialQuerySpec]:
-    """Generate English search queries anchored on the gap's mechanism/capability.
-
-    Raw concatenation of the gap's (often Chinese) fields produced queries that
-    matched surface keywords (e.g. "adapter") across application domains while
-    missing the systems-level prior work (e.g. ZeRO-Offload, QLoRA CPU offloading)
-    the audit was meant to find. English, mechanism-anchored queries fix the
-    language/recall mismatch; on failure we fall back to raw concatenation.
+    """Generate 5-family adversarial queries (with synonym/mechanism/benchmark/
+    method-neighbor expansion and 2-3 variants per family) to defend against
+    lexical mismatch. On failure, falls back to raw concatenation.
     """
     try:
         gen = await llm.chat_json([
@@ -349,15 +365,25 @@ async def generate_english_adversarial_queries(llm, gap: GapCandidate) -> list[A
                 claimed_delta=gap.claimed_delta or "",
                 falsification_condition=gap.falsification_condition or "",
             )},
-        ], GapQueryGenSchema)
-        specs = [
-            AdversarialQuerySpec("exact_gap", (gen.exact_gap or "").strip()),
-            AdversarialQuerySpec("alternative_coverage", (gen.alternative_coverage or "").strip()),
-            AdversarialQuerySpec("claim_falsification", (gen.claim_falsification or "").strip()),
-        ]
-        specs = [spec for spec in specs if spec.query_text]
-        if specs:
-            return specs
+        ], GapQueryGenList)
+        specs: list[AdversarialQuerySpec] = []
+        for fam in gen.families:
+            if fam.family not in VALID_QUERY_FAMILIES:
+                continue
+            for q in fam.queries:
+                text = (q or "").strip()
+                if text:
+                    specs.append(AdversarialQuerySpec(fam.family, text))
+        # De-duplicate within the same family (keep first occurrence).
+        seen = set()
+        deduped = []
+        for spec in specs:
+            key = (spec.family, spec.query_text.lower())
+            if key not in seen:
+                seen.add(key)
+                deduped.append(spec)
+        if deduped:
+            return deduped
     except Exception as exc:
         logger.warning("Gap %s: English query generation failed (%s), falling back to raw concatenation", gap.id[:8], exc)
     return build_adversarial_queries(gap)
