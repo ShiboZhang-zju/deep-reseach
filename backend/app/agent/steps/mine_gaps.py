@@ -406,8 +406,14 @@ async def mine_gap_candidates(
     # excluded) and every returned candidate, then embed them once. Dedup is
     # non-fatal — if embedding is unavailable we skip it rather than blocking
     # mining — so a duplicate can only slip through when embeddings fail.
-    existing_gaps = [g for g in gap_repo.list_gaps_for_contract(db, task_id, contract.id)
-                     if g.status not in {"rejected", "superseded"}]
+    # Compare against every non-rejected gap in the contract, INCLUDING
+    # superseded versions: a gap that was narrowed (v1 superseded -> v2) must
+    # still block a later candidate that rewords v1's original broad claim,
+    # otherwise "reword the rejected broad claim" defeats the lineage. Only
+    # genuinely rejected gaps (audit said closed) leave the comparison pool.
+    existing_gaps = [g for g in gap_repo.list_gaps_for_contract(
+        db, task_id, contract.id, include_superseded=True)
+        if g.status != "rejected"]
     existing_fps = [_gap_fingerprint(g.observed_problem, g.missing_capability,
                                      g.claimed_delta) for g in existing_gaps]
     candidate_objs = result.gaps[:max_gaps]
