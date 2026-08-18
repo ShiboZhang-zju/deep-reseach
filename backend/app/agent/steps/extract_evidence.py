@@ -398,6 +398,7 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
                 extraction_method="pdf_fulltext",
                 extraction_confidence=0.9 if match_quality == "exact" else 0.7,
                 verification_status="verified",
+                discovered_round=round_number,
             )
             db.add(eu)
             evidence_count += 1
@@ -445,6 +446,7 @@ async def _extract_from_abstract(db, llm, task_id, paper, abstract, round_number
                 extraction_method="abstract_only",
                 extraction_confidence=0.4,
                 verification_status="abstract_only",
+                discovered_round=round_number,
             )
             db.add(eu)
             evidence_count += 1
