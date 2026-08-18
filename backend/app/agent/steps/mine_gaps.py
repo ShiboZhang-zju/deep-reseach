@@ -1,5 +1,6 @@
 """Step: Mine lightweight, evidence-backed research gap candidates."""
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from app.agent.state import ResearchState
 from app.db.models import EvidenceUnit, QuestionEvidenceLink, ResearchContract, ResearchQuestion
 from app.db.repositories import gap_repo, paper_repo
 from app.schemas.schemas import GapCandidateList
+from app.services.embedding_service import cosine_similarity, embed_texts
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +35,32 @@ _MAX_PROMPT_EVIDENCE = 40
 # version is what invalidates gaps already stamped for a round, so a change to
 # the admission rules must bump it or the new rules never take effect on a
 # resumed task.
-GAP_MINING_POLICY_VERSION = "evidence-admission-v3"
+GAP_MINING_POLICY_VERSION = "evidence-admission-v4"
+
+# Semantic-dedup threshold: two gap candidates whose fingerprint (observed
+# problem + missing capability + claimed delta) embeds to a cosine similarity at
+# or above this bound are the same gap reworded. Without this, the same gap
+# enters the audit twice under different wording and can be rejected once and
+# "confirmed" once — the single most damaging false signal a research-idea
+# system can emit.
+_GAP_DEDUP_SIMILARITY = 0.85
+
+
+def _gap_fingerprint(observed_problem, missing_capability, claimed_delta) -> str:
+    """The stable semantic identity of a gap, used for dedup."""
+    return " ".join(p for p in (observed_problem, missing_capability, claimed_delta)
+                    if p).strip()
+
+
+async def _embed_fingerprints(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of gap fingerprints; empty on failure (dedup is non-fatal)."""
+    if not texts:
+        return []
+    try:
+        return await asyncio.to_thread(embed_texts, texts)
+    except Exception as exc:
+        logger.warning("gap dedup embedding failed (%s); dedup disabled", exc)
+        return []
 
 @dataclass(frozen=True)
 class QuestionEvidenceAdmission:
@@ -375,10 +402,27 @@ async def mine_gap_candidates(
         ),
     }], GapCandidateList)
 
+    # Semantic dedup prep: fingerprint every already-accepted gap (this batch
+    # excluded) and every returned candidate, then embed them once. Dedup is
+    # non-fatal — if embedding is unavailable we skip it rather than blocking
+    # mining — so a duplicate can only slip through when embeddings fail.
+    existing_gaps = [g for g in gap_repo.list_gaps_for_contract(db, task_id, contract.id)
+                     if g.status not in {"rejected", "superseded"}]
+    existing_fps = [_gap_fingerprint(g.observed_problem, g.missing_capability,
+                                     g.claimed_delta) for g in existing_gaps]
+    candidate_objs = result.gaps[:max_gaps]
+    candidate_fps = [_gap_fingerprint(c.observed_problem, c.missing_capability,
+                                      c.claimed_delta) for c in candidate_objs]
+    all_vecs = await _embed_fingerprints(existing_fps + candidate_fps)
+    dedup_enabled = bool(all_vecs) and len(all_vecs) == len(existing_fps) + len(candidate_fps)
+    existing_vecs = all_vecs[:len(existing_fps)]
+    candidate_vecs = all_vecs[len(existing_fps):] if dedup_enabled else []
+    accepted_vecs = list(existing_vecs)
+
     created = []
     rejected_candidates = []
     accepted_candidates = []
-    for candidate in result.gaps[:max_gaps]:
+    for idx, candidate in enumerate(candidate_objs):
         candidate_question_ids = set(candidate.question_ids)
         allowed_for_candidate = {
             evidence_id for question_id in candidate_question_ids
@@ -422,6 +466,26 @@ async def mine_gap_candidates(
             })
             continue
 
+        # Semantic dedup: a candidate that is the same gap as one already
+        # accepted (this batch or a previous round) under different wording is
+        # dropped, so it cannot enter the audit twice and earn a contradictory
+        # verdict. The fingerprint is observed problem + missing capability +
+        # claimed delta.
+        dup = False
+        if dedup_enabled and candidate_vecs[idx]:
+            for vec in accepted_vecs:
+                if vec and cosine_similarity(candidate_vecs[idx], vec) >= _GAP_DEDUP_SIMILARITY:
+                    dup = True
+                    break
+        if dup:
+            rejected_candidates.append({
+                "reason": "DUPLICATE_GAP",
+                "gap_type": candidate.gap_type,
+                "question_ids": candidate.question_ids,
+                "cited_evidence_ids": candidate.supporting_evidence_ids,
+            })
+            continue
+
         # O5(b): full-text presence sets provenance tier rather than rejecting.
         # A-tier (complete) has a full-text-locatable span; B-tier (partial)
         # is abstract-strength only and must be confirmed by the downstream
@@ -447,6 +511,8 @@ async def mine_gap_candidates(
         for evidence_id in candidate.contradicting_evidence_ids:
             gap_repo.create_gap_evidence_link(db, gap.id, evidence_id, "contradicts", 0.8)
         created.append(gap)
+        if dedup_enabled and candidate_vecs[idx]:
+            accepted_vecs.append(candidate_vecs[idx])
         accepted_candidates.append({
             "gap_id": gap.id, "gap_type": candidate.gap_type,
             "linked_evidence_ids": usable_evidence_ids,

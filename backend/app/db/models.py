@@ -821,6 +821,15 @@ class GapCandidate(Base):
     version = Column(Integer, nullable=False, default=1)
     superseded_at = Column(DateTime)
 
+    # Lineage (Phase 3D): narrowing a gap creates a new version of the SAME
+    # canonical gap, not a sibling row. canonical_gap_id points at the lineage
+    # root (NULL on the root itself — resolve with `canonical_gap_id or id`);
+    # parent_gap_id points at the immediately superseded version. This is what
+    # lets the report show one row per canonical gap (its latest version) and
+    # keeps a rejected gap from being reworded into a fresh "novel" gap.
+    canonical_gap_id = Column(String, nullable=True)
+    parent_gap_id = Column(String, nullable=True)
+
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -829,6 +838,7 @@ class GapCandidate(Base):
         Index("idx_gc_contract", "contract_id"),
         Index("idx_gc_status", "status"),
         Index("idx_gc_task_status", "task_id", "status"),
+        Index("idx_gc_canonical", "canonical_gap_id"),
     )
 
 

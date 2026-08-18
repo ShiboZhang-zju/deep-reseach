@@ -49,6 +49,9 @@ def create_gap_candidate(
     significance_score: float | None = None,
     risk_score: float | None = None,
     status: str = "candidate",
+    version: int = 1,
+    canonical_gap_id: str | None = None,
+    parent_gap_id: str | None = None,
 ) -> GapCandidate:
     """Create a new gap candidate."""
     # Validate contract belongs to this task
@@ -80,6 +83,9 @@ def create_gap_candidate(
         significance_score=significance_score,
         risk_score=risk_score,
         status=status,
+        version=version,
+        canonical_gap_id=canonical_gap_id,
+        parent_gap_id=parent_gap_id,
     )
     db.add(gap)
     db.flush()
@@ -113,6 +119,29 @@ def list_gaps_for_contract(
     if not include_superseded:
         query = query.filter(GapCandidate.status != "superseded")
     return query.order_by(GapCandidate.created_at).all()
+
+
+def list_canonical_gap_heads(
+    db: Session, task_id: str, contract_id: str,
+) -> list[GapCandidate]:
+    """The latest non-superseded version of each canonical gap.
+
+    Narrowing leaves a superseded parent and an active child; both share the
+    same canonical lineage. Collapse them so the report surfaces one entry per
+    canonical gap (its highest-version active row) instead of the historical
+    chain, which would otherwise show a rejected v1 next to its surviving v2 as
+    two unrelated gaps.
+    """
+    gaps = list_gaps_for_contract(db, task_id, contract_id, include_superseded=True)
+    heads: dict[str, GapCandidate] = {}
+    for gap in gaps:
+        if gap.status == "superseded":
+            continue
+        canonical = gap.canonical_gap_id or gap.id
+        existing = heads.get(canonical)
+        if existing is None or (gap.version or 1) > (existing.version or 1):
+            heads[canonical] = gap
+    return sorted(heads.values(), key=lambda g: g.created_at)
 
 
 def supersede_contract_gaps(db: Session, task_id: str, contract_id: str) -> int:

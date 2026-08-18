@@ -143,7 +143,10 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
         lines.append("")
 
     # --- 5. Candidate gaps and audit status ---
-    gaps = [g for g in gap_repo.list_gaps_for_contract(db, task_id, contract_id)] if contract_id else []
+    # One row per canonical gap (its latest non-superseded version), so a gap
+    # that was narrowed (v1 superseded -> v2) never surfaces as two unrelated
+    # gaps with potentially contradictory audit verdicts.
+    gaps = [g for g in gap_repo.list_canonical_gap_heads(db, task_id, contract_id)] if contract_id else []
     lines.append("## 候选研究空白 (Gap) 与审计状态\n")
     if not gaps:
         lines.append("(本次运行未挖掘出可入库的候选 Gap。)\n")
@@ -156,7 +159,8 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
         for g in gaps[:12]:
             tier = "A(全文支撑)" if g.provenance_status == "complete" else "B(摘要级)"
             desc = (g.description or g.missing_capability or "")[:120].replace("\n", " ")
-            lines.append(f"- [{g.status}][{tier}] {desc}")
+            vtag = f" v{g.version}" if (g.version or 1) > 1 else ""
+            lines.append(f"- [{g.status}][{tier}]{vtag} {desc}")
         lines.append("")
 
     # --- 5b. Graded candidate directions (O1) ---

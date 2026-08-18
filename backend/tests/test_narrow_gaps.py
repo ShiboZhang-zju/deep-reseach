@@ -74,6 +74,7 @@ def _seed_audited_gap(db, *, audit_result="partially_closed",
 def test_partially_closed_gap_is_narrowed_to_its_remaining_delta(temp_db):
     from app.agent.state import ResearchState
     from app.agent.steps.narrow_gaps import narrow_audited_gaps
+    from app.db.models import GapCandidate
 
     db = temp_db()
     task, contract, gap = _seed_audited_gap(db)
@@ -81,12 +82,40 @@ def test_partially_closed_gap_is_narrowed_to_its_remaining_delta(temp_db):
 
     narrowed = narrow_audited_gaps(db, state, task.id)
 
+    # Narrowing versions the gap instead of overwriting it: the parent keeps its
+    # original claim and is retired, while a child carries the narrowed claim.
+    assert len(narrowed) == 1
+    child_id = narrowed[0]
+    assert child_id != gap.id
+    child = db.get(GapCandidate, child_id)
+    assert child.claimed_delta == "固定预算下状态变化边界的量化评估仍未被任何近邻覆盖。"
+    assert "近邻已覆盖静态问答下的记忆压缩评测。" in child.existing_coverage
+    assert "一般问答准确率" in child.existing_coverage, "原有覆盖不能被丢弃"
+    assert child.status == "auditing", "收窄后的 claim 必须重新经过审计"
+    assert child.version == 2
+    assert child.parent_gap_id == gap.id
+    assert child.canonical_gap_id == gap.id
     db.refresh(gap)
-    assert narrowed == [gap.id]
-    assert gap.claimed_delta == "固定预算下状态变化边界的量化评估仍未被任何近邻覆盖。"
-    assert "近邻已覆盖静态问答下的记忆压缩评测。" in gap.existing_coverage
-    assert "一般问答准确率" in gap.existing_coverage, "原有覆盖不能被丢弃"
-    assert gap.status == "auditing", "收窄后的 claim 必须重新经过审计"
+    assert gap.status == "superseded", "收窄后父版本必须退役，不能作为并列 Gap 出现"
+    assert gap.claimed_delta == "固定预算下的状态变化边界评测", "父版本原始 claim 不能被覆盖"
+    db.close()
+
+
+def test_narrowed_gap_surfaces_as_a_single_canonical_head(temp_db):
+    from app.agent.state import ResearchState
+    from app.agent.steps.narrow_gaps import narrow_audited_gaps
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, contract, gap = _seed_audited_gap(db)
+    state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=2)
+
+    child_id = narrow_audited_gaps(db, state, task.id)[0]
+
+    # The report must show exactly one row per canonical gap (its latest head),
+    # never the superseded v1 next to its v2.
+    heads = gap_repo.list_canonical_gap_heads(db, task.id, contract.id)
+    assert [h.id for h in heads] == [child_id]
     db.close()
 
 
