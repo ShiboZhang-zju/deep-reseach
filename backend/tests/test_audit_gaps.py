@@ -159,9 +159,16 @@ async def test_confirmed_audit_creates_comparison_and_survives(temp_db, monkeypa
 
     assert results[0].audit_result == "confirmed"
     assert state.surviving_gap_ids == [gap.id]
-    assert gap_repo.get_gap(db, gap.id).status == "surviving"
+    gap_row = gap_repo.get_gap(db, gap.id)
+    assert gap_row.status == "surviving"
     assert len(gap_repo.list_neighbor_comparisons(db, gap.id)) == 1
     assert gap_repo.list_gap_audits(db, gap.id)[0].recommended_action == "continue"
+    # P0-2: a confirmed gap must carry traceable nearest-prior-art provenance,
+    # not just a bare novelty_confidence float.
+    assert gap_row.nearest_prior_art_paper_id is not None
+    assert gap_row.nearest_prior_art_title == "Neighbor B"
+    assert gap_row.search_confidence == "high"
+    assert gap_row.residual_gap and "状态变化边界" in gap_row.residual_gap
     db.close()
 
 

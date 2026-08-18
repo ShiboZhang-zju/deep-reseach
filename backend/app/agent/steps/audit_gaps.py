@@ -618,6 +618,7 @@ async def audit_gap_candidate(
     action = decision.recommended_action
     if action == "continue" and decision.audit_result == "confirmed":
         gap.status = "surviving"
+        _record_nearest_prior_art(db, gap, decision)
     elif action == "reject" or decision.audit_result == "closed":
         gap.status = "rejected"
         action = "reject"
@@ -678,6 +679,54 @@ def _format_neighbors(neighbors: list[Paper]) -> str:
         f"- Paper ID: {paper.id}\n  Title: {paper.title}\n  Abstract: {(paper.abstract or '')[:1200]}"
         for paper in neighbors
     )
+
+
+def _search_confidence(comparisons) -> str:
+    """How confident the adversarial search is that it found the real prior art.
+
+    Grounded on the highest judged semantic similarity among the neighbours: a
+    high-similarity neighbour means the audit compared against actual prior work
+    on the gap's own problem; a low-similarity set means retrieval likely missed
+    the mechanism-level work and the "novel" claim rests on thin comparison.
+    """
+    if not comparisons:
+        return "low"
+    max_sim = max((c.similarity_score or 0.0) for c in comparisons)
+    if max_sim >= 0.5:
+        return "high"
+    if max_sim >= _MIN_NEIGHBOR_SIMILARITY:
+        return "medium"
+    return "low"
+
+
+def _record_nearest_prior_art(db, gap: GapCandidate, decision) -> None:
+    """Materialise a surviving gap's nearest-prior-art provenance.
+
+    The closest prior work is the neighbour whose judged overlap with the gap is
+    highest (tie-broken by similarity). The residual gap is what that neighbour
+    does NOT cover, joined with the audit's own differentiation statement. This
+    turns "novelty=0.85" into a traceable claim the report can surface, pointing
+    at a concrete paper and at what is genuinely left uncovered.
+    """
+    comparisons = gap_repo.list_neighbor_comparisons(db, gap.id)
+    gap.search_confidence = _search_confidence(comparisons)
+    if not comparisons:
+        gap.nearest_prior_art_paper_id = None
+        gap.nearest_prior_art_title = None
+        gap.residual_gap = None
+        return
+    nearest = max(comparisons, key=lambda c: (c.overlap_ratio or 0.0,
+                                              c.similarity_score or 0.0))
+    paper = db.get(Paper, nearest.paper_id)
+    gap.nearest_prior_art_paper_id = nearest.paper_id
+    gap.nearest_prior_art_title = paper.title if paper else None
+    uncovered = json.loads(nearest.uncovered_claims_json or "[]")
+    parts = []
+    if decision.differentiation_summary:
+        parts.append(decision.differentiation_summary.strip())
+    if uncovered:
+        parts.append("Nearest prior work does not cover: " + "; ".join(uncovered))
+    gap.residual_gap = "\n".join(parts).strip() or None
 
 
 def _gap_evidence_ids(db, gap_id: str, relation_type: str) -> list[str]:

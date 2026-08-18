@@ -161,6 +161,14 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
             desc = (g.description or g.missing_capability or "")[:120].replace("\n", " ")
             vtag = f" v{g.version}" if (g.version or 1) > 1 else ""
             lines.append(f"- [{g.status}][{tier}]{vtag} {desc}")
+            if g.status == "surviving" and g.nearest_prior_art_title:
+                conf = {"high": "高", "medium": "中", "low": "低"}.get(
+                    g.search_confidence or "", "未知")
+                lines.append(f"  - 最近已知 prior art: {g.nearest_prior_art_title}")
+                if g.residual_gap:
+                    residual = (g.residual_gap or "")[:200].replace("\n", " ")
+                    lines.append(f"  - 剩余缺口: {residual}")
+                lines.append(f"  - 检索置信度: {conf}")
         lines.append("")
 
     # --- 5b. Graded candidate directions (O1) ---

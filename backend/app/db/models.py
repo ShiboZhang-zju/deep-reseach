@@ -830,6 +830,15 @@ class GapCandidate(Base):
     canonical_gap_id = Column(String, nullable=True)
     parent_gap_id = Column(String, nullable=True)
 
+    # Nearest-prior-art provenance (Phase 3E): a surviving gap's novelty is
+    # reported as "closest prior work + residual gap + search confidence"
+    # instead of a bare novelty_confidence, so the claim is traceable to a
+    # specific paper and the audit's retrieval quality is explicit.
+    nearest_prior_art_paper_id = Column(String, nullable=True)
+    nearest_prior_art_title = Column(String, nullable=True)
+    residual_gap = Column(Text, nullable=True)
+    search_confidence = Column(String, nullable=True)  # high / medium / low
+
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
