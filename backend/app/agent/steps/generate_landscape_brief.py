@@ -30,6 +30,7 @@ from app.db.models import (
     Paper,
     TaskPaper,
     GapCandidate,
+    GapPhenomenonPlan,
     InterventionCandidate,
     ResearchIdea,
 )
@@ -156,6 +157,13 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
         other = [g for g in gaps if g.status not in ("surviving", "rejected")]
         lines.append(f"候选 Gap 共 {len(gaps)} 个：存活 {len(surviving)}，被驳回 {len(rejected)}，"
                      f"待定/审计中 {len(other)}。\n")
+        # Preload phenomenon plans for surviving gaps in one query.
+        plans_by_gap = {}
+        if surviving:
+            for plan in db.query(GapPhenomenonPlan).filter(
+                GapPhenomenonPlan.gap_id.in_([g.id for g in surviving]),
+            ).all():
+                plans_by_gap[plan.gap_id] = plan
         for g in gaps[:12]:
             tier = "A(全文支撑)" if g.provenance_status == "complete" else "B(摘要级)"
             desc = (g.description or g.missing_capability or "")[:120].replace("\n", " ")
@@ -169,6 +177,12 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
                     residual = (g.residual_gap or "")[:200].replace("\n", " ")
                     lines.append(f"  - 剩余缺口: {residual}")
                 lines.append(f"  - 检索置信度: {conf}")
+            plan = plans_by_gap.get(g.id)
+            if plan:
+                lines.append(f"  - 待验证现象: {(plan.phenomenon or '')[:140].replace(chr(10), ' ')}")
+                lines.append(f"  - 证伪实验: {(plan.oracle_experiment or '')[:140].replace(chr(10), ' ')}")
+                if plan.kill_criterion:
+                    lines.append(f"  - 放弃判据: {(plan.kill_criterion or '')[:140].replace(chr(10), ' ')}")
         lines.append("")
 
     # --- 5b. Graded candidate directions (O1) ---

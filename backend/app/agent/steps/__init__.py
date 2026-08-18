@@ -21,6 +21,7 @@ from app.agent.steps.extract_evidence import extract_evidence_units
 from app.agent.steps.update_coverage import update_coverage_matrix
 from app.agent.steps.mine_gaps import mine_gap_candidates
 from app.agent.steps.audit_gaps import audit_gap_candidates
+from app.agent.steps.generate_phenomenon_plans import generate_phenomenon_plans
 from app.agent.steps.generate_interventions import generate_interventions
 from app.agent.steps.generate_minimal_experiments import generate_minimal_experiments
 from app.agent.steps.generate_landscape_brief import generate_landscape_brief
@@ -51,6 +52,7 @@ __all__ = [
     "update_coverage_matrix",
     "mine_gap_candidates",
     "audit_gap_candidates",
+    "generate_phenomenon_plans",
     "generate_interventions",
     "generate_minimal_experiments",
     "generate_landscape_brief",

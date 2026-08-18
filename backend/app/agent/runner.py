@@ -42,6 +42,7 @@ from app.agent.steps import (
     update_coverage_matrix,
     mine_gap_candidates,
     audit_gap_candidates,
+    generate_phenomenon_plans,
     generate_interventions,
     generate_minimal_experiments,
     generate_landscape_brief,
@@ -804,6 +805,29 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             await _terminate_more_research(db, state, task_id,
                                            "more_research_required", "no_surviving_gap_after_audit")
             return
+
+        # --- Phenomenon validation (Phase 3F) ---
+        # Pin down the falsifiable phenomenon behind each surviving gap before
+        # designing any intervention. Non-blocking: a failed or missing plan
+        # does not abort the run, it just leaves the direction without an
+        # explicit kill criterion.
+        task_repo.update_status(db, task_id, "validating_phenomenon")
+        db.commit()
+        emit_event(task_id, "status", {"status": "validating_phenomenon"})
+
+        async def _phenomenon_op(db):
+            return await generate_phenomenon_plans(db, state, llm, task_id)
+
+        phenomenon_input_version = hashlib.sha256(json.dumps({
+            "surviving_gap_ids": sorted(state.surviving_gap_ids),
+            "contract_id": state.contract_id,
+            "pipeline_version": state.pipeline_version,
+        }, sort_keys=True).encode()).hexdigest()
+        await phase_service.execute_phase(
+            db, task_id, "generate_phenomenon_plans", _phenomenon_op,
+            input_version=phenomenon_input_version
+        )
+        state = task_repo.get_state(db, task_id)
 
         # --- Interventions ---
         task_repo.update_status(db, task_id, "synthesizing_ideas")

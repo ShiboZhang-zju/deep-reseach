@@ -851,6 +851,37 @@ class GapCandidate(Base):
     )
 
 
+class GapPhenomenonPlan(Base):
+    """The phenomenon-validation plan for a surviving gap (Phase 3F).
+
+    Before any intervention or method is designed, the gap's underlying
+    empirical claim is pinned down: what phenomenon it rests on, the cheapest
+    experiment that could falsify it, and the kill criterion below which the
+    phenomenon is too small to be worth a method paper. This gates method
+    generation on "the problem is real and measurable", not "the story is
+    plausible".
+    """
+    __tablename__ = "gap_phenomenon_plans"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    contract_id = Column(String, ForeignKey("research_contracts.id"))
+    gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+
+    phenomenon = Column(Text, nullable=False)
+    critical_unknown = Column(Text)
+    oracle_experiment = Column(Text)
+    kill_criterion = Column(Text)
+    measurement = Column(Text)
+    pipeline_version = Column(Integer)
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_gpp_task", "task_id"),
+        Index("idx_gpp_gap", "gap_id"),
+    )
+
+
 class InterventionCandidate(Base):
     """A proposed mechanism that addresses one surviving gap."""
     __tablename__ = "intervention_candidates"
