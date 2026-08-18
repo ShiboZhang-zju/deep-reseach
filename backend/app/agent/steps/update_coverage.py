@@ -18,9 +18,10 @@ from app.agent.evidence_relations import (
 from app.agent.state import ResearchState
 from app.db.models import (
     EvidenceUnit, ResearchQuestion, CoverageRecord,
-    QuestionEvidenceLink, Paper,
+    QuestionEvidenceLink, Paper, TaskPaper,
 )
 from app.db.repositories import paper_repo
+from sqlalchemy import func
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
         background = 0
         supporting_papers: set[str] = set()
         contradicting_papers: set[str] = set()
+        supporting_evidence: list[EvidenceUnit] = []
+        direct_supporting = 0
 
         # (#12) LLM-based semantic matching: one batched call (or a few) per
         # question decides which evidence items are relevant and how.
@@ -105,6 +108,9 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
                 background += 1
             elif relation_type in SUPPORTING_RELATIONS:
                 supporting += 1
+                supporting_evidence.append(eu)
+                if relation_type == "supports":
+                    direct_supporting += 1
                 if eu.paper_id:
                     supporting_papers.add(eu.paper_id)
             elif relation_type in CONTRADICTING_RELATIONS:
@@ -167,6 +173,18 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
         cr.direct_neighbor_count = 0
         cr.unresolved_aspects_json = json.dumps([], ensure_ascii=False)
         cr.round_number = round_number
+
+        # P1-1: Evidence Quality (mechanical) + Search Saturation (per-RQ).
+        evidence_quality, fulltext_ratio, directness = _compute_evidence_quality(
+            supporting_evidence, direct_supporting, distinct_supporting)
+        sat_state, marg_papers, marg_evidence = _compute_search_saturation(
+            db, question, supporting_papers, round_number)
+        cr.evidence_quality = evidence_quality
+        cr.fulltext_ratio = fulltext_ratio
+        cr.directness = directness
+        cr.search_saturation = sat_state
+        cr.last_round_marginal_papers = marg_papers
+        cr.last_round_marginal_evidence = marg_evidence
 
         # Calculate delta
         prev_score = prev_coverage.get(question.id, 0.0)
@@ -306,3 +324,89 @@ def _determine_relation(evidence: EvidenceUnit, question: ResearchQuestion) -> s
     if evidence.evidence_type in ["future_work", "comparison"]:
         return "background"
     return "supports"
+
+
+def _compute_evidence_quality(supporting_evidence, direct_supporting, distinct_supporting):
+    """Mechanical Evidence Quality (P1-1): fulltext ratio + directness + breadth
+    + source confidence. Pure code — no LLM."""
+    if not supporting_evidence:
+        return 0.0, 0.0, 0.0
+    fulltext_ratio = sum(1 for e in supporting_evidence
+                         if e.verification_status in {"verified", "upgraded"}) / len(supporting_evidence)
+    directness = direct_supporting / len(supporting_evidence)
+    paper_breadth = min(1.0, distinct_supporting / 3.0)
+    source_quality = sum(e.extraction_confidence or 0.0 for e in supporting_evidence) / len(supporting_evidence)
+    quality = 0.4 * fulltext_ratio + 0.25 * directness + 0.20 * paper_breadth + 0.15 * source_quality
+    return round(quality, 2), round(fulltext_ratio, 2), round(directness, 2)
+
+
+def _compute_search_saturation(db, question, supporting_paper_ids, round_number):
+    """Three-state Search Saturation (P1-1), strictly per-RQ.
+
+    States: INSUFFICIENT_OBSERVATION / STILL_GAINING / SATURATED.
+    Gain rate is cumulative-relative: marginal / cumulative-so-far, NOT
+    marginal / previous-round-marginal. Evidence counts DISTINCT evidence-bearing
+    papers so one paper producing many EvidenceUnits cannot fake "still growing".
+    SATURATED needs absolute-low + decaying gain + stable RQ top-K, jointly.
+    """
+    from app.config import settings
+
+    if not supporting_paper_ids:
+        return "INSUFFICIENT_OBSERVATION", 0, 0
+
+    marginal_papers = db.query(TaskPaper).filter(
+        TaskPaper.task_id == question.task_id,
+        TaskPaper.paper_id.in_(supporting_paper_ids),
+        TaskPaper.priority.in_(["high", "medium"]),
+        TaskPaper.discovered_round == round_number,
+    ).count()
+
+    cumulative_papers = db.query(TaskPaper).filter(
+        TaskPaper.task_id == question.task_id,
+        TaskPaper.paper_id.in_(supporting_paper_ids),
+        TaskPaper.priority.in_(["high", "medium"]),
+        TaskPaper.discovered_round <= round_number,
+    ).count()
+
+    marginal_evidence = db.query(func.count(func.distinct(EvidenceUnit.paper_id))).filter(
+        EvidenceUnit.task_id == question.task_id,
+        EvidenceUnit.paper_id.in_(supporting_paper_ids),
+        EvidenceUnit.discovered_round == round_number,
+    ).scalar() or 0
+
+    cumulative_evidence = db.query(func.count(func.distinct(EvidenceUnit.paper_id))).filter(
+        EvidenceUnit.task_id == question.task_id,
+        EvidenceUnit.paper_id.in_(supporting_paper_ids),
+        EvidenceUnit.discovered_round <= round_number,
+    ).scalar() or 0
+
+    prev_cum_papers = cumulative_papers - marginal_papers
+    prev_cum_evidence = cumulative_evidence - marginal_evidence
+    paper_gain_rate = marginal_papers / max(1, prev_cum_papers)
+    evidence_gain_rate = marginal_evidence / max(1, prev_cum_evidence)
+
+    if round_number < settings.saturation_consecutive_rounds:
+        return "INSUFFICIENT_OBSERVATION", marginal_papers, marginal_evidence
+
+    # RQ top-K recall stability (adjacent rounds): does the top-K set stop changing?
+    def _topk(r):
+        rows = db.query(TaskPaper.paper_id).filter(
+            TaskPaper.task_id == question.task_id,
+            TaskPaper.paper_id.in_(supporting_paper_ids),
+            TaskPaper.priority.in_(["high", "medium"]),
+            TaskPaper.discovered_round <= r,
+        ).order_by(TaskPaper.final_score.desc()).limit(5).all()
+        return {p for (p,) in rows}
+
+    topk_cur = _topk(round_number)
+    topk_prev = _topk(round_number - 1)
+    recall_stability = (len(topk_cur & topk_prev) / 5.0) if topk_prev else 0.0
+
+    if (marginal_papers < settings.saturation_min_marginal_papers
+            and marginal_evidence < settings.saturation_min_marginal_evidence
+            and paper_gain_rate < settings.saturation_gain_rate_threshold
+            and evidence_gain_rate < settings.saturation_gain_rate_threshold
+            and recall_stability >= settings.saturation_recall_stability):
+        return "SATURATED", marginal_papers, marginal_evidence
+
+    return "STILL_GAINING", marginal_papers, marginal_evidence

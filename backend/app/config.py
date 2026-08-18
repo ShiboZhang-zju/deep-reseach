@@ -270,6 +270,23 @@ class Settings(BaseSettings):
     gap_admission_min_query_families_constrained: int = 1
     gap_admission_min_gap_papers_constrained: int = 2
 
+    # P1-1: Search Saturation (per-RQ, three-state). Configurable heuristics —
+    # defaults are STARTING POINTS, not scientific ground truth; calibrate on
+    # historical end-to-end tasks. States:
+    #   INSUFFICIENT_OBSERVATION / STILL_GAINING / SATURATED
+    saturation_min_marginal_papers: int = 2      # high-value papers added this round
+    saturation_min_marginal_evidence: int = 3    # distinct evidence-bearing papers added this round
+    saturation_consecutive_rounds: int = 2       # rounds of observation before SATURATED is allowed
+    saturation_gain_rate_threshold: float = 1.0  # cumulative-relative gain < this -> decaying
+    saturation_recall_stability: float = 0.6     # RQ top-K recall stability for the SATURATED arm
+
+    # P1-1: Nearest-prior-art stability + search confidence (four-state).
+    npa_stability_high: float = 0.6
+    npa_stability_medium: float = 0.4
+    family_coverage_high: float = 0.8
+    family_coverage_medium: float = 0.6
+    family_stability_floor: float = 0.3         # per-family floor -> flag that family, not the whole gap
+
     @property
     def effective_openalex_rate_per_min(self) -> int:
         """OpenAlex rate: high when an email/key is present (polite pool)."""

@@ -38,6 +38,126 @@ _HIGH_NOVELTY = 0.8
 GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v4"
 
 
+# --- Canonical atomic claims (Phase 3H) ---
+# A gap's claimed delta is decomposed into atomic positive capability/delta
+# statements BEFORE the NPA audit, so each neighbor is judged per-claim and the
+# residual gap is a set subtraction (claims - union(FULL-covered claims)), never
+# a natural-language string intersection. Claim verdict handles UNCERTAIN first.
+
+class AtomicClaimSchema(BaseModel):
+    claim_text: str = Field(min_length=5)
+
+
+class AtomicClaimList(BaseModel):
+    claims: list[AtomicClaimSchema] = Field(default_factory=list, min_length=1)
+
+
+class ClaimCoverageSchema(BaseModel):
+    claim_index: int = Field(ge=0)
+    coverage: str = Field(description="One of: FULL, PARTIAL, NONE, UNCERTAIN")
+    rationale: str = ""
+
+
+_ATOMIC_CLAIM_SYSTEM = """You decompose a research gap's claimed delta into canonical atomic claims.
+
+Each atomic claim must be a POSITIVE capability/delta statement — something a prior-art paper
+could independently be judged to cover or not cover. It must NOT be a literature-gap conclusion
+like "existing work lacks X" or "no work does Y".
+
+Bad: "existing work lacks dense hidden tests"
+Good: "dense hidden tests distinguish accidental from robust correctness"
+
+Produce 3-5 atomic claims that together capture the gap's claimed delta. Each claim is atomic
+(one testable capability), self-contained, and in English."""
+
+_ATOMIC_CLAIM_USER = """Gap claimed delta: {claimed_delta}
+Missing capability: {missing_capability}
+
+Produce the atomic claims."""
+
+
+async def _ensure_atomic_claims(db, llm, gap: GapCandidate, task_id: str) -> list:
+    """Idempotently decompose a gap's claimed delta into atomic claims.
+
+    Called when the gap enters the NPA audit (not after surviving). Returns the
+    existing claims on a re-audit; a decomposition failure is non-fatal and
+    leaves the old LLM-decision verdict path intact.
+    """
+    claims = gap_repo.list_atomic_claims(db, gap.id)
+    if claims:
+        return claims
+    if not (gap.claimed_delta or "").strip():
+        return []
+    try:
+        result = await llm.chat_json([
+            {"role": "system", "content": _ATOMIC_CLAIM_SYSTEM},
+            {"role": "user", "content": _ATOMIC_CLAIM_USER.format(
+                claimed_delta=gap.claimed_delta or "",
+                missing_capability=gap.missing_capability or "",
+            )},
+        ], AtomicClaimList)
+        result_claims = list(result.claims)
+    except Exception as exc:
+        logger.warning("Gap %s: atomic claim decomposition failed (%s); non-fatal",
+                       gap.id[:8], exc)
+        return []
+    for idx, claim in enumerate(result_claims):
+        gap_repo.create_atomic_claim(db, task_id, gap.id, idx, claim.claim_text)
+    db.flush()
+    return gap_repo.list_atomic_claims(db, gap.id)
+
+
+def _format_atomic_claims(claims) -> str:
+    if not claims:
+        return "(no atomic claims; judge against the claimed delta directly)"
+    return "\n".join(f"- claim[{c.claim_index}]: {c.claim_text}" for c in claims)
+
+
+def _derive_verdict_from_claims(db, gap: GapCandidate) -> tuple[str, str, list[str]] | None:
+    """Derive (audit_result, recommended_action, residual_claim_ids) from claim
+    coverage. Returns None when atomic claims are absent (fall back to the LLM's
+    decision).
+
+    UNCERTAIN is handled first: a claim with no effective NPA judgment, or one
+    judged UNCERTAIN, forces more_search rather than a false confirmed. NONE is
+    only "every effective NPA explicitly judged it uncovered". residual only
+    subtracts FULL; PARTIAL stays partially-addressed (drives narrowing).
+    """
+    claims = gap_repo.list_atomic_claims(db, gap.id)
+    if not claims:
+        return None
+    coverages = gap_repo.list_neighbor_claim_coverage(db, gap.id)
+    by_claim = defaultdict(list)
+    for cov in coverages:
+        by_claim[cov.claim_id].append(cov.coverage)
+
+    full: list[str] = []
+    partial: list[str] = []
+    none: list[str] = []
+    uncertain: list[str] = []
+    for claim in claims:
+        covs = by_claim.get(claim.id, [])
+        if not covs:
+            uncertain.append(claim.id)          # no judgment -> insufficient evidence
+        elif any(c == "FULL" for c in covs):
+            full.append(claim.id)
+        elif any(c == "PARTIAL" for c in covs):
+            partial.append(claim.id)
+        elif any(c == "UNCERTAIN" for c in covs):
+            uncertain.append(claim.id)
+        else:
+            none.append(claim.id)               # every NPA explicitly judged NONE
+
+    residual_ids = none + partial               # claims not FULL-covered
+    if uncertain:
+        return ("uncertain", "more_search", residual_ids)
+    if not none and not partial:
+        return ("closed", "reject", residual_ids)
+    if none and not partial:
+        return ("confirmed", "continue", residual_ids)
+    return ("partially_closed", "narrow", residual_ids)
+
+
 class AuditDecisionInvalid(ValueError):
     """The model returned an audit decision that violates the audit contract.
 
@@ -74,7 +194,14 @@ recommended_action must be exactly one of these four values, and nothing else:
 For each neighbor, compare only the supplied gap claims and paper content. Do not invent papers or evidence IDs.
 evidence_for_gap_ids and evidence_against_gap_ids may only contain IDs copied verbatim
 from the gap's supporting/contradicting evidence lists; neighbor paper IDs are not
-evidence IDs and must never appear there. Copy every ID character by character."""
+evidence IDs and must never appear there. Copy every ID character by character.
+
+For each neighbor, also output claim_coverage: for EACH atomic claim (identified by its
+claim_index), judge whether that neighbor covers it — FULL (covers the capability
+completely), PARTIAL (covers part of it), NONE (clearly does not cover it), or UNCERTAIN
+(cannot tell from the supplied content). Give a short rationale. Do not skip any claim.
+A claim that no effective neighbor judges is treated as insufficient evidence, NOT as
+uncovered — return UNCERTAIN for it rather than NONE when you genuinely cannot tell."""
 
 _AUDIT_USER = """Candidate gap:
 - ID: {gap_id}
@@ -88,6 +215,9 @@ _AUDIT_USER = """Candidate gap:
 
 Supporting evidence IDs: {supporting_evidence_ids}
 Contradicting evidence IDs: {contradicting_evidence_ids}
+
+Atomic claims (judge each neighbor's claim_coverage against these indices):
+{atomic_claims}
 
 Neighbor papers:
 {neighbors}
@@ -105,6 +235,8 @@ class NeighborAuditSchema(BaseModel):
     uncovered_claims: list[str] = Field(default_factory=list)
     overlap_ratio: float = Field(ge=0, le=1)
     overlap_risk: float = Field(ge=0, le=1)
+    why_not_closed: str = ""
+    claim_coverage: list[ClaimCoverageSchema] = Field(default_factory=list)
 
 
 class GapAuditDecisionSchema(BaseModel):
@@ -449,6 +581,7 @@ async def audit_gap_candidate(
         raise ValueError("Gap does not belong to task")
 
     gap.status = "auditing"
+    atomic_claims = await _ensure_atomic_claims(db, llm, gap, task_id)
     audit_round = state.current_round + 1
     query_specs = await generate_english_adversarial_queries(llm, gap)
     queries = [spec.query_text for spec in query_specs]
@@ -523,6 +656,7 @@ async def audit_gap_candidate(
             falsification_condition=gap.falsification_condition or "(not specified)",
             supporting_evidence_ids=_gap_evidence_ids(db, gap.id, "suggests"),
             contradicting_evidence_ids=_gap_evidence_ids(db, gap.id, "contradicts"),
+            atomic_claims=_format_atomic_claims(atomic_claims),
             neighbors=_format_neighbors(neighbors),
         )},
     ], GapAuditDecisionSchema)
@@ -601,7 +735,8 @@ async def audit_gap_candidate(
                        "similarity %.2f below %.2f)", gap.id[:8], max_sim,
                        _MIN_NEIGHBOR_SIMILARITY)
     for comparison in decision.comparisons:
-        gap_repo.create_neighbor_comparison(            db,
+        gap_repo.create_neighbor_comparison(
+            db,
             gap_id=gap.id,
             paper_id=comparison.paper_id,
             task_id=task_id,
@@ -613,7 +748,31 @@ async def audit_gap_candidate(
             uncovered_claims=comparison.uncovered_claims,
             overlap_ratio=comparison.overlap_ratio,
             overlap_risk=comparison.overlap_risk,
+            why_not_closed=comparison.why_not_closed or None,
         )
+        # P1-1: record per-claim coverage (FULL/PARTIAL/NONE/UNCERTAIN).
+        for cov in comparison.claim_coverage:
+            if 0 <= cov.claim_index < len(atomic_claims):
+                gap_repo.create_neighbor_claim_coverage(
+                    db, task_id=task_id, gap_id=gap.id,
+                    neighbor_paper_id=comparison.paper_id,
+                    claim_id=atomic_claims[cov.claim_index].id,
+                    coverage=cov.coverage.upper(), rationale=cov.rationale,
+                )
+
+    # P1-1: derive the verdict from claim-level coverage when atomic claims are
+    # present — grounding confirmed/narrow/closed in per-claim judgments that
+    # handle UNCERTAIN first, instead of the LLM's free-form audit_result.
+    claim_verdict = _derive_verdict_from_claims(db, gap)
+    if claim_verdict is not None:
+        derived_result, derived_action, residual_ids = claim_verdict
+        decision.audit_result = derived_result
+        decision.recommended_action = derived_action
+        gap.residual_claim_ids_json = json.dumps(residual_ids)
+        if residual_ids:
+            id_set = set(residual_ids)
+            gap.residual_gap = " ".join(
+                c.claim_text for c in atomic_claims if c.id in id_set)
 
     action = decision.recommended_action
     if action == "continue" and decision.audit_result == "confirmed":
@@ -681,52 +840,117 @@ def _format_neighbors(neighbors: list[Paper]) -> str:
     )
 
 
-def _search_confidence(comparisons) -> str:
-    """How confident the adversarial search is that it found the real prior art.
+def _median(values):
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
 
-    Grounded on the highest judged semantic similarity among the neighbours: a
-    high-similarity neighbour means the audit compared against actual prior work
-    on the gap's own problem; a low-similarity set means retrieval likely missed
-    the mechanism-level work and the "novel" claim rests on thin comparison.
+
+def _compute_search_confidence(db, gap) -> tuple[float | None, float | None, str]:
+    """Four-state search confidence (P1-1), all mechanical.
+
+    States: INSUFFICIENT_OBSERVATION / high / medium / low.
+    Driven by (a) query-family coverage, (b) MEDIAN family-internal stability
+    (same family, different query variants -> Top-K overlap), and (c) cross-round
+    global Top-K stability. The first audit round has no cross-round data and
+    returns INSUFFICIENT_OBSERVATION, never low. Thresholds come from settings.
     """
-    if not comparisons:
-        return "low"
-    max_sim = max((c.similarity_score or 0.0) for c in comparisons)
-    if max_sim >= 0.5:
-        return "high"
-    if max_sim >= _MIN_NEIGHBOR_SIMILARITY:
-        return "medium"
-    return "low"
+    from app.config import settings
+    records = db.query(SearchQueryRecord).filter(
+        SearchQueryRecord.target_gap_id == gap.id,
+    ).all()
+    families = sorted({r.query_family for r in records if r.query_family})
+    family_coverage = min(1.0, len(families) / 5.0)
+
+    def _query_topk(query_id, k=5):
+        rows = db.query(SearchQueryPaper.paper_id).filter(
+            SearchQueryPaper.query_id == query_id,
+        ).order_by(SearchQueryPaper.rank).limit(k).all()
+        return {p for (p,) in rows}
+
+    queries_by_family = defaultdict(list)
+    for r in records:
+        if r.query_family:
+            queries_by_family[r.query_family].append(r.id)
+
+    family_stabilities = []
+    for family in families:
+        topks = [t for t in (_query_topk(qid) for qid in queries_by_family[family]) if t]
+        if len(topks) >= 2:
+            jacs = []
+            for i in range(len(topks)):
+                for j in range(i + 1, len(topks)):
+                    a, b = topks[i], topks[j]
+                    jacs.append(len(a & b) / max(1, len(a | b)))
+            family_stabilities.append(_median(jacs))
+
+    median_family = _median(family_stabilities) if family_stabilities else None
+
+    comparisons = gap_repo.list_neighbor_comparisons(db, gap.id)
+    current_topk = {c.paper_id for c in comparisons[:5]}
+    prev_topk = set()
+    audits = db.query(GapAudit).filter(
+        GapAudit.gap_id == gap.id,
+        GapAudit.search_admission_status == "PASS",
+    ).order_by(GapAudit.created_at.desc()).limit(2).all()
+    if len(audits) >= 2:
+        prev_topk = set(json.loads(audits[1].neighbor_paper_ids_json or "[]")[:5])
+    cross_round = (len(current_topk & prev_topk) / 5.0) if (prev_topk and current_topk) else None
+
+    if cross_round is None:
+        confidence = "INSUFFICIENT_OBSERVATION"
+    elif (cross_round >= settings.npa_stability_high
+            and (median_family is None or median_family >= settings.npa_stability_high)
+            and family_coverage >= settings.family_coverage_high):
+        confidence = "high"
+    elif (cross_round >= settings.npa_stability_medium
+            and family_coverage >= settings.family_coverage_medium):
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return family_coverage, median_family, confidence
 
 
 def _record_nearest_prior_art(db, gap: GapCandidate, decision) -> None:
-    """Materialise a surviving gap's nearest-prior-art provenance.
+    """Materialise a surviving gap's nearest-prior-art provenance + P1-1 NPA
+    stability and four-state search confidence.
 
-    The closest prior work is the neighbour whose judged overlap with the gap is
-    highest (tie-broken by similarity). The residual gap is what that neighbour
-    does NOT cover, joined with the audit's own differentiation statement. This
-    turns "novelty=0.85" into a traceable claim the report can surface, pointing
-    at a concrete paper and at what is genuinely left uncovered.
+    The closest prior work is the neighbour with the highest judged overlap
+    (tie-broken by similarity). The residual gap is prefered from the claim-level
+    residual already computed (set subtraction); it falls back to the audit's
+    differentiation summary only when atomic claims are absent.
     """
     comparisons = gap_repo.list_neighbor_comparisons(db, gap.id)
-    gap.search_confidence = _search_confidence(comparisons)
+    family_coverage, median_family, confidence = _compute_search_confidence(db, gap)
+    gap.family_coverage = family_coverage
+    gap.npa_stability = median_family
+    gap.search_confidence = confidence
     if not comparisons:
         gap.nearest_prior_art_paper_id = None
         gap.nearest_prior_art_title = None
-        gap.residual_gap = None
+        if not gap.residual_gap:
+            gap.residual_gap = None
         return
     nearest = max(comparisons, key=lambda c: (c.overlap_ratio or 0.0,
                                               c.similarity_score or 0.0))
     paper = db.get(Paper, nearest.paper_id)
     gap.nearest_prior_art_paper_id = nearest.paper_id
     gap.nearest_prior_art_title = paper.title if paper else None
-    uncovered = json.loads(nearest.uncovered_claims_json or "[]")
-    parts = []
-    if decision.differentiation_summary:
-        parts.append(decision.differentiation_summary.strip())
-    if uncovered:
-        parts.append("Nearest prior work does not cover: " + "; ".join(uncovered))
-    gap.residual_gap = "\n".join(parts).strip() or None
+    # Prefer the claim-level residual (set subtraction); fall back to the audit's
+    # differentiation summary only when atomic claims are absent.
+    if not gap.residual_gap:
+        uncovered = json.loads(nearest.uncovered_claims_json or "[]")
+        parts = []
+        if decision.differentiation_summary:
+            parts.append(decision.differentiation_summary.strip())
+        if uncovered:
+            parts.append("Nearest prior work does not cover: " + "; ".join(uncovered))
+        gap.residual_gap = "\n".join(parts).strip() or None
 
 
 def _gap_evidence_ids(db, gap_id: str, relation_type: str) -> list[str]:

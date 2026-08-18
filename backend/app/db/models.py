@@ -559,6 +559,10 @@ class EvidenceUnit(Base):
     verification_status = Column(Text, default="unverified")
     # unverified / verified / conflicted / rejected / abstract_only / upgraded
 
+    # P1-1: round in which this evidence unit was extracted (per-round
+    # marginal-evidence counting in Search Saturation). NULL for pre-P1-1 rows.
+    discovered_round = Column(Integer, nullable=True)
+
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -646,6 +650,14 @@ class CoverageRecord(Base):
     direct_neighbor_count = Column(Integer, default=0)
     unresolved_aspects_json = Column(Text, default="[]")
     unavailable_reason = Column(Text)
+
+    # P1-1: Evidence quality + search saturation (mechanical, per-RQ, per-round).
+    evidence_quality = Column(Float, nullable=True)     # 0..1 aggregated quality
+    fulltext_ratio = Column(Float, nullable=True)       # fraction of fulltext-locatable evidence
+    directness = Column(Float, nullable=True)           # fraction of direct "supports" links
+    search_saturation = Column(Text, nullable=True)     # INSUFFICIENT_OBSERVATION / STILL_GAINING / SATURATED
+    last_round_marginal_papers = Column(Integer, nullable=True)
+    last_round_marginal_evidence = Column(Integer, nullable=True)
 
     # Phase 2.1: Round tracking for snapshots
     round_number = Column(Integer, nullable=False, default=0)
@@ -837,7 +849,12 @@ class GapCandidate(Base):
     nearest_prior_art_paper_id = Column(String, nullable=True)
     nearest_prior_art_title = Column(String, nullable=True)
     residual_gap = Column(Text, nullable=True)
-    search_confidence = Column(String, nullable=True)  # high / medium / low
+    search_confidence = Column(String, nullable=True)  # INSUFFICIENT_OBSERVATION / high / medium / low
+
+    # P1-1: Novelty search coverage + nearest-prior-art stability (mechanical).
+    npa_stability = Column(Float, nullable=True)          # cross-round Top-K stability 0..1
+    family_coverage = Column(Float, nullable=True)        # query-family coverage 0..1
+    residual_claim_ids_json = Column(Text, default="[]")  # atomic claim ids left uncovered
 
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
@@ -1062,10 +1079,68 @@ class NeighborComparison(Base):
     overlap_ratio = Column(Float, default=0.0)
     # 0-1, ratio of gap claims covered by this paper
 
+    # P1-1: one-line statement of why this neighbor, despite its overlap, does
+    # NOT close the gap (the residual difference, grounded in claim coverage).
+    why_not_closed = Column(Text)
+
     created_at = Column(DateTime, default=_utcnow)
 
     __table_args__ = (
         Index("idx_nc_gap", "gap_id"),
         Index("idx_nc_paper", "paper_id"),
         Index("idx_nc_unique", "gap_id", "paper_id", unique=True),
+    )
+
+
+class GapAtomicClaim(Base):
+    """A canonical atomic claim derived from a gap's claimed delta (Phase 3H).
+
+    Each claim is a positive capability/delta statement (e.g. "dense hidden
+    tests distinguish accidental from robust correctness"), NOT a literature-gap
+    conclusion like "existing work lacks X". A prior-art paper is judged against
+    these atomic claims, and the residual gap is the set of claims no neighbor
+    fully covers — computed as a set subtraction, never a string intersection.
+    """
+    __tablename__ = "gap_atomic_claims"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+
+    claim_index = Column(Integer, nullable=False)
+    claim_text = Column(Text, nullable=False)
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_gac_gap", "gap_id"),
+        Index("idx_gac_task_gap", "task_id", "gap_id"),
+    )
+
+
+class NeighborClaimCoverage(Base):
+    """A neighbor paper's coverage judgment for one atomic claim (Phase 3H).
+
+    coverage ∈ {FULL, PARTIAL, NONE, UNCERTAIN}. FULL removes the claim from the
+    residual set; PARTIAL marks it partially addressed (narrowing); NONE means an
+    effective NPA explicitly judged it uncovered; UNCERTAIN means the judgment
+    is missing/insufficient (never aggregated into NONE).
+    """
+    __tablename__ = "neighbor_claim_coverage"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+    gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+    neighbor_paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
+    claim_id = Column(String, ForeignKey("gap_atomic_claims.id"), nullable=False)
+
+    coverage = Column(Text, nullable=False)  # FULL / PARTIAL / NONE / UNCERTAIN
+    rationale = Column(Text)
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_ncc_gap", "gap_id"),
+        Index("idx_ncc_claim", "claim_id"),
+        Index("idx_ncc_unique", "gap_id", "neighbor_paper_id", "claim_id", unique=True),
     )

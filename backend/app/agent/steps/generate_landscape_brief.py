@@ -88,16 +88,20 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
     if not questions:
         lines.append("(尚未分解出研究问题)\n")
     else:
-        lines.append("| 研究问题 | 重要性 | 状态 | 最新覆盖度 |")
-        lines.append("|---|---|---|---|")
+        lines.append("| 研究问题 | 重要性 | 状态 | 覆盖度 | 证据质量 | 检索饱和 |")
+        lines.append("|---|---|---|---|---|---|")
+        sat_map = {"INSUFFICIENT_OBSERVATION": "观察不足",
+                   "STILL_GAINING": "仍在增长", "SATURATED": "已饱和"}
         for q in questions:
             cov = latest_cov.get(q.id)
             cov_txt = f"{cov.coverage_score:.2f}" if cov and cov.coverage_score is not None else "—"
             if cov and not cov.coverage_score and cov.unavailable_reason:
                 cov_txt = f"不可得({cov.unavailable_reason[:20]})"
+            eq_txt = f"{cov.evidence_quality:.2f}" if cov and cov.evidence_quality is not None else "—"
+            sat_txt = sat_map.get(cov.search_saturation, "—") if cov else "—"
             imp = f"{q.importance:.2f}" if q.importance is not None else "—"
             qtext = (q.question or "")[:60].replace("|", "/")
-            lines.append(f"| {qtext} | {imp} | {q.status or '—'} | {cov_txt} |")
+            lines.append(f"| {qtext} | {imp} | {q.status or '—'} | {cov_txt} | {eq_txt} | {sat_txt} |")
         lines.append("")
 
     # --- 3. Paper role distribution ---
@@ -170,13 +174,19 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
             vtag = f" v{g.version}" if (g.version or 1) > 1 else ""
             lines.append(f"- [{g.status}][{tier}]{vtag} {desc}")
             if g.status == "surviving" and g.nearest_prior_art_title:
-                conf = {"high": "高", "medium": "中", "low": "低"}.get(
+                conf = {"INSUFFICIENT_OBSERVATION": "观察不足",
+                        "high": "高", "medium": "中", "low": "低"}.get(
                     g.search_confidence or "", "未知")
                 lines.append(f"  - 最近已知 prior art: {g.nearest_prior_art_title}")
                 if g.residual_gap:
                     residual = (g.residual_gap or "")[:200].replace("\n", " ")
                     lines.append(f"  - 剩余缺口: {residual}")
-                lines.append(f"  - 检索置信度: {conf}")
+                stability = ""
+                if g.npa_stability is not None:
+                    stability += f"，近邻稳定性 {g.npa_stability:.2f}"
+                if g.family_coverage is not None:
+                    stability += f"，query family 覆盖 {g.family_coverage:.0%}"
+                lines.append(f"  - 检索置信度: {conf}{stability}")
             plan = plans_by_gap.get(g.id)
             if plan:
                 lines.append(f"  - 待验证现象: {(plan.phenomenon or '')[:140].replace(chr(10), ' ')}")

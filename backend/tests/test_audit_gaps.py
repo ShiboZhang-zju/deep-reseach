@@ -167,7 +167,9 @@ async def test_confirmed_audit_creates_comparison_and_survives(temp_db, monkeypa
     # not just a bare novelty_confidence float.
     assert gap_row.nearest_prior_art_paper_id is not None
     assert gap_row.nearest_prior_art_title == "Neighbor B"
-    assert gap_row.search_confidence == "high"
+    # First audit round has no cross-round stability -> INSUFFICIENT_OBSERVATION
+    # (never high, never low).
+    assert gap_row.search_confidence == "INSUFFICIENT_OBSERVATION"
     assert gap_row.residual_gap and "状态变化边界" in gap_row.residual_gap
     db.close()
 

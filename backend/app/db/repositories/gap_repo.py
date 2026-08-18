@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import (
     GapCandidate, GapEvidenceLink, GapAudit, NeighborComparison,
+    GapAtomicClaim, NeighborClaimCoverage,
     EvidenceUnit, ResearchContract,
 )
 
@@ -306,6 +307,7 @@ def create_neighbor_comparison(
     uncovered_claims: list[str] | None = None,
     overlap_ratio: float = 0.0,
     overlap_risk: float = 0.0,
+    why_not_closed: str | None = None,
 ) -> NeighborComparison:
     """Record how a gap compares to one neighbour paper.
 
@@ -337,6 +339,7 @@ def create_neighbor_comparison(
     comp.covered_claims_json = json.dumps(covered_claims or [])
     comp.uncovered_claims_json = json.dumps(uncovered_claims or [])
     comp.overlap_ratio = overlap_ratio
+    comp.why_not_closed = why_not_closed
     comp.overlap_risk = overlap_risk
     db.flush()
     return comp
@@ -346,3 +349,53 @@ def list_neighbor_comparisons(db: Session, gap_id: str) -> list[NeighborComparis
     return db.query(NeighborComparison).filter(
         NeighborComparison.gap_id == gap_id,
     ).order_by(NeighborComparison.similarity_score.desc()).all()
+
+
+# === GapAtomicClaim (Phase 3H: canonical atomic claims) ===
+
+def list_atomic_claims(db: Session, gap_id: str) -> list[GapAtomicClaim]:
+    return db.query(GapAtomicClaim).filter(
+        GapAtomicClaim.gap_id == gap_id,
+    ).order_by(GapAtomicClaim.claim_index).all()
+
+
+def create_atomic_claim(db: Session, task_id: str, gap_id: str,
+                        claim_index: int, claim_text: str) -> GapAtomicClaim:
+    claim = GapAtomicClaim(
+        task_id=task_id, gap_id=gap_id,
+        claim_index=claim_index, claim_text=claim_text,
+    )
+    db.add(claim)
+    db.flush()
+    return claim
+
+
+# === NeighborClaimCoverage (Phase 3H: per-claim coverage judgment) ===
+
+def create_neighbor_claim_coverage(
+    db: Session, task_id: str, gap_id: str, neighbor_paper_id: str,
+    claim_id: str, coverage: str, rationale: str | None = None,
+) -> NeighborClaimCoverage:
+    """Upsert a neighbor's coverage judgment for one atomic claim."""
+    existing = db.query(NeighborClaimCoverage).filter(
+        NeighborClaimCoverage.gap_id == gap_id,
+        NeighborClaimCoverage.neighbor_paper_id == neighbor_paper_id,
+        NeighborClaimCoverage.claim_id == claim_id,
+    ).first()
+    if existing:
+        existing.coverage = coverage
+        existing.rationale = rationale
+        return existing
+    row = NeighborClaimCoverage(
+        task_id=task_id, gap_id=gap_id, neighbor_paper_id=neighbor_paper_id,
+        claim_id=claim_id, coverage=coverage, rationale=rationale,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def list_neighbor_claim_coverage(db: Session, gap_id: str) -> list[NeighborClaimCoverage]:
+    return db.query(NeighborClaimCoverage).filter(
+        NeighborClaimCoverage.gap_id == gap_id,
+    ).all()
