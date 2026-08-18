@@ -81,8 +81,8 @@ cd backend && python -m pytest -q
 | 后端框架 | FastAPI (Python 3.11+) |
 | 数据库 | SQLite（WAL）+ Alembic 迁移 |
 | ORM | SQLAlchemy 2.0 |
-| LLM | 多 provider 可切换；当前部署为本地 Qwen3.5-397B-A17B（OpenAI 兼容端点，40960 上下文） |
-| 论文数据源 | Semantic Scholar + arXiv + OpenAlex + Crossref + Unpaywall + CORE（无 key 时走免费额度） |
+| LLM | 多 provider 可切换；主模型 Qwen3.5-397B-A17B + 备用 Qwen3.6-35B-A3B（FallbackLLMProvider 自动降级，OpenAI 兼容端点，40960 上下文） |
+| 论文数据源 | Semantic Scholar + arXiv + OpenAlex + Crossref + Unpaywall + CORE + IEEE（无 key 时走免费额度） |
 | 向量检索 | ChromaDB + 可插拔 Embedding 后端（当前用 DashScope `text-embedding-v4` / 1024 维，绕开本地 PyTorch） |
 | 前端 | Vite + React + TypeScript + Tailwind CSS |
 | Agent 架构 |轻量自研 Loop（不依赖 LangGraph） |
@@ -102,7 +102,7 @@ cd backend && python -m pytest -q
 | Gap 收窄次数上限 | 单 Gap 2 次 | |
 | O2 定向补检索：每原因上限 | 2 次 | |
 | O2 定向补检索：全局轮数上限 | 3 轮 | |
-| O7 相似度预过滤阈值 | 0.35 | |
+| O7 相似度预过滤阈值 | 0.45（无摘要论文 0.55） | 从 0.35 上调：实测 401 篇有 77% 落入 low 噪声 |
 | 评分批内校准最小批量 | 5 篇 | |
 | 实验方案输出格式 | Markdown + JSON 双格式 | |
 
@@ -123,8 +123,10 @@ cd backend && python -m pytest -q
 | 全部数据源失败 | 本轮重试一次 |
 | 重试后仍失败 | 任务标记为 `failed`，等待用户重新启动或修改配置 |
 | LLM 调用失败（可重试） | 重试 3 次（指数退避） |
+| LLM 主模型故障（transport/服务错误） | `FallbackLLMProvider` 自动切到备用模型（Qwen3.6-35B-A3B）；确定性错误（超预算/超上下文）不降级 |
 | LLM 返回非法 JSON | 追加一次纠正轮次；只回显 400 字符摘录，保证重试请求不大于首轮 |
 | LLM prompt 超出上下文 | 抛 `LLMContextOverflow`（与"服务故障"区分），由调用方缩小输入 |
+| 检索循环失败但已完成 ≥1 轮 | 降级为 `more_research_required` 并保留已完成轮次的检索/证据/覆盖度，照常产出 Landscape Brief（不再作废整轮成果） |
 | Gap 挖掘阶段失败 | 降级为 `more_research_required` 并照常产出 Landscape Brief，已完成的检索/证据/覆盖度全部保留、可续跑 |
 | 单个 Gap 的审计决策非法 | 只废弃该条决策，其余 Gap 的结论保留（失败粒度与输出粒度对齐） |
 
@@ -222,8 +224,7 @@ deep-research/
 │   │   │   ├── base.py              # LLMProvider 抽象基类
 │   │   │   ├── venus_provider.py    # Venus LLM Proxy（默认，兼容 OpenAI API）
 │   │   │   ├── openai_provider.py    # OpenAI 直连（备用）
-│   │   │   ├── deepseek_provider.py  # DeepSeek（预留）
-│   │   │   ├── claude_provider.py    # Claude（预留）
+│   │   │   ├── fallback_provider.py  # 主备模型自动降级（FallbackLLMProvider）
 │   │   │   └── factory.py           # Provider 工厂
 │   │   │
 │   │   ├── paper_sources/
@@ -232,7 +233,10 @@ deep-research/
 │   │   │   ├── semantic_scholar.py
 │   │   │   ├── arxiv.py
 │   │   │   ├── openalex.py
-│   │   │   └── crossref.py
+│   │   │   ├── crossref.py
+│   │   │   ├── unpaywall.py          # OA 全文链接（DOI → 免费 PDF）
+│   │   │   ├── core.py              # CORE 全文
+│   │   │   └── ieee.py              # IEEE Xplore（需 key，可留空跳过）
 │   │   │
 │   │   ├── db/
 │   │   │   ├── __init__.py
@@ -262,9 +266,9 @@ deep-research/
 │   │       ├── scoring_service.py   # 论文评分
 │   │       └── event_service.py     # SSE 事件推送
 │   │
-│   ├── tests/                       # 262 个测试（pytest -q）
+│   ├── tests/                       # 263 个测试（pytest -q）
 │   │
-│   └── alembic_migrations/          # 数据库迁移（Alembic，0001 → 0017）
+│   └── alembic_migrations/          # 数据库迁移（Alembic，0000 → 0019）
 │
 └── frontend/
     ├── package.json
@@ -527,7 +531,7 @@ CREATE UNIQUE INDEX idx_rounds ON research_rounds(task_id, round_number);
 ### 论文评分
 
 ```
-paper_score = 0.30 × relevance + 0.25 × authority + 0.15 × recency + 0.15 × novelty + 0.15 × idea_potential
+paper_score = 0.25 × relevance + 0.30 × authority + 0.15 × recency + 0.15 × novelty + 0.15 × idea_potential
 ```
 
 > **authority 调整**：缺失元数据（无引用+无年份）打 0.7 折；顶会/顶刊（ICML/NeurIPS/ICLR/CVPR/ACL 等）加 0.1（上限 1.0）。
@@ -559,9 +563,11 @@ idea_score = 0.20 × novelty + 0.20 × feasibility + 0.20 × significance + 0.20
 final_score = idea_score - 0.08 × risk
 ```
 
-> 另有验证惩罚：编造基线 -0.15/个（上限 -0.3），编造数据集 -0.05/个，指标-假设不匹配 -0.05/个，非新颖 -0.1。
+> 该 8 维打分与加权公式由 V1（`generate_ideas.py` 的 `_score_idea`）与 V2（`generate_minimal_experiments.py` 复用同一函数）共用。V2 链路产出的 Idea `decision` 统一为 `conditional_go`（分级由 `confidence_tier` A/B/C 表达），而非 V1 的 go/revise/reject。
+>
+> V1 链路另有验证惩罚：编造基线 -0.15/个（上限 -0.3），编造数据集 -0.05/个，指标-假设不匹配 -0.05/个，非新颖 -0.1。
 
-| 分数 | 决策 |
+| 分数 | 决策（V1 链路） |
 |------|------|
 | >= 0.70 | go |
 | 0.50 - 0.70 | revise |
@@ -601,7 +607,7 @@ final_score = idea_score - 0.08 × risk
 
 ## LLM Provider 架构
 
-Provider 通过 OpenAI 兼容协议对接，可切换。当前部署指向本地 Qwen3.5-397B-A17B。
+Provider 通过 OpenAI 兼容协议对接，可切换。当前部署为本地 Qwen3.5-397B-A17B（主）+ Qwen3.6-35B-A3B（备用），主模型 transport/服务错误时由 `FallbackLLMProvider` 自动降级到备用模型。
 
 ```python
 # 抽象基类（app/llm/base.py）
@@ -626,11 +632,18 @@ class VenusProvider(LLMProvider):
     #            chat_template_kwargs.enable_thinking
     ...
 
+# 主备降级（app/llm/fallback_provider.py）
+class FallbackLLMProvider(LLMProvider):
+    # 包装多个 provider，逐个尝试；仅 transport/服务错误（LLM call failed）时切换，
+    # LLMBudgetExceeded / LLMContextOverflow 等确定性错误直接 raise 不降级。
+    # 成功后同步 last_usage / total_tokens_used / call_count。
+    ...
+
 # 工厂模式
 class LLMFactory:
     @staticmethod
     def create(provider_name: str) -> LLMProvider:
-        # venus / openai / deepseek / qwen / claude
+        # venus（配置了 fallback 时返回 FallbackLLMProvider） / openai
         ...
 ```
 
@@ -659,11 +672,14 @@ class LLMFactory:
 ## 环境变量
 
 ```env
-# LLM Provider（OpenAI 兼容协议；provider 名沿用 venus，端点由下面三项决定）
+# LLM Provider（OpenAI 兼容协议；provider 名沿用 venus，端点由下面几项决定）
 LLM_PROVIDER=venus
 ENV_VENUS_OPENAPI_SECRET_ID=            # 走本地端点时可留空
 VENUS_LLM_PROXY_URL=http://<host>:8080/openapi
 VENUS_LLM_MODEL=Qwen3.5-397B-A17B-W8A8-P800-Functional-Agent
+# 备用模型：主模型 transport/服务错误时自动降级；model 留空则禁用降级
+FALLBACK_VENUS_LLM_PROXY_URL=http://<host2>:8080/openapi
+FALLBACK_VENUS_LLM_MODEL=Qwen3.6-35B-A3B-P800-test-image
 
 # 上下文预算（必须与实际模型一致，否则超长 prompt 只会得到笼统的 400）
 LLM_CONTEXT_TOKENS=40960
@@ -680,7 +696,9 @@ OPENAI_MODEL=gpt-4o
 SEMANTIC_SCHOLAR_API_KEY=
 # OpenAlex / Crossref：填邮箱即可进入 polite pool，限速更宽松（无需审批，即时生效）
 OPENALEX_EMAIL=your@email.com
+OPENALEX_API_KEY=
 CROSSREF_EMAIL=your@email.com
+IEEE_API_KEY=                            # 需 IEEE 订购，可留空跳过
 CORE_API_KEY=
 
 # Embedding 后端（可插拔，走 OpenAI 兼容 API 绕开 Windows PyTorch segfault）
@@ -707,7 +725,7 @@ ENABLE_RAG_INDEXING=false                # 关闭 RAG 索引后仍会抽取证�
 # 优化参数
 MAX_REMEDIATION_ATTEMPTS=2               # O2 每个失败原因的定向补检索上限
 MAX_REMEDIATION_ROUNDS_TOTAL=3           # O2 全局定向补检索轮数上限
-SEARCH_PREFILTER_MIN_SIMILARITY=0.35     # O7 入库前主题相似度过滤阈值（0 关闭）
+SEARCH_PREFILTER_MIN_SIMILARITY=0.45     # O7 入库前主题相似度过滤阈值（0 关闭）
 SCORE_CALIBRATION_MIN_BATCH=5            # 评分批内校准最小批量
 SCORE_CALIBRATION_STRENGTH=0.15          # 校准强度
 
@@ -847,7 +865,7 @@ async def run_task(task_id: str):
 - [x] **审计不再空转**：收窄后只重审被收窄的 Gap；`more_search` 无法被满足时关闭为不可判定（新增 `gap_audits.audited_claimed_delta`，迁移 0017）
 - [x] **证据供给对齐准入**：抽取的 chunk 预算按 section 轮转（conclusion 优先），修复 section 名硬编码为空串导致 section 提示从未生效的缺陷
 - [x] **关系语义统一**：新增 `agent/evidence_relations.py` 作为 supporting 语义与最低相关性的单一来源，覆盖度与挖掘共用
-- [x] **测试**：后端 262 个测试通过
+- [x] **测试**：后端 263 个测试通过
 
 ### 实测运行画像（RAG 主题，单卡资源约束）
 
