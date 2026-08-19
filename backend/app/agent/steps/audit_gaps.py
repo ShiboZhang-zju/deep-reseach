@@ -1,5 +1,6 @@
 """Step: Run a lightweight adversarial audit for evidence-backed gap candidates."""
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -279,6 +280,7 @@ class GapAuditResult:
 class AdversarialQuerySpec:
     family: str
     query_text: str
+    variant_index: int = 0
 
 @dataclass(frozen=True)
 class GapSearchAdmission:
@@ -310,35 +312,49 @@ def build_adversarial_queries(gap: GapCandidate) -> list[AdversarialQuerySpec]:
     return [spec for spec in specs if spec.query_text and not (spec.query_text.lower() in seen or seen.add(spec.query_text.lower()))]
 
 
-class QueryFamilySchema(BaseModel):
+class IntentWithVariantsSchema(BaseModel):
     family: str = Field(description="One of: exact_gap, synonym, mechanism, benchmark, method_neighbor")
-    queries: list[str] = Field(default_factory=list, min_length=1, max_length=3)
+    problem: str = Field(min_length=3)
+    mechanism: str = Field(min_length=3)
+    intervention: str = Field(min_length=3)
+    evaluation_setting: str = Field(min_length=3)
+    task_scope: str = Field(min_length=3)
+    variants: list[str] = Field(default_factory=list, min_length=2, max_length=3)
 
 
 class GapQueryGenList(BaseModel):
-    families: list[QueryFamilySchema] = Field(default_factory=list)
+    intents: list[IntentWithVariantsSchema] = Field(default_factory=list)
 
 
-_QUERY_GEN_SYSTEM = """You are generating English academic search queries for an adversarial gap audit.
-The gap description may be in Chinese or mixed language. Produce queries that would retrieve the
-most relevant PRIOR WORK that could already close this gap, focusing on systems- and
-mechanism-level work rather than surface application papers.
+_QUERY_GEN_SYSTEM = """You generate English academic search queries for an adversarial gap audit in TWO
+conceptual steps. The goal is to retrieve PRIOR WORK that could already close this gap, but the
+queries must be SEMANTICALLY STABLE so that a family-internal stability check is meaningful.
 
-Produce EXACTLY these 5 query families, each with 2-3 distinct English query variants:
-- exact_gap: the gap's own claimed delta / missing capability, stated in English.
-- synonym: the SAME concept rewritten with standard academic synonyms and broader/narrower
-  terminology (e.g. "accidental correctness" -> "test adequacy", "hidden test robustness",
-  "mutation testing", "specification coverage"). This family defends against lexical mismatch
-  — prior work that uses different terms for the same idea.
-- mechanism: queries anchored on the SAME failure mechanism, ignoring surface wording.
-- benchmark: queries for work sharing the SAME evaluation setting / benchmark / task family.
-- method_neighbor: queries for work using the SAME intervention or an adjacent method family.
+STEP 1 — fix a canonical search INTENT per family. For each family, first pin down these five
+structured fields (they are the invariant that every variant must preserve):
+- problem: the concrete problem being solved.
+- mechanism: the exact failure/working mechanism under investigation.
+- intervention: the exact method/technique being evaluated (or the target of evaluation).
+- evaluation_setting: the benchmark / task / evaluation protocol.
+- task_scope: the application scope (e.g. code generation, memory, QA).
+
+Produce EXACTLY these 5 families:
+- exact_gap: the gap's own claimed delta / missing capability.
+- synonym: the SAME intent rewritten with standard academic synonyms and broader/narrower
+  terminology (defends against lexical mismatch — prior work using different terms).
+- mechanism: anchored on the SAME failure mechanism.
+- benchmark: anchored on the SAME evaluation setting / benchmark / task family.
+- method_neighbor: anchored on the SAME intervention / method family.
+
+STEP 2 — generate 2-3 query variants PER family. Each variant must be a PARAPHRASE of that
+family's canonical intent: ONLY terminology and wording may change. The problem, mechanism,
+intervention, evaluation setting, and task scope MUST NOT drift — a "benchmark" family variant
+must not become an "efficiency analysis", and a "method_neighbor" family variant must not swap
+the intervention for a different method. Different variants differ only in phrasing/terminology.
 
 Rules:
 - Output English only.
-- Translate the gap's concepts into standard English technical vocabulary; do not invent new terms.
-- Each family's variants must genuinely differ (different phrasing / angle), not trivially reorder
-  the same words — they drive a family-internal stability check."""
+- Translate concepts into standard English technical vocabulary; do not invent new terms."""
 
 _QUERY_GEN_USER = """Candidate gap:
 - Setting: {target_setting}
@@ -347,14 +363,112 @@ _QUERY_GEN_USER = """Candidate gap:
 - Claimed delta: {claimed_delta}
 - Falsification condition: {falsification_condition}
 
-Produce 5 query families, each with 2-3 English query variants."""
+First fix each family's canonical intent (problem/mechanism/intervention/evaluation_setting/
+task_scope), then produce 2-3 paraphrase variants per family that preserve it exactly."""
 
 
-async def generate_english_adversarial_queries(llm, gap: GapCandidate) -> list[AdversarialQuerySpec]:
-    """Generate 5-family adversarial queries (with synonym/mechanism/benchmark/
-    method-neighbor expansion and 2-3 variants per family) to defend against
-    lexical mismatch. On failure, falls back to raw concatenation.
+_VARIANT_REGENERATE_SYSTEM = """You are rewriting ONE academic search query so it is a faithful paraphrase of a fixed
+canonical search intent. A previous variant drifted away from the intent (it changed the problem,
+mechanism, intervention, evaluation setting, or task scope). Produce a corrected query that ONLY
+changes terminology and wording — never the mechanism, method, benchmark, or objective."""
+
+_VARIANT_REGENERATE_USER = """Canonical intent:
+- Problem: {problem}
+- Mechanism: {mechanism}
+- Intervention: {intervention}
+- Evaluation setting: {evaluation_setting}
+- Task scope: {task_scope}
+
+Drifted variant to replace: {bad_variant}
+
+Return a corrected query that is a faithful paraphrase of the intent above."""
+
+
+class RegenerateVariantSchema(BaseModel):
+    variant: str = Field(min_length=5)
+
+
+def _intent_canonical_text(intent) -> str:
+    return " ".join(filter(None, [intent.problem, intent.mechanism, intent.intervention,
+                                  intent.evaluation_setting, intent.task_scope]))
+
+
+async def _variant_is_invariant(canonical_text: str, variant: str, threshold: float) -> bool:
+    """Cheap embedding guardrail: is `variant` still a paraphrase of the intent?
+
+    This is NOT the sole judge — a borderline/drifted variant is fed to the LLM
+    for a corrected regeneration. If embedding is unavailable we do not block.
     """
+    if not canonical_text or not variant:
+        return False
+    try:
+        from app.services.embedding_service import cosine_similarity, embed_texts
+        vecs = await asyncio.to_thread(embed_texts, [canonical_text, variant])
+        if len(vecs) == 2 and vecs[0] and vecs[1]:
+            return cosine_similarity(vecs[0], vecs[1]) >= threshold
+    except Exception as exc:
+        logger.warning("variant invariance embedding failed (%s); not blocking", exc)
+    return True
+
+
+async def _regenerate_variant(llm, intent, bad_variant: str) -> str:
+    """LLM-directed regeneration of a drifted variant (the non-embedding judge)."""
+    result = await llm.chat_json([
+        {"role": "system", "content": _VARIANT_REGENERATE_SYSTEM},
+        {"role": "user", "content": _VARIANT_REGENERATE_USER.format(
+            problem=intent.problem, mechanism=intent.mechanism,
+            intervention=intent.intervention, evaluation_setting=intent.evaluation_setting,
+            task_scope=intent.task_scope, bad_variant=bad_variant)},
+    ], RegenerateVariantSchema)
+    return (result.variant or "").strip()
+
+
+async def _validate_and_regenerate_variants(llm, intent, budget: int) -> list[str]:
+    """Validate semantic invariance per variant; regenerate drifted ones up to a
+    budget, dropping still-drifted variants. Returns the valid variants (>=2
+    required, else the caller marks QUERY_GENERATION_INVALID)."""
+    from app.config import settings
+    canonical_text = _intent_canonical_text(intent)
+    threshold = settings.variant_invariance_embedding_threshold
+    valid: list[str] = []
+    for variant in intent.variants:
+        text = (variant or "").strip()
+        if not text:
+            continue
+        accepted = False
+        for _ in range(budget + 1):
+            if await _variant_is_invariant(canonical_text, text, threshold):
+                valid.append(text)
+                accepted = True
+                break
+            regenerated = await _regenerate_variant(llm, intent, text)
+            if not regenerated or regenerated == text:
+                break
+            text = regenerated
+        if not accepted:
+            logger.info("dropped drifted variant for family '%s' after %d regen attempts",
+                        intent.family, budget)
+    # De-duplicate within the family (keep first).
+    seen = set()
+    deduped = []
+    for v in valid:
+        key = v.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(v)
+    return deduped
+
+
+async def generate_english_adversarial_queries(db, llm, gap: GapCandidate) -> list[AdversarialQuerySpec]:
+    """Two-step generation: fix each family's canonical intent first (structured
+    problem/mechanism/intervention/evaluation_setting/task_scope), then produce
+    paraphrase variants that must preserve it. Variants are validated for
+    semantic invariance (embedding guardrail + LLM regeneration) so a family
+    never silently drifts into a different mechanism/method/benchmark — which is
+    what made family-internal stability meaningless (scope drift, not lexical
+    mismatch). Falls back to raw concatenation on total failure.
+    """
+    from app.config import settings
     try:
         gen = await llm.chat_json([
             {"role": "system", "content": _QUERY_GEN_SYSTEM},
@@ -366,27 +480,49 @@ async def generate_english_adversarial_queries(llm, gap: GapCandidate) -> list[A
                 falsification_condition=gap.falsification_condition or "",
             )},
         ], GapQueryGenList)
-        specs: list[AdversarialQuerySpec] = []
-        for fam in gen.families:
-            if fam.family not in VALID_QUERY_FAMILIES:
-                continue
-            for q in fam.queries:
-                text = (q or "").strip()
-                if text:
-                    specs.append(AdversarialQuerySpec(fam.family, text))
-        # De-duplicate within the same family (keep first occurrence).
-        seen = set()
-        deduped = []
-        for spec in specs:
-            key = (spec.family, spec.query_text.lower())
-            if key not in seen:
-                seen.add(key)
-                deduped.append(spec)
-        if deduped:
-            return deduped
+        intents = list(gen.intents)
     except Exception as exc:
         logger.warning("Gap %s: English query generation failed (%s), falling back to raw concatenation", gap.id[:8], exc)
-    return build_adversarial_queries(gap)
+        return build_adversarial_queries(gap)
+
+    specs: list[AdversarialQuerySpec] = []
+    intents_summary = []
+    budget = settings.variant_regenerate_budget
+    for intent in intents:
+        if intent.family not in VALID_QUERY_FAMILIES:
+            continue
+        valid_variants = await _validate_and_regenerate_variants(llm, intent, budget)
+        if len(valid_variants) < 2:
+            # QUERY_GENERATION_INVALID: cannot compute a meaningful family-internal
+            # stability, and must NOT be read as SEARCH_UNSTABLE.
+            intents_summary.append({
+                "family": intent.family, "status": "QUERY_GENERATION_INVALID",
+                "valid_variant_count": len(valid_variants),
+                "problem": intent.problem, "mechanism": intent.mechanism,
+                "intervention": intent.intervention,
+                "evaluation_setting": intent.evaluation_setting,
+                "task_scope": intent.task_scope,
+            })
+            continue
+        for vi, variant in enumerate(valid_variants):
+            specs.append(AdversarialQuerySpec(intent.family, variant, variant_index=vi))
+        intents_summary.append({
+            "family": intent.family, "status": "VALID",
+            "variant_count": len(valid_variants),
+            "problem": intent.problem, "mechanism": intent.mechanism,
+            "intervention": intent.intervention,
+            "evaluation_setting": intent.evaluation_setting,
+            "task_scope": intent.task_scope,
+        })
+
+    # Structured persistence of the canonical intents (for diagnosis/calibration).
+    paper_repo.save_trace(db, gap.task_id, "gap_query_intents", "generation",
+                          output_data={"gap_id": gap.id, "intents": intents_summary})
+    # QUERY_GENERATION_INVALID (or no valid family): return empty, do NOT fall back
+    # to raw concatenation — raw concatenation is exactly the scope-drift source
+    # that made family-internal stability meaningless. The caller treats an empty
+    # query set as "cannot search" (more_search), never as SEARCH_UNSTABLE.
+    return specs
 
 
 def collect_same_question_neighbors(db, gap) -> list[str]:
@@ -609,7 +745,25 @@ async def audit_gap_candidate(
     gap.status = "auditing"
     atomic_claims = await _ensure_atomic_claims(db, llm, gap, task_id)
     audit_round = state.current_round + 1
-    query_specs = await generate_english_adversarial_queries(llm, gap)
+    query_specs = await generate_english_adversarial_queries(db, llm, gap)
+    if not query_specs:
+        # QUERY_GENERATION_INVALID: every family's variants drifted and could not
+        # be regenerated into a valid set. Cannot search — mark more_search, and
+        # do NOT read this as SEARCH_UNSTABLE (the search never ran).
+        paper_repo.save_trace(db, task_id, "gap_query_generation_invalid", "decision",
+                              output_data={"gap_id": gap.id})
+        gap.status = "auditing"
+        gap_repo.create_gap_audit(
+            db, gap_id=gap.id, task_id=task_id, adversarial_queries=[],
+            audit_result="uncertain", neighbor_paper_ids=[],
+            recommended_action="more_search", audit_round=audit_round,
+            search_policy_version=GAP_SEARCH_POLICY_VERSION,
+            search_admission_status="QUERY_GENERATION_INVALID",
+            search_admission_reasons=["QUERY_GENERATION_INVALID"],
+            search_query_ids=[], audited_claimed_delta=gap.claimed_delta or "",
+        )
+        db.commit()
+        return GapAuditResult(gap.id, "uncertain", "more_search", "")
     queries = [spec.query_text for spec in query_specs]
     executions = []
     for spec in query_specs:

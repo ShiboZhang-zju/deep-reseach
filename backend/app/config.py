@@ -287,6 +287,8 @@ class Settings(BaseSettings):
     family_coverage_medium: float = 0.6
     family_stability_floor: float = 0.3         # per-family floor -> flag that family, not the whole gap
     family_instability_more_search_budget: int = 2  # max family-instability-triggered more_search rounds
+    variant_invariance_embedding_threshold: float = 0.7  # variant vs canonical intent cosine floor (cheap guardrail)
+    variant_regenerate_budget: int = 2          # per-variant regenerate attempts before dropping
 
     @property
     def effective_openalex_rate_per_min(self) -> int:
