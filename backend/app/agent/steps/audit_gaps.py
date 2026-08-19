@@ -820,8 +820,18 @@ async def audit_gap_candidate(
         _waterfall = _compute_overlap_waterfall(db, gap, [paper.id for paper in neighbors])
         paper_repo.save_trace(db, task_id, "gap_overlap_waterfall", "decision",
                               output_data={"gap_id": gap.id, "waterfall": _waterfall})
+        # Cumulative NPA Top-K convergence is the stability signal that matters
+        # for novelty audit (variants complement each other, so their pairwise
+        # Jaccard is NOT the right gate). Also record the final_score
+        # distribution so a relevance cutoff can be chosen from data later.
+        _cumulative = _compute_cumulative_npa_stability(db, gap, admission.completed_query_ids)
+        _score_dist = _compute_final_score_distribution(db, gap, admission.completed_query_ids)
+        paper_repo.save_trace(db, task_id, "gap_cumulative_npa_stability", "decision",
+                              output_data={"gap_id": gap.id,
+                                           "cumulative": _cumulative,
+                                           "final_score_distribution": _score_dist})
     except Exception as exc:
-        logger.warning("Gap %s: overlap waterfall diagnostic failed (non-fatal): %s",
+        logger.warning("Gap %s: NPA diagnostics failed (non-fatal): %s",
                        gap.id[:8], exc)
     if _audit_input_repeats(_latest_decided_audit(db, gap.id), gap, neighbors):
         # A previous audit asked for more search and got none: same claim, same
@@ -981,16 +991,17 @@ async def audit_gap_candidate(
                 c.claim_text for c in atomic_claims if c.id in id_set)
 
         # P1-1 blind-spot fix: a claim-level "confirmed" is not trustworthy when
-        # the family-internal retrieval is highly unstable (same family's variants
-        # recall disjoint Top-K) — the audit may have missed the real prior art.
-        # Downgrade to more_search, but bounded by a budget so a persistently
-        # unstable family cannot loop forever.
+        # the multi-query union has NOT converged — i.e. adding more variants
+        # still changes the global NPA Top-K, so the audit may have missed the
+        # real prior art. Downgrade to more_search, bounded by a budget so a
+        # persistently non-converging union cannot loop forever. We deliberately
+        # do NOT gate on family-internal Jaccard: variants complement each
+        # other, so low pairwise overlap is expected and uninformative.
         if derived_result == "confirmed":
             from app.config import settings
             diagnostics = _compute_npa_diagnostics(db, gap)
-            if (diagnostics.instable_families
-                    and diagnostics.median_family_stability is not None
-                    and diagnostics.median_family_stability < settings.family_stability_floor):
+            if (diagnostics.cumulative_convergence is not None
+                    and diagnostics.cumulative_convergence < settings.npa_stability_medium):
                 more_search_count = sum(
                     1 for a in gap_repo.list_gap_audits(db, gap.id)
                     if a.recommended_action == "more_search")
@@ -998,9 +1009,10 @@ async def audit_gap_candidate(
                     decision.audit_result = "uncertain"
                     decision.recommended_action = "more_search"
                     paper_repo.save_trace(
-                        db, task_id, "gap_audit_family_instability", "decision",
+                        db, task_id, "gap_audit_npa_unconverged", "decision",
                         output_data={
                             "gap_id": gap.id,
+                            "cumulative_convergence": diagnostics.cumulative_convergence,
                             "instable_families": diagnostics.instable_families,
                             "median_family_stability": diagnostics.median_family_stability,
                         })
@@ -1090,6 +1102,11 @@ class NPADiagnostics:
     stability_at_k: dict[int, float | None]        # k -> median family stability @k (diagnostic)
     search_confidence: str
     instable_families: list[str]                   # stability@5 < floor
+    # Final-step Jaccard of the cumulative global Top-K (convergence of the
+    # multi-query union). This — not family-internal Jaccard — is the stability
+    # signal that matters for novelty: variants complement each other, so their
+    # pairwise overlap being low is expected and uninformative.
+    cumulative_convergence: float | None = None
 
 
 def _compute_overlap_waterfall(db, gap: GapCandidate, npa_neighbor_ids: list[str]) -> dict:
@@ -1227,6 +1244,114 @@ def _compute_overlap_waterfall(db, gap: GapCandidate, npa_neighbor_ids: list[str
     return out
 
 
+def _rank_retrieved_papers(db, gap: GapCandidate, query_ids: list[str]) -> list[str]:
+    """Rank papers retrieved by `query_ids` with the NPA scoring formula.
+
+    Mirrors `select_gap_specific_neighbors`' scoring (hits / families / rank /
+    sources / final_score) but returns ordered paper_ids for the RETRIEVED set
+    only (no corpus fallback), so the cumulative-stability diagnostic can watch
+    the global Top-K change as queries accumulate.
+    """
+    mappings = db.query(SearchQueryPaper).filter(
+        SearchQueryPaper.query_id.in_(query_ids)).all()
+    qfam = {r.id: r.query_family for r in db.query(SearchQueryRecord).filter(
+        SearchQueryRecord.id.in_(query_ids)).all()}
+    stats = defaultdict(lambda: {"hits": 0, "families": set(), "sources": set(),
+                                 "best_rank": 10**6})
+    for m in mappings:
+        s = stats[m.paper_id]
+        s["hits"] += 1
+        s["families"].add(qfam.get(m.query_id, ""))
+        s["sources"].add(m.source)
+        s["best_rank"] = min(s["best_rank"], m.rank)
+    tps = {tp.paper_id: (tp.final_score or 0.0) for tp in db.query(TaskPaper).filter(
+        TaskPaper.task_id == gap.task_id,
+        TaskPaper.paper_id.in_(list(stats.keys()))).all()}
+    scored = []
+    for pid, s in stats.items():
+        score = (0.4 * s["hits"] + 0.3 * len(s["families"])
+                 + 0.2 / (s["best_rank"] + 1) + 0.1 * len(s["sources"])
+                 + 0.1 * tps.get(pid, 0.0))
+        scored.append((score, pid))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [pid for _, pid in scored]
+
+
+def _compute_cumulative_npa_stability(db, gap: GapCandidate, query_ids: list[str],
+                                      k: int = _MAX_NEIGHBORS) -> dict:
+    """Cumulative NPA Top-K convergence across query variants.
+
+    Family variants have COMPLEMENTARY raw recall, so their pairwise Jaccard is
+    the wrong stability signal (low overlap just means they surface different
+    papers, which is desirable). Instead we union queries incrementally and track
+    how the re-ranked global Top-K changes. A converging Top-K means nearest-
+    prior-art selection has stabilised; a drifting Top-K means more variants are
+    still needed before the audit can trust its neighbour set.
+    """
+    records = db.query(SearchQueryRecord).filter(
+        SearchQueryRecord.id.in_(query_ids)).order_by(
+        SearchQueryRecord.created_at, SearchQueryRecord.id).all()
+    ordered = [r.id for r in records]
+    curve = []
+    prev = None
+    for i in range(1, len(ordered) + 1):
+        topk = _rank_retrieved_papers(db, gap, ordered[:i])[:k]
+        jac = None
+        if prev is not None:
+            jac = len(set(prev) & set(topk)) / max(1, len(set(prev) | set(topk)))
+        curve.append({"n_queries": i, "topk_paper_ids": topk,
+                      "jaccard_vs_prev": jac})
+        prev = topk
+    final_jac = curve[-1]["jaccard_vs_prev"] if len(curve) >= 2 else None
+    return {
+        "n_queries": len(ordered),
+        "convergence_curve": curve,
+        "final_topk_paper_ids": prev if prev else [],
+        "final_step_jaccard": final_jac,
+    }
+
+
+def _compute_final_score_distribution(db, gap: GapCandidate, query_ids: list[str]) -> dict:
+    """final_score distribution over the gap's retrieved papers.
+
+    The high-value overlap diagnostic needs a relevance cutoff, but we do NOT
+    pre-commit to a fixed 0.5. Report the distribution first so a threshold can
+    be chosen from data, not assumption.
+    """
+    pids = {m.paper_id for m in db.query(SearchQueryPaper).filter(
+        SearchQueryPaper.query_id.in_(query_ids)).all()}
+    if not pids:
+        return {"count": 0, "scores": [], "histogram": {}}
+    tps = db.query(TaskPaper).filter(
+        TaskPaper.task_id == gap.task_id,
+        TaskPaper.paper_id.in_(pids)).all()
+    scores = sorted((tp.final_score or 0.0) for tp in tps)
+
+    def _pct(p):
+        if not scores:
+            return None
+        idx = min(len(scores) - 1, int(round(p * (len(scores) - 1))))
+        return scores[idx]
+
+    hist = {}
+    for lo in range(10):
+        lo_v, hi_v = lo / 10.0, (lo + 1) / 10.0
+        cnt = sum(1 for s in scores if lo_v <= s < hi_v)
+        if cnt:
+            hist[f"{lo_v:.1f}-{hi_v:.1f}"] = cnt
+    return {
+        "count": len(scores),
+        "min": scores[0] if scores else None,
+        "max": scores[-1] if scores else None,
+        "mean": round(sum(scores) / len(scores), 4) if scores else None,
+        "median": _pct(0.5),
+        "p25": _pct(0.25),
+        "p75": _pct(0.75),
+        "p90": _pct(0.9),
+        "histogram": hist,
+    }
+
+
 def _compute_npa_diagnostics(db, gap) -> NPADiagnostics:
     """Four-state search confidence + NPA stability diagnostics (P1-1), mechanical.
 
@@ -1297,10 +1422,18 @@ def _compute_npa_diagnostics(db, gap) -> NPADiagnostics:
         vals = [s for s in stabs.values() if s is not None]
         stability_at_k[k] = _median(vals) if vals else None
 
+    # Cumulative global Top-K convergence (multi-query union). This replaces
+    # family-internal Jaccard as the stability gate: variants complement each
+    # other, so their pairwise overlap being low is expected, not a signal of
+    # instability. What matters is whether the unioned Top-K converges.
+    cumulative = _compute_cumulative_npa_stability(db, gap, [r.id for r in records])
+    cumulative_convergence = cumulative["final_step_jaccard"]
+
     if cross_round is None:
         confidence = "INSUFFICIENT_OBSERVATION"
     elif (cross_round >= settings.npa_stability_high
-            and (median_family is None or median_family >= settings.npa_stability_high)
+            and (cumulative_convergence is None
+                 or cumulative_convergence >= settings.npa_stability_high)
             and family_coverage >= settings.family_coverage_high):
         confidence = "high"
     elif (cross_round >= settings.npa_stability_medium
@@ -1317,6 +1450,7 @@ def _compute_npa_diagnostics(db, gap) -> NPADiagnostics:
         stability_at_k=stability_at_k,
         search_confidence=confidence,
         instable_families=instable_families,
+        cumulative_convergence=cumulative_convergence,
     )
 
 
