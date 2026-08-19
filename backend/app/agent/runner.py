@@ -625,6 +625,36 @@ async def _generate_landscape_brief_phase(db, state: ResearchState, task_id: str
                        task_id[:8], exc)
 
 
+def _finalize_inconclusive_gaps(db, task_id: str) -> int:
+    """Close auditing gaps whose last decided audit asked for more search.
+
+    Runs at task termination (budget exhausted). `rejected` asserts a gap was
+    disproven; `inconclusive` asserts only that search budget ran out before
+    novelty could be decided. The distinction is a reporting concern — an
+    inconclusive gap is "unconfirmed", not "refuted" — so we keep the two
+    terminal states separate rather than folding these into `rejected`.
+    """
+    from app.db.models import GapCandidate, GapAudit
+
+    gaps = db.query(GapCandidate).filter(
+        GapCandidate.task_id == task_id,
+        GapCandidate.status == "auditing",
+    ).all()
+    closed = 0
+    for gap in gaps:
+        last = (db.query(GapAudit)
+                .filter(GapAudit.gap_id == gap.id)
+                .order_by(GapAudit.created_at.desc())
+                .first())
+        if last is not None and last.recommended_action == "more_search":
+            gap.status = "inconclusive"
+            closed += 1
+    if closed:
+        logger.info("Task %s: finalized %d auditing gap(s) as inconclusive "
+                    "(search budget exhausted)", task_id[:8], closed)
+    return closed
+
+
 async def _terminate_more_research(db, state: ResearchState, task_id: str,
                                     status: str, reason: str):
     """Emit landscape brief + set a terminal 'more research' style status.
@@ -632,6 +662,7 @@ async def _terminate_more_research(db, state: ResearchState, task_id: str,
     Centralizes the 6 former inline termination exits so O2 remediation logic
     lives in one place.
     """
+    _finalize_inconclusive_gaps(db, task_id)
     await _generate_landscape_brief_phase(db, state, task_id, status, reason)
     task_repo.update_status(db, task_id, status)
     task_repo.update_stop_reason(db, task_id, reason)

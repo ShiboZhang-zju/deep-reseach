@@ -158,8 +158,10 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
     else:
         surviving = [g for g in gaps if g.status == "surviving"]
         rejected = [g for g in gaps if g.status == "rejected"]
-        other = [g for g in gaps if g.status not in ("surviving", "rejected")]
+        inconclusive = [g for g in gaps if g.status == "inconclusive"]
+        other = [g for g in gaps if g.status not in ("surviving", "rejected", "inconclusive")]
         lines.append(f"候选 Gap 共 {len(gaps)} 个：存活 {len(surviving)}，被驳回 {len(rejected)}，"
+                     f"未确认 {len(inconclusive)}（检索预算耗尽后仍缺少足够证据），"
                      f"待定/审计中 {len(other)}。\n")
         # Preload phenomenon plans for surviving gaps in one query.
         plans_by_gap = {}
@@ -172,7 +174,11 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
             tier = "A(全文支撑)" if g.provenance_status == "complete" else "B(摘要级)"
             desc = (g.description or g.missing_capability or "")[:120].replace("\n", " ")
             vtag = f" v{g.version}" if (g.version or 1) > 1 else ""
-            lines.append(f"- [{g.status}][{tier}]{vtag} {desc}")
+            status_label = {"surviving": "存活", "rejected": "驳回",
+                            "inconclusive": "未确认", "auditing": "审计中",
+                            "audited": "已审计", "candidate": "候选",
+                            "superseded": "已取代"}.get(g.status, g.status)
+            lines.append(f"- [{status_label}][{tier}]{vtag} {desc}")
             if g.status == "surviving" and g.nearest_prior_art_title:
                 conf = {"INSUFFICIENT_OBSERVATION": "观察不足",
                         "high": "高", "medium": "中", "low": "低"}.get(

@@ -412,15 +412,25 @@ async def _variant_is_invariant(canonical_text: str, variant: str, threshold: fl
 
 
 async def _regenerate_variant(llm, intent, bad_variant: str) -> str:
-    """LLM-directed regeneration of a drifted variant (the non-embedding judge)."""
-    result = await llm.chat_json([
-        {"role": "system", "content": _VARIANT_REGENERATE_SYSTEM},
-        {"role": "user", "content": _VARIANT_REGENERATE_USER.format(
-            problem=intent.problem, mechanism=intent.mechanism,
-            intervention=intent.intervention, evaluation_setting=intent.evaluation_setting,
-            task_scope=intent.task_scope, bad_variant=bad_variant)},
-    ], RegenerateVariantSchema)
-    return (result.variant or "").strip()
+    """LLM-directed regeneration of a drifted variant (the non-embedding judge).
+
+    A failed regeneration (e.g. the LLM returns malformed JSON or a schema blob
+    instead of a `variant` string) must NOT abort the whole task. It degrades to
+    an empty string, which the caller treats as "keep this variant dropped",
+    ultimately marking QUERY_GENERATION_INVALID if <2 valid variants remain.
+    """
+    try:
+        result = await llm.chat_json([
+            {"role": "system", "content": _VARIANT_REGENERATE_SYSTEM},
+            {"role": "user", "content": _VARIANT_REGENERATE_USER.format(
+                problem=intent.problem, mechanism=intent.mechanism,
+                intervention=intent.intervention, evaluation_setting=intent.evaluation_setting,
+                task_scope=intent.task_scope, bad_variant=bad_variant)},
+        ], RegenerateVariantSchema)
+        return (result.variant or "").strip()
+    except Exception as exc:
+        logger.warning("variant regeneration failed (non-fatal, dropping variant): %s", exc)
+        return ""
 
 
 async def _validate_and_regenerate_variants(llm, intent, budget: int) -> list[str]:
@@ -491,7 +501,13 @@ async def generate_english_adversarial_queries(db, llm, gap: GapCandidate) -> li
     for intent in intents:
         if intent.family not in VALID_QUERY_FAMILIES:
             continue
-        valid_variants = await _validate_and_regenerate_variants(llm, intent, budget)
+        try:
+            valid_variants = await _validate_and_regenerate_variants(llm, intent, budget)
+        except Exception as exc:
+            logger.warning("family '%s': variant validation/regeneration failed "
+                           "(non-fatal, marking QUERY_GENERATION_INVALID): %s",
+                           intent.family, exc)
+            valid_variants = []
         if len(valid_variants) < 2:
             # QUERY_GENERATION_INVALID: cannot compute a meaningful family-internal
             # stability, and must NOT be read as SEARCH_UNSTABLE.

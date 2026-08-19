@@ -802,6 +802,8 @@ class GapCandidate(Base):
     - surviving: Passed audit, eligible for feasibility gate (Phase 4)
     - rejected: Failed audit or feasibility gate
     - superseded: Replaced by a newer version (contract change)
+    - inconclusive: Search budget exhausted before novelty could be decided
+      (distinct from `rejected`, which asserts the gap is disproven)
 
     provenance_status:
     - complete: All structured fields populated with evidence backing
