@@ -52,6 +52,10 @@ class ResearchState:
 
     # Search loop state
     current_round: int = 0
+    # Directed remediation rounds run so far. Kept SEPARATE from current_round
+    # (which only counts primary search rounds up to max_rounds) so the UI never
+    # surfaces a confusing "round 5/3". Bounded by max_remediation_rounds_total.
+    remediation_round: int = 0
     used_queries: list[str] = field(default_factory=list)
     knowledge_gaps: list[str] = field(default_factory=list)
     collected_paper_ids: list[str] = field(default_factory=list)

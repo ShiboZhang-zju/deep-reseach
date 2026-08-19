@@ -305,8 +305,12 @@ def recover_interrupted_tasks():
             if task.state_json:
                 try:
                     state = ResearchState.from_json(task.state_json)
+                    # Only count primary search rounds (<= max_rounds). Remediation
+                    # rounds are stored above max_rounds and must not be mistaken
+                    # for completed primary rounds during resume calibration.
                     max_completed = db.query(ResearchRound.round_number).filter(
-                        ResearchRound.task_id == task.id
+                        ResearchRound.task_id == task.id,
+                        ResearchRound.round_number <= task.max_rounds,
                     ).order_by(ResearchRound.round_number.desc()).first()
                     actual_rounds = max_completed[0] if max_completed else 0
 

@@ -203,12 +203,16 @@ async def run_targeted_research_round(
     if not seeds:
         seeds = _build_seed_queries(key, topic)
 
-    # Bump round counter — a remediation round is a real search round.
-    state.current_round += 1
-    round_num = state.current_round
+    # A remediation round is a real search round for STORAGE purposes, but it
+    # must NOT inflate `current_round` past `max_rounds` (which would surface as
+    # a confusing "round 5/3" in the UI). Keep a separate counter and offset the
+    # stored round_num above max_rounds so it stays unique against the primary
+    # search rounds and can be filtered out of resume calibration.
+    state.remediation_round += 1
+    round_num = settings.max_rounds + state.remediation_round
 
-    logger.info("Task %s: O2 targeted remediation round %d for reason='%s' (intent=%s)",
-                task_id[:8], round_num, key, intent)
+    logger.info("Task %s: O2 targeted remediation round %d (remediation #%d) for reason='%s' (intent=%s)",
+                task_id[:8], round_num, state.remediation_round, key, intent)
     task_repo.update_status(db, task_id, "searching")
     db.commit()
     emit_event(task_id, "status", {"status": "searching", "reason": f"remediation:{key}"})
@@ -235,7 +239,7 @@ async def run_targeted_research_round(
             logger.warning("Task %s: failed to record remediation query '%s': %s",
                            task_id[:8], seed[:40], e)
     if not executions:
-        state.current_round -= 1
+        state.remediation_round -= 1
         return RemediationResult(False, reason, 0, 0, exhausted=True)
 
     state.used_queries.extend(e.query_text for e in executions)
