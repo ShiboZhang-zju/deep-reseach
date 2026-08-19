@@ -13,7 +13,7 @@ from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
 from app.db.models import (EvidenceUnit, GapAudit, GapCandidate, Paper, QuestionEvidenceLink,
-                          SearchQueryPaper, SearchQueryRecord, TaskPaper)
+                          SearchQueryPaper, SearchQueryRecord, SearchRawResult, TaskPaper)
 from app.db.repositories import gap_repo, paper_repo, task_repo
 from app.db.repositories.search_query_repo import save_search_query
 
@@ -797,6 +797,16 @@ async def audit_gap_candidate(
         db.commit()
         return GapAuditResult(gap.id, "uncertain", "more_search", "")
     neighbors = select_gap_specific_neighbors(db, gap, admission.completed_query_ids)
+    # Recall waterfall diagnostic: record per-family raw/canonical/post-filter/
+    # final overlap on every admitted audit (not only confirmed gaps), so the
+    # instability root cause can be located regardless of the verdict.
+    try:
+        _waterfall = _compute_overlap_waterfall(db, gap, [paper.id for paper in neighbors])
+        paper_repo.save_trace(db, task_id, "gap_overlap_waterfall", "decision",
+                              output_data={"gap_id": gap.id, "waterfall": _waterfall})
+    except Exception as exc:
+        logger.warning("Gap %s: overlap waterfall diagnostic failed (non-fatal): %s",
+                       gap.id[:8], exc)
     if _audit_input_repeats(_latest_decided_audit(db, gap.id), gap, neighbors):
         # A previous audit asked for more search and got none: same claim, same
         # neighbors. Observed cost of not detecting this: one gap audited four
@@ -1064,6 +1074,141 @@ class NPADiagnostics:
     stability_at_k: dict[int, float | None]        # k -> median family stability @k (diagnostic)
     search_confidence: str
     instable_families: list[str]                   # stability@5 < floor
+
+
+def _compute_overlap_waterfall(db, gap: GapCandidate, npa_neighbor_ids: list[str]) -> dict:
+    """Recall waterfall: where does cross-variant instability get introduced?
+
+    For each query family, compares overlap between its variants at successive
+    pipeline stages, so we can tell whether instability is a retrieval property
+    (raw already low), a canonicalization artifact, a pre-filter artifact, or a
+    re-ranking artifact. Reported as median pairwise Jaccard + OverlapCoefficient
+    at @5/@10/@20.
+
+    Stages (paper identity used for overlap):
+      raw         = external_paper_id (fallback title-hash) in raw_rank order
+      canonical   = title-hash in raw_rank order (dedup across sources)
+      post_filter = SearchQueryPaper.paper_id in rank order
+      final       = post-filter papers ordered by TaskPaper.final_score desc
+    Also reports:
+      high_value  = post-filter subset with priority == "high"
+      npa_candidate = the gap's final neighbour set (novelty audit actually uses this)
+
+    NOTE: a low raw overlap only licenses "retrieval is paraphrase-sensitive";
+    it is NOT, by itself, proof of lexical mismatch (that needs raw identity
+    inspection, which this table now enables).
+    """
+    from app.services.scoring_service import title_hash
+
+    records = db.query(SearchQueryRecord).filter(
+        SearchQueryRecord.target_gap_id == gap.id,
+    ).all()
+    families = sorted({r.query_family for r in records if r.query_family})
+    queries_by_family = defaultdict(list)
+    for r in records:
+        if r.query_family:
+            queries_by_family[r.query_family].append(r.id)
+
+    def _median_pairwise(sets_list: list[set]):
+        if len(sets_list) < 2:
+            return None, None
+        jacs, overlaps = [], []
+        for i in range(len(sets_list)):
+            for j in range(i + 1, len(sets_list)):
+                a, b = sets_list[i], sets_list[j]
+                inter = len(a & b)
+                union = len(a | b)
+                jacs.append(inter / union if union else 0.0)
+                overlaps.append(inter / min(len(a), len(b)) if min(len(a), len(b)) else 0.0)
+        return _median(jacs), _median(overlaps)
+
+    def _raw_ids(query_id, k):
+        rows = db.query(SearchRawResult).filter(
+            SearchRawResult.query_id == query_id,
+        ).order_by(SearchRawResult.raw_rank).limit(k).all()
+        ids = []
+        for r in rows:
+            if r.external_paper_id:
+                ids.append(("ext", r.external_paper_id))
+            elif r.title:
+                ids.append(("hash", title_hash(r.title)))
+            else:
+                ids.append(("row", r.id))
+        return ids
+
+    def _canonical_ids(query_id, k):
+        rows = db.query(SearchRawResult).filter(
+            SearchRawResult.query_id == query_id,
+        ).order_by(SearchRawResult.raw_rank).all()
+        seen, ids = set(), []
+        for r in rows:
+            key = title_hash(r.title) if r.title else (r.canonical_paper_id or r.external_paper_id or r.id)
+            if key not in seen:
+                seen.add(key)
+                ids.append(key)
+            if len(ids) >= k:
+                break
+        return ids
+
+    def _postfilter_ids(query_id, k):
+        rows = db.query(SearchQueryPaper.paper_id).filter(
+            SearchQueryPaper.query_id == query_id,
+        ).order_by(SearchQueryPaper.rank).limit(k).all()
+        return [p for (p,) in rows]
+
+    # Pre-load per-query final_score / priority once (task-level, shared across
+    # families) so the final / high-value stages don't hit the DB per paper.
+    score_cache: dict[str, float] = {}
+    priority_cache: dict[str, str] = {}
+    tps = db.query(TaskPaper).filter(TaskPaper.task_id == gap.task_id).all()
+    for tp in tps:
+        score_cache[tp.paper_id] = tp.final_score or 0.0
+        priority_cache[tp.paper_id] = tp.priority or ""
+
+    def _final_ids(query_id, k):
+        rows = db.query(SearchQueryPaper.paper_id).filter(
+            SearchQueryPaper.query_id == query_id,
+        ).all()
+        pids = [p for (p,) in rows]
+        return sorted(pids, key=lambda p: score_cache.get(p, 0.0), reverse=True)[:k]
+
+    def _high_value_ids(query_id, k):
+        rows = db.query(SearchQueryPaper.paper_id).filter(
+            SearchQueryPaper.query_id == query_id,
+        ).order_by(SearchQueryPaper.rank).all()
+        hv = []
+        for (p,) in rows:
+            if priority_cache.get(p) == "high":
+                hv.append(p)
+            if len(hv) >= k:
+                break
+        return hv
+
+    out = {}
+    for family in families:
+        qids = queries_by_family[family]
+        fam = {"query_count": len(qids)}
+        for stage, getter in (
+            ("raw", _raw_ids),
+            ("canonical", _canonical_ids),
+            ("post_filter", _postfilter_ids),
+            ("final", _final_ids),
+            ("high_value", _high_value_ids),
+        ):
+            stage_out = {}
+            for k in (5, 10, 20):
+                sets = [set(getter(qid, k)) for qid in qids]
+                sets = [s for s in sets if s]
+                jac, oc = _median_pairwise(sets)
+                stage_out[str(k)] = {"jaccard": jac, "overlap_coefficient": oc}
+            fam[stage] = stage_out
+        out[family] = fam
+
+    out["npa_candidate"] = {
+        "neighbor_paper_ids": list(npa_neighbor_ids),
+        "neighbor_count": len(npa_neighbor_ids),
+    }
+    return out
 
 
 def _compute_npa_diagnostics(db, gap) -> NPADiagnostics:

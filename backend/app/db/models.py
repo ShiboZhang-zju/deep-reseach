@@ -747,6 +747,39 @@ class SearchQueryPaper(Base):
     )
 
 
+class SearchRawResult(Base):
+    """Minimal audit record of a paper as returned by a source, BEFORE any
+    canonicalization or pre-filter.
+
+    Persisting only the raw identity (external ids + title + year + raw rank)
+    lets the overlap diagnostic reconstruct the recall waterfall for a query
+    family's variants: raw -> canonical -> post-filter -> final Top-K. We
+    deliberately do NOT store the full API payload here.
+    """
+    __tablename__ = "search_raw_results"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    query_id = Column(String, ForeignKey("search_query_records.id"), nullable=False)
+    source = Column(Text, default="unknown")
+    # Position within this source's raw result list (pre-filter, per query).
+    raw_rank = Column(Integer, default=0)
+    # Best available external identifier for this paper (S2/OpenAlex/arXiv/DOI).
+    external_paper_id = Column(Text)
+    doi = Column(Text)
+    arxiv_id = Column(Text)
+    title = Column(Text)
+    year = Column(Integer)
+    # Backfilled after normalize/upsert maps the raw paper to a canonical row.
+    canonical_paper_id = Column(String, ForeignKey("papers.id"), nullable=True)
+    retrieved_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_srr_query", "query_id"),
+        Index("idx_srr_query_src_rank", "query_id", "source", "raw_rank", unique=True),
+        Index("idx_srr_canonical", "canonical_paper_id"),
+    )
+
+
 # === Phase 3A: Gap Control Plane ===
 
 class GapCandidate(Base):

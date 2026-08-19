@@ -47,7 +47,7 @@ async def search_and_save_papers(db, state: ResearchState,
 
     Returns: (papers_found, deduped_count, new_paper_ids)
     """
-    from app.db.models import SearchQueryPaper
+    from app.db.models import SearchQueryPaper, SearchRawResult
 
     collected_set = set(state.collected_paper_ids)
     all_raw_papers = []
@@ -71,18 +71,60 @@ async def search_and_save_papers(db, state: ResearchState,
             logger.info("Round %d query '%s': found %d raw papers",
                         round_num, query_text[:40], raw_count)
 
+            # Persist minimal raw-retrieval identity BEFORE the similarity
+            # pre-filter, so the recall waterfall diagnostic can compare query
+            # variants on raw external ids (not just the canonical survivors).
+            # raw_rank is the paper's position within its source's result list
+            # for this query, numbered here (not by the source) so the rank is
+            # always unique per (query, source) even when a test/fake source
+            # does not tag its papers.
+            raw_result_rows: dict[tuple[str, int], SearchRawResult] = {}
+            # Idempotency: a query may be re-executed across retries (same
+            # SearchQueryRecord, e.g. a coverage retry re-runs the search phase).
+            # Keep the first raw snapshot and don't duplicate rows for it.
+            _already_has_raw = db.query(SearchRawResult.id).filter(
+                SearchRawResult.query_id == query_id,
+            ).limit(1).first() is not None
+            if not _already_has_raw:
+                _source_rank: dict[str, int] = {}
+                for raw in raw_papers:
+                    src = (getattr(raw, "source", "") or "unknown")
+                    rk = _source_rank.get(src, 0)
+                    _source_rank[src] = rk + 1
+                    row = SearchRawResult(
+                        query_id=query_id,
+                        source=src,
+                        raw_rank=rk,
+                        external_paper_id=_external_paper_id(raw),
+                        doi=getattr(raw, "doi", None) or None,
+                        arxiv_id=getattr(raw, "arxiv_id", None) or None,
+                        title=getattr(raw, "title", "") or "",
+                        year=getattr(raw, "year", None),
+                    )
+                    db.add(row)
+                    raw_result_rows[(src, rk)] = row
+
             # O7: prefilter by topic similarity before persisting, to keep
             # off-topic noise out of the evidence/gap pipeline.
             raw_papers = await _prefilter_by_similarity(raw_papers, state, round_num, query_text)
 
             # Save each paper and create SearchQueryPaper mapping
             new_paper_count_for_query = 0
+            _source_rank2: dict[str, int] = {}
             for rank, raw in enumerate(raw_papers):
                 normalized = normalize_paper(raw)
                 paper, is_new = paper_repo.upsert_paper(db, normalized)
                 paper_repo.create_task_paper(db, task_id, paper.id, round_num)
 
                 source_name = raw.source if hasattr(raw, 'source') else 'unknown'
+                # Backfill the canonical paper id onto the matching raw result
+                # (same per-source ordering as the pre-filter numbering above),
+                # so the diagnostic can join raw identity to final scoring.
+                _rk = _source_rank2.get(source_name, 0)
+                _source_rank2[source_name] = _rk + 1
+                _rr = raw_result_rows.get((source_name, _rk))
+                if _rr is not None:
+                    _rr.canonical_paper_id = paper.id
                 is_new_for_task = paper.id not in collected_set
                 query_paper_mappings.append(
                     (query_id, paper.id, rank, source_name, is_new_for_task)
@@ -206,6 +248,20 @@ async def search_and_save_papers(db, state: ResearchState,
         asyncio.create_task(_trigger_metadata_enrichment(list(new_paper_ids)))
 
     return papers_found, len(deduped), new_paper_ids
+
+
+def _external_paper_id(raw) -> str | None:
+    """Best available external identifier for a raw paper (S2/OpenAlex/arXiv/DOI).
+
+    Used as the raw-layer identity in the overlap waterfall. Fallback to None
+    when the source provided no external id; the diagnostic then falls back to
+    a title hash so the paper still participates in raw overlap.
+    """
+    for attr in ("semantic_scholar_id", "openalex_id", "arxiv_id", "doi"):
+        v = getattr(raw, attr, None)
+        if v:
+            return str(v)
+    return None
 
 
 async def _prefilter_by_similarity(raw_papers: list, state: ResearchState,
