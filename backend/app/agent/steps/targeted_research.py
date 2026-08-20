@@ -102,19 +102,46 @@ def _reason_key(reason: str) -> str | None:
     return None
 
 
-def can_remediate(state: ResearchState, reason: str) -> bool:
-    """Return True if a directed remediation round is allowed for this reason."""
+def can_remediate(state: ResearchState, reason: str,
+                  service_families: list[str] | None = None) -> bool:
+    """Return True if a directed remediation round is allowed for this reason.
+
+    Two budgets apply:
+    - Task-level hard cap (max_remediation_rounds_total): a global safety net
+      over ALL remediation rounds so runtime cannot balloon. Applies to every
+      reason.
+    - Per-canonical-gap-family budget (max_remediation_attempts_per_gap): a
+      remediation round answers "how much more retrieval does THIS gap's novelty
+      need?", so it is charged to the canonical gap family that consumed it. A
+      NEW family that appears after a mining revision starts at 0 and must NOT
+      inherit an old family's spend (task 08005641: old gap A ate the budget,
+      then gaps B/C appeared and were left with zero remediation chances).
+      Narrowed versions (v1 -> v2) share the family budget.
+
+    For gap-scoped reasons the round proceeds only if at least one served
+    canonical family still has per-family budget; the task hard cap still
+    bounds the total.
+    """
     if settings.max_remediation_attempts <= 0:
         return False
     key = _reason_key(reason)
     if key is None:
         return False
     attempts = state.remediation_attempts or {}
-    per_reason = int(attempts.get(key, 0))
     total = int(attempts.get("__total__", 0))
-    if per_reason >= settings.max_remediation_attempts:
-        return False
     if total >= settings.max_remediation_rounds_total:
+        return False
+    if key == "no_surviving_gap_after_audit":
+        # Gap-scoped remediation: proceed only if at least one served canonical
+        # family still has per-family budget.
+        if not service_families:
+            return False
+        used = state.gap_remediation_used or {}
+        remaining = [fam for fam in set(service_families)
+                     if int(used.get(fam, 0)) < settings.max_remediation_attempts_per_gap]
+        return bool(remaining)
+    per_reason = int(attempts.get(key, 0))
+    if per_reason >= settings.max_remediation_attempts:
         return False
     return True
 
@@ -182,13 +209,20 @@ async def _generate_remediation_queries(
 async def run_targeted_research_round(
     db, state: ResearchState, llm, task_id: str, reason: str,
     context: list[str] | None = None,
+    service_families: list[str] | None = None,
 ) -> RemediationResult:
     """RunONE directed search round aimed at `reason`, then return outcome.
+
+    `service_families` are the canonical gap family ids this round is answering
+    "how much more retrieval does this gap's novelty need?" for. The round is
+    charged against the task budget AND each served family's per-family budget,
+    so a new family surfacing after a mining revision gets its own remediation
+    chances instead of inheriting an old family's spend.
 
     The caller is responsible for re-running the failed gate afterwards.
     """
     key = _reason_key(reason)
-    if key is None or not can_remediate(state, reason):
+    if key is None or not can_remediate(state, reason, service_families):
         return RemediationResult(False, reason, 0, 0, exhausted=True)
 
     intent, _templates = _REASON_PLAYBOOK[key]
@@ -273,11 +307,20 @@ async def run_targeted_research_round(
         state = task_repo.get_state(db, task_id)
         new_paper_count = 0
 
-    # Record the attempt (per-reason + global), then persist.
+    # Record the attempt (per-reason + task-global + per-family), then persist.
     attempts = dict(state.remediation_attempts or {})
     attempts[key] = int(attempts.get(key, 0)) + 1
     attempts["__total__"] = int(attempts.get("__total__", 0)) + 1
     state.remediation_attempts = attempts
+    if service_families:
+        family_used = dict(state.gap_remediation_used or {})
+        for fam in set(service_families):
+            # Charge only families that still have budget left; an already
+            # exhausted family is not charged again (its gap should have been
+            # finalized, not re-served by a later family's round).
+            if int(family_used.get(fam, 0)) < settings.max_remediation_attempts_per_gap:
+                family_used[fam] = int(family_used.get(fam, 0)) + 1
+        state.gap_remediation_used = family_used
     task_repo.save_state(db, task_id, state)
     db.commit()
 

@@ -63,7 +63,8 @@ def _latest_coverage_per_question(db, task_id, question_ids):
 
 def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
                                    terminal_status: str = "",
-                                   terminal_reason: str = "") -> str:
+                                   terminal_reason: str = "",
+                                   state: ResearchState | None = None) -> str:
     """Assemble the landscape brief deterministically from DB rows."""
     lines: list[str] = ["# 研究态势简报 (Research Landscape Brief)\n"]
 
@@ -179,6 +180,21 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
                             "audited": "已审计", "candidate": "候选",
                             "superseded": "已取代"}.get(g.status, g.status)
             lines.append(f"- [{status_label}][{tier}]{vtag} {desc}")
+            # Honest inconclusive attribution: distinguish "this gap's own
+            # novelty budget ran out" from "the task-global budget ran out".
+            # A new canonical family must not inherit an old family's spend, so
+            # per-family usage is the primary signal; the task total is context.
+            if g.status == "inconclusive" and state is not None:
+                fam = g.canonical_gap_id or g.id
+                fam_used = int((state.gap_remediation_used or {}).get(fam, 0))
+                fam_cap = settings.max_remediation_attempts_per_gap
+                task_used = int((state.remediation_attempts or {}).get("__total__", 0))
+                task_cap = settings.max_remediation_rounds_total
+                if fam_used >= fam_cap:
+                    cause = f"gap novelty 检索预算已用尽 ({fam_used}/{fam_cap})"
+                else:
+                    cause = f"gap novelty 预算未用尽 ({fam_used}/{fam_cap})，但任务总预算用尽"
+                lines.append(f"  - 未确认归因: {cause}；task remediation {task_used}/{task_cap} 已用")
             if g.status == "surviving" and g.nearest_prior_art_title:
                 conf = {"INSUFFICIENT_OBSERVATION": "观察不足",
                         "high": "高", "medium": "中", "low": "低"}.get(
@@ -345,7 +361,7 @@ async def generate_landscape_brief(db, state: ResearchState, task_id: str,
     """
     try:
         markdown = build_landscape_brief_markdown(
-            db, task_id, state.contract_id, terminal_status, terminal_reason
+            db, task_id, state.contract_id, terminal_status, terminal_reason, state=state
         )
         content_json = json.dumps({
             "type": "landscape_brief",

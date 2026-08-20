@@ -843,8 +843,14 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             # anchor its queries on the exact mechanism the audit failed to find
             # comparisons for, instead of a broad topic sweep.
             gap_claims = [g.claimed_delta for g in gaps if g.claimed_delta]
+            # Charge the round to the canonical families being served. A new
+            # family surfacing after a mining revision gets its own per-family
+            # budget instead of inheriting an old family's spend; narrowed
+            # versions (v1 -> v2) share the family budget via canonical_gap_id.
+            service_families = sorted({g.canonical_gap_id or g.id for g in gaps})
             if await _try_remediate(db, state, llm, task_id,
-                                    "no_surviving_gap_after_audit", context=gap_claims):
+                                    "no_surviving_gap_after_audit", context=gap_claims,
+                                    service_families=service_families):
                 continue
             await _terminate_more_research(db, state, task_id,
                                            "more_research_required", "no_surviving_gap_after_audit")
@@ -962,19 +968,26 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
 
 
 async def _try_remediate(db, state: ResearchState, llm, task_id: str, reason: str,
-                         context: list[str] | None = None) -> bool:
+                         context: list[str] | None = None,
+                         service_families: list[str] | None = None) -> bool:
     """Attempt one O2 directed remediation round for `reason`.
 
     Returns True if a remediation round ran (caller should retry the pipeline),
     False if remediation is not allowed/exhausted (caller should terminate).
     `context` carries reason-specific material (e.g. the audited gaps' claimed
     deltas) so the LLM can anchor the remediation queries on it.
+
+    `service_families` are the canonical gap family ids whose novelty the round
+    is meant to resolve; they are charged against each family's per-family
+    remediation budget (in addition to the task-global cap).
     """
-    if not can_remediate(state, reason):
+    if not can_remediate(state, reason, service_families):
         logger.info("Task %s: no remediation for '%s' (disabled/exhausted)", task_id[:8], reason)
         return False
     logger.info("Task %s: O2 remediation triggered for '%s'", task_id[:8], reason)
-    result = await run_targeted_research_round(db, state, llm, task_id, reason, context=context)
+    result = await run_targeted_research_round(db, state, llm, task_id, reason,
+                                               context=context,
+                                               service_families=service_families)
     if not result.attempted:
         return False
     logger.info("Task %s: remediation added %d papers, %d evidence (exhausted=%s)",

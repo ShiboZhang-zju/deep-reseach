@@ -45,6 +45,14 @@ class ResearchState:
     # Bounded by settings.max_remediation_attempts to avoid infinite loops.
     remediation_attempts: dict = field(default_factory=dict)
 
+    # O2 (evidence-sensitive idempotency, 0027): remediation budget scoped to
+    # the canonical gap family that consumed it. A remediation round answers
+    # "how much more retrieval does THIS gap's novelty need?", so it must not
+    # inherit an old gap family's spend. Keyed by canonical_gap_id (root's own
+    # id when it is the root). Narrowed versions (v1 -> v2) share the family.
+    # Bounded per family by settings.max_remediation_attempts_per_gap.
+    gap_remediation_used: dict = field(default_factory=dict)
+
     # Pipeline orchestration
     current_phase: str = "pending"
     pipeline_version: int = 2

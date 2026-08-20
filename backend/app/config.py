@@ -132,6 +132,14 @@ class Settings(BaseSettings):
     # Total directed-search rounds allowed across ALL gates for one task —
     # a global budget so remediation cannot balloon the runtime.
     max_remediation_rounds_total: int = 3
+    # Per-canonical-gap-family remediation budget (evidence-sensitive
+    # idempotency, 0027). A remediation round answers "how much more retrieval
+    # does THIS gap's novelty need?", so the budget is scoped to the canonical
+    # gap family that consumed it — not the whole task. A new gap family that
+    # appears after a mining revision must not inherit the spent budget of an
+    # old family (which previously let an old gap eat a new gap's only chance,
+    # see task 08005641). Narrowed versions (v1 -> v2) share the family budget.
+    max_remediation_attempts_per_gap: int = 2
 
     # RAG / PDF download
     enable_scihub: bool = False  # P0-4: Sci-Hub disabled by default for legal compliance
