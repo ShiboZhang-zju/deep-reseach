@@ -37,7 +37,7 @@ _HIGH_NOVELTY = 0.8
 # have ruled prior work out. Like the mining policy version, this is what
 # invalidates audits already stamped for a round, so an admission-or-verdict
 # rule change must bump it or resumed tasks keep their old verdicts.
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v4"
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v5"
 
 
 # --- Canonical atomic claims (Phase 3H) ---
@@ -341,8 +341,14 @@ structured fields (they are the invariant that every variant must preserve):
 
 Produce EXACTLY these 5 families:
 - exact_gap: the gap's own claimed delta / missing capability.
-- synonym: the SAME intent rewritten with standard academic synonyms and broader/narrower
-  terminology (defends against lexical mismatch — prior work using different terms).
+- synonym: the SAME intent rewritten with STANDARD TERMS OF ART from the literature
+  (defends against lexical mismatch — prior work using different terms). Communities
+  rename the same concept: a system refusing to answer may be called abstention,
+  unanswerability, selective prediction, or calibrated "I don't know"; insufficient
+  evidence may be called evidence sufficiency or context sufficiency. Enumerate the
+  standard names actually used for THIS gap's core mechanism and capability, then
+  anchor each variant on a DIFFERENT one — variants must differ in the technical
+  TERM, not just in phrasing.
 - mechanism: anchored on the SAME failure mechanism.
 - benchmark: anchored on the SAME evaluation setting / benchmark / task family.
 - method_neighbor: anchored on the SAME intervention / method family.
@@ -355,7 +361,10 @@ the intervention for a different method. Different variants differ only in phras
 
 Rules:
 - Output English only.
-- Translate concepts into standard English technical vocabulary; do not invent new terms."""
+- Translate concepts into standard English technical vocabulary; do not invent new terms.
+- Terminology diversity is the synonym family's purpose: its variants must each anchor
+  on a different standard term of art for the same concept, never three rewordings of
+  one term."""
 
 _QUERY_GEN_USER = """Candidate gap:
 - Setting: {target_setting}

@@ -170,3 +170,35 @@ async def test_invalid_family_name_is_skipped(temp_db, monkeypatch):
 
     assert specs == []
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_synonym_family_prompt_demands_term_of_art_diversity(temp_db):
+    """fd688ba6 RETRIEVAL MISS: known prior art (UAEval4RAG, Evidence Sufficiency
+    Benchmark, SURE-RAG) was never recalled because the queries used only the gap's
+    own wording while the literature names the same concepts differently. The
+    synonym-family prompt must instruct each variant to anchor on a DIFFERENT
+    standard term of art, with the renaming pattern spelled out."""
+    import app.agent.steps.audit_gaps as ag
+
+    captured = {}
+
+    class CapturingLLM:
+        async def chat_json(self, messages, schema):
+            captured["system"] = messages[0]["content"]
+            from app.agent.steps.audit_gaps import GapQueryGenList
+            return GapQueryGenList(intents=[])
+
+    db = temp_db()
+    task, gap = _seed_gap(db)
+    await ag.generate_english_adversarial_queries(db, CapturingLLM(), gap)
+
+    system = captured["system"]
+    # Each synonym variant anchors on a DIFFERENT standard term, not a rewording.
+    assert "DIFFERENT" in system
+    assert "terms of art" in system.lower()
+    # The fd688ba6 renaming pattern must be spelled out so the LLM enumerates
+    # the actual literature vocabulary instead of echoing the gap's wording.
+    for term in ("abstention", "unanswerability", "selective prediction", "sufficiency"):
+        assert term in system, f"terminology example '{term}' missing from prompt"
+    db.close()
