@@ -320,7 +320,11 @@ class IntentWithVariantsSchema(BaseModel):
     intervention: str = Field(min_length=3)
     evaluation_setting: str = Field(min_length=3)
     task_scope: str = Field(min_length=3)
-    variants: list[str] = Field(default_factory=list, min_length=2, max_length=3)
+    standard_terms: list[str] = Field(
+        default_factory=list, max_length=5,
+        description="Synonym family only: the DISTINCT standard terms of art used in the "
+                    "literature for this gap's core mechanism/capability, one per variant.")
+    variants: list[str] = Field(default_factory=list, min_length=2, max_length=4)
 
 
 class GapQueryGenList(BaseModel):
@@ -345,26 +349,29 @@ Produce EXACTLY these 5 families:
   (defends against lexical mismatch — prior work using different terms). Communities
   rename the same concept: a system refusing to answer may be called abstention,
   unanswerability, selective prediction, or calibrated "I don't know"; insufficient
-  evidence may be called evidence sufficiency or context sufficiency. Enumerate the
-  standard names actually used for THIS gap's core mechanism and capability, then
-  anchor each variant on a DIFFERENT one — variants must differ in the technical
-  TERM, not just in phrasing.
+  evidence may be called evidence sufficiency or context sufficiency. FIRST enumerate
+  the distinct standard names actually used for THIS gap's core mechanism and
+  capability into `standard_terms` (as many as apply, up to 5), THEN produce exactly
+  ONE variant per enumerated term, anchoring that variant on its term — never two
+  variants on the same term.
 - mechanism: anchored on the SAME failure mechanism.
 - benchmark: anchored on the SAME evaluation setting / benchmark / task family.
 - method_neighbor: anchored on the SAME intervention / method family.
 
-STEP 2 — generate 2-3 query variants PER family. Each variant must be a PARAPHRASE of that
+STEP 2 — generate 2-4 query variants PER family. Each variant must be a PARAPHRASE of that
 family's canonical intent: ONLY terminology and wording may change. The problem, mechanism,
 intervention, evaluation setting, and task scope MUST NOT drift — a "benchmark" family variant
 must not become an "efficiency analysis", and a "method_neighbor" family variant must not swap
 the intervention for a different method. Different variants differ only in phrasing/terminology.
+Use the full budget (4 variants) for the synonym family: more distinct terms recalled is the
+whole point of that family.
 
 Rules:
 - Output English only.
 - Translate concepts into standard English technical vocabulary; do not invent new terms.
 - Terminology diversity is the synonym family's purpose: its variants must each anchor
-  on a different standard term of art for the same concept, never three rewordings of
-  one term."""
+  on a different standard term of art for the same concept — never repeat a term across
+  the family's variants, and cover as many distinct standard names as the budget allows."""
 
 _QUERY_GEN_USER = """Candidate gap:
 - Setting: {target_setting}
@@ -479,6 +486,40 @@ async def _validate_and_regenerate_variants(llm, intent, budget: int) -> list[st
     return deduped
 
 
+def _cover_standard_terms(intent, variants: list[str]) -> list[str]:
+    """Deterministic term-coverage enforcement for the synonym family.
+
+    The LLM enumerates the standard terms of art (``standard_terms``) but does
+    not reliably anchor one variant per term — observed on fd688ba6 replays:
+    4 terms enumerated (including "unanswerability"), yet 2 of 4 variants
+    drifted back to the gap's own wording. An enumerated-but-unused term is a
+    guaranteed retrieval blind spot: UAEval4RAG ("Unanswerability Evaluation
+    for RAG") was missed exactly because no query ever contained it.
+
+    For every enumerated term no variant covers, append a code-constructed
+    query anchoring that term. Sources match on keywords, so coverage beats
+    phrasing elegance; construction from the intent's own fields keeps the
+    query a faithful paraphrase by definition (it IS the intent plus the term).
+    """
+    if not intent.standard_terms:
+        return variants
+    lowered = [v.lower() for v in variants]
+    missing = []
+    for term in intent.standard_terms:
+        t = (term or "").strip()
+        if not t:
+            continue
+        if not any(t.lower() in v for v in lowered):
+            missing.append(t)
+    if not missing:
+        return variants
+    scope = (intent.task_scope or "").strip()
+    out = list(variants)
+    for t in missing:
+        out.append(f"{t} {scope}".strip())
+    return out
+
+
 async def generate_english_adversarial_queries(db, llm, gap: GapCandidate) -> list[AdversarialQuerySpec]:
     """Two-step generation: fix each family's canonical intent first (structured
     problem/mechanism/intervention/evaluation_setting/task_scope), then produce
@@ -524,6 +565,7 @@ async def generate_english_adversarial_queries(db, llm, gap: GapCandidate) -> li
             intents_summary.append({
                 "family": intent.family, "status": "QUERY_GENERATION_INVALID",
                 "valid_variant_count": len(valid_variants),
+                "standard_terms": intent.standard_terms,
                 "problem": intent.problem, "mechanism": intent.mechanism,
                 "intervention": intent.intervention,
                 "evaluation_setting": intent.evaluation_setting,
@@ -532,9 +574,15 @@ async def generate_english_adversarial_queries(db, llm, gap: GapCandidate) -> li
             continue
         for vi, variant in enumerate(valid_variants):
             specs.append(AdversarialQuerySpec(intent.family, variant, variant_index=vi))
+        constructed = (valid_variants if intent.family != "synonym"
+                       else _cover_standard_terms(intent, valid_variants))
+        for vi, variant in enumerate(constructed[len(valid_variants):], start=len(valid_variants)):
+            specs.append(AdversarialQuerySpec(intent.family, variant, variant_index=vi))
         intents_summary.append({
             "family": intent.family, "status": "VALID",
             "variant_count": len(valid_variants),
+            "standard_terms": intent.standard_terms,
+            "constructed_term_queries": constructed[len(valid_variants):],
             "problem": intent.problem, "mechanism": intent.mechanism,
             "intervention": intent.intervention,
             "evaluation_setting": intent.evaluation_setting,

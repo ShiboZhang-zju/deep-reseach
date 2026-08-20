@@ -194,11 +194,98 @@ async def test_synonym_family_prompt_demands_term_of_art_diversity(temp_db):
     await ag.generate_english_adversarial_queries(db, CapturingLLM(), gap)
 
     system = captured["system"]
-    # Each synonym variant anchors on a DIFFERENT standard term, not a rewording.
-    assert "DIFFERENT" in system
-    assert "terms of art" in system.lower()
+    normalized = " ".join(system.split())
+    # The synonym family must enumerate its distinct terms of art FIRST into the
+    # structured `standard_terms` field, then anchor exactly one variant per term —
+    # the explicit enumeration is what keeps variants from concentrating on one term.
+    assert "standard_terms" in normalized
+    assert "never two variants on the same term" in normalized
+    assert "terms of art" in normalized.lower()
     # The fd688ba6 renaming pattern must be spelled out so the LLM enumerates
     # the actual literature vocabulary instead of echoing the gap's wording.
     for term in ("abstention", "unanswerability", "selective prediction", "sufficiency"):
-        assert term in system, f"terminology example '{term}' missing from prompt"
+        assert term in normalized, f"terminology example '{term}' missing from prompt"
+    db.close()
+
+
+def test_intent_schema_carries_standard_terms():
+    """The structured term enumeration must survive as a schema field — it is
+    what forces term-first thinking during generation."""
+    from app.agent.steps.audit_gaps import IntentWithVariantsSchema
+
+    intent = IntentWithVariantsSchema(
+        family="synonym", problem="ppp", mechanism="mmm", intervention="iii",
+        evaluation_setting="eee", task_scope="ttt",
+        standard_terms=["abstention", "unanswerability", "evidence sufficiency"],
+        variants=["a query", "b query", "c query"])
+    assert intent.standard_terms == ["abstention", "unanswerability", "evidence sufficiency"]
+
+
+def test_cover_standard_terms_appends_queries_for_uncovered_terms():
+    from app.agent.steps.audit_gaps import IntentWithVariantsSchema, _cover_standard_terms
+
+    intent = IntentWithVariantsSchema(
+        family="synonym", problem="ppp", mechanism="mmm", intervention="iii",
+        evaluation_setting="eee", task_scope="LLM code generation self-correction",
+        standard_terms=["abstention", "unanswerability", "evidence sufficiency"],
+        variants=["Evaluating abstention in RAG", "RAG refusal under missing evidence"])
+    out = _cover_standard_terms(intent, ["Evaluating abstention in RAG",
+                                         "RAG refusal under missing evidence"])
+    # Covered term unchanged; uncovered terms each get a term-anchored query.
+    assert len(out) == 4
+    assert any("unanswerability" in q for q in out[2:])
+    assert any("evidence sufficiency" in q for q in out[2:])
+    assert all(q.endswith("LLM code generation self-correction") for q in out[2:])
+
+
+def test_cover_standard_terms_noop_when_covered_or_empty():
+    from app.agent.steps.audit_gaps import IntentWithVariantsSchema, _cover_standard_terms
+
+    intent = IntentWithVariantsSchema(
+        family="synonym", problem="ppp", mechanism="mmm", intervention="iii",
+        evaluation_setting="eee", task_scope="ttt",
+        standard_terms=["abstention"],
+        variants=["Evaluating abstention in RAG", "abstention and refusal metrics"])
+    variants = ["Evaluating abstention in RAG", "abstention and refusal metrics"]
+    assert _cover_standard_terms(intent, variants) == variants
+
+    intent.standard_terms = []
+    assert _cover_standard_terms(intent, variants) == variants
+
+
+@pytest.mark.asyncio
+async def test_synonym_uncovered_terms_get_constructed_queries(temp_db, monkeypatch):
+    """fd688ba6 replays showed the LLM enumerates standard terms but drifts most
+    variants back to the gap's own wording — enumerated-but-unused terms are
+    retrieval blind spots. The generator must deterministically append a
+    term-anchored query for every uncovered enumerated term."""
+    import app.agent.steps.audit_gaps as ag
+
+    async def _always_invariant(canonical_text, variant, threshold):
+        return True
+    monkeypatch.setattr(ag, "_variant_is_invariant", _always_invariant)
+
+    db = temp_db()
+    task, gap = _seed_gap(db)
+    intent = ag.IntentWithVariantsSchema(
+        family="synonym",
+        problem="self-correction is evaluated on sparse test suites",
+        mechanism="sparse tests cannot distinguish accidental from robust correctness",
+        intervention="sparse-to-dense test evaluation",
+        evaluation_setting="HumanEval-style code benchmarks",
+        task_scope="LLM code generation self-correction",
+        standard_terms=["abstention", "unanswerability", "selective prediction"],
+        variants=["query about abstention behaviour",
+                  "query about abstention metrics",
+                  "generic refusal accuracy query"],
+    )
+    llm = IntentLLM([intent])
+    specs = await ag.generate_english_adversarial_queries(db, llm, gap)
+
+    texts = [s.query_text for s in specs]
+    assert any("unanswerability" in t for t in texts), \
+        "uncovered enumerated term must get a constructed query"
+    assert any("selective prediction" in t for t in texts)
+    # Covered term ("abstention") gets no duplicate construction.
+    assert len([t for t in texts if "abstention" in t]) == 2
     db.close()
