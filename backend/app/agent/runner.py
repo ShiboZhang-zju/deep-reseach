@@ -50,7 +50,7 @@ from app.agent.steps import (
     can_remediate,
 )
 from app.agent.steps.analyze_papers import analyze_papers
-from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
+from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION, compute_evidence_fingerprint
 from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION
 from app.agent.steps.narrow_gaps import MAX_NARROW_ATTEMPTS, narrow_audited_gaps
 
@@ -718,15 +718,24 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         task_repo.update_status(db, task_id, "mining_gaps")
         db.commit()
         emit_event(task_id, "status", {"status": "mining_gaps"})
+        # Evidence-sensitive idempotency: hash the CURRENT evidence pool +
+        # question links into the mining input_version. A remediation round adds
+        # evidence without advancing current_round, so without this the version
+        # was unchanged and PhaseRun idempotency skipped mining, discarding the
+        # new evidence. The fingerprint is content-based (stable, sorted rows),
+        # so an unchanged pool hashes identically and only real changes re-mine.
+        evidence_fingerprint = compute_evidence_fingerprint(db, task_id)
         gap_input_version = hashlib.sha256(json.dumps({
             "contract_id": state.contract_id,
             "round": state.current_round,
             "pipeline_version": state.pipeline_version,
             "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+            "evidence_fingerprint": evidence_fingerprint,
         }, sort_keys=True).encode()).hexdigest()
 
         async def _mine_gaps_op(db):
-            return await mine_gap_candidates(db, state, llm, task_id)
+            return await mine_gap_candidates(
+                db, state, llm, task_id, input_version=gap_input_version)
 
         try:
             gaps = await phase_service.execute_phase(

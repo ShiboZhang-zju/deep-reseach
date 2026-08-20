@@ -332,12 +332,20 @@ async def mine_gap_candidates(
     llm,
     task_id: str,
     max_gaps: int = 3,
+    input_version: str = "",
 ) -> list:
     """Create evidence-backed boundary/evaluation gap candidates.
 
     This MVP step deliberately mines only gap types that can be grounded in
     limitations, negative results, evaluation, and comparison evidence. It does
     not infer that missing evidence alone is a research gap.
+
+    input_version is the evidence-sensitive fingerprint (the same hash the
+    runner embeds in the mining phase's input_version). The existing-gap
+    short-circuit binds to it: when remediation adds evidence, the fingerprint
+    changes, the short-circuit misses, and mining re-runs on the richer pool
+    instead of reusing gaps mined from the old pool. Legacy calls without an
+    input_version keep the round-based short-circuit for backward compatibility.
     """
     if not state.contract_id:
         logger.warning("Task %s: skip gap mining without an active contract", task_id[:8])
@@ -348,10 +356,16 @@ async def mine_gap_candidates(
         logger.warning("Task %s: skip gap mining without an active contract record", task_id[:8])
         return []
 
-    existing = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, contract.id)
-                if gap.mining_policy_version == GAP_MINING_POLICY_VERSION
-                and gap.mining_round == state.current_round
-                and gap.status not in {"rejected", "superseded"}]
+    if input_version:
+        existing = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, contract.id)
+                    if gap.mining_policy_version == GAP_MINING_POLICY_VERSION
+                    and gap.mining_input_version == input_version
+                    and gap.status not in {"rejected", "superseded"}]
+    else:
+        existing = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, contract.id)
+                    if gap.mining_policy_version == GAP_MINING_POLICY_VERSION
+                    and gap.mining_round == state.current_round
+                    and gap.status not in {"rejected", "superseded"}]
     if existing:
         state.active_gap_ids = [gap.id for gap in existing if gap.status != "rejected"]
         return existing
@@ -546,6 +560,7 @@ async def mine_gap_candidates(
             novelty_score=candidate.novelty_score, feasibility_score=candidate.feasibility_score,
             significance_score=candidate.significance_score,
             mining_policy_version=GAP_MINING_POLICY_VERSION,
+            mining_input_version=input_version,
         )
         # Only admitted evidence gets linked; an unoffered ID would otherwise
         # create a gap-evidence link pointing at nothing.
