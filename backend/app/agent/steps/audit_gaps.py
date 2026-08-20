@@ -847,6 +847,7 @@ async def audit_gap_candidate(
     # scored papers are reused, so this never re-hits the LLM for the same
     # (gap, paper) under the same scoring version.
     try:
+        from app.config import settings
         scored = await score_all_gap_candidates(
             db, llm, gap, admission.candidate_paper_ids, task_id)
         if scored:
