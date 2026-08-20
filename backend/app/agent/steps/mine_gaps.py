@@ -1,6 +1,7 @@
 """Step: Mine lightweight, evidence-backed research gap candidates."""
 
 import asyncio
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -44,6 +45,42 @@ GAP_MINING_POLICY_VERSION = "evidence-admission-v4"
 # "confirmed" once — the single most damaging false signal a research-idea
 # system can emit.
 _GAP_DEDUP_SIMILARITY = 0.85
+
+
+def compute_evidence_fingerprint(db, task_id: str) -> str:
+    """Stable content fingerprint of the evidence pool + question links.
+
+    Evidence-sensitive idempotency for gap mining: the runner hashes this
+    fingerprint into the mining phase's input_version, so an O2 remediation
+    round that adds evidence changes the fingerprint and therefore the input
+    version, which makes PhaseRun idempotency re-run admission + mining on the
+    richer pool instead of skipping them as "already done".
+
+    The fingerprint is content-based (stable identity fields, sorted rows,
+    floats rounded) — NOT a count — so the same pool always hashes identically
+    while any added/replaced evidence or relinked question changes it.
+    """
+    evidence = db.query(EvidenceUnit).filter(EvidenceUnit.task_id == task_id).all()
+    ev_rows = sorted(
+        (e.id, e.paper_id, e.evidence_type, e.verification_status,
+         round(e.extraction_confidence or 0.0, 3))
+        for e in evidence
+    )
+    question_ids = {
+        q.id for q in db.query(ResearchQuestion)
+        .filter(ResearchQuestion.task_id == task_id).all()
+    }
+    links = db.query(QuestionEvidenceLink).all()
+    link_rows = sorted(
+        (l.question_id, l.evidence_id, l.relation_type,
+         round(l.relevance_score or 0.0, 3))
+        for l in links if l.question_id in question_ids
+    )
+    payload = json.dumps(
+        {"evidence": ev_rows, "links": link_rows},
+        sort_keys=True, ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _gap_fingerprint(observed_problem, missing_capability, claimed_delta) -> str:

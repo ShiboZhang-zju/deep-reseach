@@ -853,6 +853,12 @@ class GapCandidate(Base):
     # Mining context
     mining_round = Column(Integer, nullable=False, default=0)
     mining_policy_version = Column(Text, default="")
+    # Evidence fingerprint the gap was mined from (evidence-sensitive
+    # idempotency): a remediation round adds evidence, changes the fingerprint,
+    # and the existing-gap short-circuit no longer matches, so mining re-runs
+    # and the new evidence can surface new gaps. NULL for legacy rows (never
+    # matches a non-empty fingerprint -> resume re-mines once).
+    mining_input_version = Column(Text, default="")
 
     # Assessment (populated in Phase 3C audit)
     novelty_score = Column(Float)
