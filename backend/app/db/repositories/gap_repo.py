@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import (
     GapCandidate, GapEvidenceLink, GapAudit, NeighborComparison,
-    GapAtomicClaim, NeighborClaimCoverage,
+    GapAtomicClaim, NeighborClaimCoverage, GapPaperRelevance,
     EvidenceUnit, ResearchContract,
 )
 
@@ -351,6 +351,55 @@ def list_neighbor_comparisons(db: Session, gap_id: str) -> list[NeighborComparis
     return db.query(NeighborComparison).filter(
         NeighborComparison.gap_id == gap_id,
     ).order_by(NeighborComparison.similarity_score.desc()).all()
+
+
+# === GapPaperRelevance (0027: gap-specific prior-art screening) ===
+
+def upsert_gap_paper_relevance(
+    db: Session, gap_id: str, paper_id: str, task_id: str,
+    relevance_score: float, problem_overlap: str = "", mechanism_overlap: str = "",
+    evaluation_overlap: str = "", claim_overlap: str = "",
+    addresses_claim_ids: list[str] | None = None, rationale: str = "",
+    scoring_version: str = "gap-rel-v1",
+) -> GapPaperRelevance:
+    row = db.query(GapPaperRelevance).filter(
+        GapPaperRelevance.gap_id == gap_id,
+        GapPaperRelevance.paper_id == paper_id,
+    ).first()
+    if row is None:
+        row = GapPaperRelevance(
+            gap_id=gap_id, paper_id=paper_id, task_id=task_id,
+            relevance_score=relevance_score, problem_overlap=problem_overlap,
+            mechanism_overlap=mechanism_overlap, evaluation_overlap=evaluation_overlap,
+            claim_overlap=claim_overlap,
+            addresses_claim_ids_json=json.dumps(addresses_claim_ids or []),
+            rationale=rationale, scoring_version=scoring_version,
+        )
+        db.add(row)
+    else:
+        row.relevance_score = relevance_score
+        row.problem_overlap = problem_overlap
+        row.mechanism_overlap = mechanism_overlap
+        row.evaluation_overlap = evaluation_overlap
+        row.claim_overlap = claim_overlap
+        row.addresses_claim_ids_json = json.dumps(addresses_claim_ids or [])
+        row.rationale = rationale
+        row.scoring_version = scoring_version
+    db.flush()
+    return row
+
+
+def list_gap_paper_relevance(db: Session, gap_id: str) -> list[GapPaperRelevance]:
+    return db.query(GapPaperRelevance).filter(
+        GapPaperRelevance.gap_id == gap_id,
+    ).order_by(GapPaperRelevance.relevance_score.desc()).all()
+
+
+def get_gap_paper_relevance(db: Session, gap_id: str, paper_id: str) -> GapPaperRelevance | None:
+    return db.query(GapPaperRelevance).filter(
+        GapPaperRelevance.gap_id == gap_id,
+        GapPaperRelevance.paper_id == paper_id,
+    ).first()
 
 
 # === GapAtomicClaim (Phase 3H: canonical atomic claims) ===

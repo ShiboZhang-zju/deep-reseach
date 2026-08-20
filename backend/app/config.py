@@ -296,6 +296,22 @@ class Settings(BaseSettings):
     family_stability_floor: float = 0.3         # per-family floor -> flag that family, not the whole gap
     family_instability_more_search_budget: int = 2  # max family-instability-triggered more_search rounds
     variant_invariance_embedding_threshold: float = 0.7  # variant vs canonical intent cosine floor (cheap guardrail)
+
+    # 0027: Gap-specific prior-art screening (false-novelty audit, fd688ba6).
+    # TaskPaper.final_score measures task/RQ relevance; the NPA audit needs
+    # "how close is this paper to THIS gap". Audit-recalled papers were stored
+    # with final_score=NULL and then out-ranked by broad surveys in neighbor
+    # selection, so direct prior art never reached the NPA pool. These weights
+    # aggregate the qualitative overlap judgments into gap_relevance — kept as
+    # configurable heuristics, not scientific truth, pending calibration on
+    # historical tasks.
+    gap_relevance_claim_weight: float = 0.4
+    gap_relevance_problem_weight: float = 0.35
+    gap_relevance_evaluation_weight: float = 0.25
+    # Max audit-recalled papers to score per gap in the cheap screen; the deep
+    # NPA audit then runs on the Top-M only (two-stage, keeps 200+ pools cheap).
+    gap_relevance_screen_top_m: int = 20
+    gap_relevance_scoring_version: str = "gap-rel-v1"
     variant_regenerate_budget: int = 2          # per-variant regenerate attempts before dropping
 
     @property

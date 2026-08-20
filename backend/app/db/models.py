@@ -1133,6 +1133,44 @@ class NeighborComparison(Base):
     )
 
 
+class GapPaperRelevance(Base):
+    """Structured relevance of one paper to ONE specific gap (0027).
+
+    Gap-specific prior-art screening (false-novelty audit, fd688ba6):
+    TaskPaper.final_score measures task/RQ relevance, but the NPA audit needs
+    "how close is this paper to THIS gap". Audit-recalled papers were stored
+    with final_score=NULL and then out-ranked by broad surveys in neighbor
+    selection, so direct prior art never reached the NPA pool. This is a
+    many-to-many (gap, paper) table scored cheaply on title+abstract BEFORE
+    the deep NPA audit; overlap fields are qualitative (yes/partial/no) and
+    relevance_score is aggregated by code (never taken verbatim from the LLM).
+    """
+
+    __tablename__ = "gap_paper_relevance"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    gap_id = Column(String, ForeignKey("gap_candidates.id"), nullable=False)
+    paper_id = Column(String, ForeignKey("papers.id"), nullable=False)
+    task_id = Column(String, ForeignKey("research_tasks.id"), nullable=False)
+
+    relevance_score = Column(Float, nullable=False, default=0.0)
+    problem_overlap = Column(String)          # yes / partial / no
+    mechanism_overlap = Column(String)        # yes / partial / no
+    evaluation_overlap = Column(String)       # yes / partial / no
+    claim_overlap = Column(String)            # yes / partial / no
+    addresses_claim_ids_json = Column(Text, default="[]")
+    rationale = Column(Text)
+    scoring_version = Column(String, default="gap-rel-v1")
+
+    created_at = Column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_gpr_gap", "gap_id"),
+        Index("idx_gpr_paper", "paper_id"),
+        Index("idx_gpr_unique", "gap_id", "paper_id", unique=True),
+    )
+
+
 class GapAtomicClaim(Base):
     """A canonical atomic claim derived from a gap's claimed delta (Phase 3H).
 

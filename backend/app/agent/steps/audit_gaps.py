@@ -12,6 +12,7 @@ from app.agent.state import ResearchState
 from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
+from app.agent.steps.gap_relevance import score_all_gap_candidates
 from app.db.models import (EvidenceUnit, GapAudit, GapCandidate, Paper, QuestionEvidenceLink,
                           SearchQueryPaper, SearchQueryRecord, SearchRawResult, TaskPaper)
 from app.db.repositories import gap_repo, paper_repo, task_repo
@@ -638,7 +639,33 @@ def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS):
         tp = db.query(TaskPaper).filter(TaskPaper.task_id == gap.task_id, TaskPaper.paper_id == paper_id).first()
         score = 0.4 * item["hits"] + 0.3 * len(item["families"]) + 0.2 / (item["best_rank"] + 1) + 0.1 * len(item["sources"]) + 0.1 * (tp.final_score or 0 if tp else 0)
         ranked.append((score, paper))
-    ranked.sort(key=lambda item: item[0], reverse=True)
+    # 0027: gap-specific relevance gate (two-stage). Cheap title/abstract gap
+    # relevance is the PRIMARY screening signal: direct prior art must not be
+    # out-ranked by a broad survey that merely gets hit by many queries. We keep
+    # the legacy formula untouched but restrict it to the gap-relevance Top-M,
+    # so a generic survey cannot crowd the NPA pool any more. Papers without a
+    # score (never screened) keep their legacy rank rather than being dropped.
+    if ranked:
+        from app.config import settings
+        rel_map = {row.paper_id: row.relevance_score
+                   for row in gap_repo.list_gap_paper_relevance(db, gap.id)}
+        # Gate only activates when at least one candidate was actually scored;
+        # otherwise this degrades to the legacy formula untouched (e.g. when
+        # the screening LLM call failed or the score is disabled).
+        if rel_map and settings.gap_relevance_screen_top_m > 0:
+            m = settings.gap_relevance_screen_top_m
+            # PRIMARY: gap-specific relevance (desc) — a directly relevant paper
+            # must NOT be crowded out of the NPA pool by a broad survey that
+            # merely gets hit by many queries. SECONDARY: legacy score as a
+            # tie-break only. Unscored papers sort below any scored one
+            # (rel_map -1.0). Top-M bounds how many candidates the deep NPA
+            # audit has to look at; the final Top-K keeps this relevance-first
+            # order (relevant papers first, legacy rank as tie-break).
+            ranked.sort(key=lambda item: (-rel_map.get(item[1].id, -1.0),
+                                          -item[0], item[1].id))
+            ranked = ranked[:max(limit, m)]
+        else:
+            ranked.sort(key=lambda item: item[0], reverse=True)
     neighbors = [paper for _, paper in ranked[:limit]]
     if len(neighbors) >= limit:
         return neighbors
@@ -812,6 +839,32 @@ async def audit_gap_candidate(
         )
         db.commit()
         return GapAuditResult(gap.id, "uncertain", "more_search", "")
+    # 0027: gap-specific prior-art screening. Score every audit-recalled paper
+    # on title+abstract against THIS gap (cheap), persist gap_paper_relevance,
+    # and expose the ranked list to the NPA selector. Direct prior art that a
+    # broad survey out-ranks on raw query hits must not be invisible to the
+    # audit because it never got a gap-specific score. Safe on replay: already
+    # scored papers are reused, so this never re-hits the LLM for the same
+    # (gap, paper) under the same scoring version.
+    try:
+        scored = await score_all_gap_candidates(
+            db, llm, gap, admission.candidate_paper_ids, task_id)
+        if scored:
+            paper_repo.save_trace(db, task_id, "gap_paper_relevance_screen", "decision",
+                                  output_data={
+                                      "gap_id": gap.id,
+                                      "scoring_version": settings.gap_relevance_scoring_version,
+                                      "top": [
+                                          {"paper_id": pid, "gap_relevance": score,
+                                           "claim_overlap": getattr(s, "claim_overlap", None),
+                                           "problem_overlap": getattr(s, "problem_overlap", None),
+                                           "evaluation_overlap": getattr(s, "evaluation_overlap", None)}
+                                          for pid, score, s in scored[:20]
+                                      ],
+                                  })
+    except Exception as exc:
+        logger.warning("Gap %s: gap-relevance screening failed (non-fatal): %s",
+                       gap.id[:8], exc)
     neighbors = select_gap_specific_neighbors(db, gap, admission.completed_query_ids)
     # Recall waterfall diagnostic: record per-family raw/canonical/post-filter/
     # final overlap on every admitted audit (not only confirmed gaps), so the
