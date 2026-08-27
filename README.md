@@ -928,8 +928,9 @@ async def run_task(task_id: str):
 - [x] **hypothesis cluster 门禁**（P2-A，EXPERIMENT_GENERATION_POLICY_VERSION = hypothesis-cluster-v2）：同 Gap 多干预按"检验的假设"聚簇，同簇 1 Idea + 变体并入消融臂；Idea 四级分类（executable_candidate / conditional_review / research_direction_only / rejected）由代码门禁定级，评分只排序
 - [x] **idea 级 novelty 快检**（P2-C）：cluster 假设 + 机制生成 3 条对抗查询（含 adjacent-domain 家族引入相邻领域文献），命中直接实现 → 降级 conditional_review + METHOD_ALREADY_PUBLISHED；基础设施失败只记 trace 不降级
 - [x] **idea 元数据差异化**（P2-B）：title 按机制命名（禁前缀 + 代码 strip 兜底）、method_sketch 用 idea 视角概述（idea_method）、motivation 逐字引用证据 claim、重跑时旧代 idea 全部 superseded（单代呈现）
+- [x] **实验计划一致性门禁**（EXPERIMENT_GENERATION_POLICY_VERSION = experiment-consistency-v6）：STATISTICAL_TEST_MISMATCH——比例型配对指标（pass rate / regression rate / accuracy 等）配 plain t-test 且未列非参数替代（McNemar / Wilcoxon / permutation / bootstrap）即拒；MODEL_SCOPE_CONFLICT 泛化——从 gap 的 target_setting 提取参数上限（`<N b` 符号或 "under/below/smaller than N b" 文字）或 SLM 关键词（默认 7B cap，含 "SLMs" 复数），model_spec 中数值越界即拒；两项均纳入反馈重试（拒绝原因回传重写一次）；生成 prompt 同步前置统计方法与模型范围规则，让首次生成即合规（v5 实测：仅靠拒绝重试时 LLM 重写仍写 t-test，prompt 前置后 v6 三计划一次通过）
 - [x] **LLM 供应商熔断**：连续 2 次失败冷却（30s 起步指数退避，上限 300s）
-- [x] **测试**：后端 335 个测试通过
+- [x] **测试**：后端 338 个测试通过
 
 **E2E 实证**（任务 23ec8f20，Test-Time Verification 主题，三次续跑迭代）：560 篇论文 → 2 个 surviving Gap（收窄链 v1 partially_closed → narrow → v2 confirmed 完整走通）→ 5 个 passed interventions 聚 3 簇 → 3 个 Idea（2 executable + 1 conditional_review）+ 3 份实验计划，终态 `waiting_for_user_review`。对照基线任务 9e56a131（修复前同主题）：9 个候选 Gap 全部 inconclusive、0 Idea、`no_surviving_gap_after_audit`。
 

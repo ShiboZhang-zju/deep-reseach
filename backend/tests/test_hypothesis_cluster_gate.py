@@ -440,7 +440,83 @@ async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
 
 def test_policy_version_bumped():
     """The experiment policy version encodes the novelty-check rules."""
-    assert EXPERIMENT_GENERATION_POLICY_VERSION == "idea-metadata-v4"
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v6"
+
+
+def _plan(**overrides):
+    from app.agent.steps.generate_minimal_experiments import MinimalExperimentSchema
+    base = dict(
+        title="Diff-Risk Classification for Self-Correction Filtering",
+        idea_method="We hypothesize that filtering stylistic corrections reduces regressions.",
+        summary="Compare filtered vs unfiltered self-correction on HumanEval.",
+        hypothesis="Filtering stylistic-only corrections reduces functional regression rate.",
+        dataset="HumanEval with injected stylistic noise",
+        baselines="apply-all corrections; heuristic filter",
+        metrics="pass@1 delta and regression rate across 164 problems",
+        model_spec="Qwen2.5-Coder-7B-Instruct",
+        dataset_provenance="Inject stylistic edits verified function-preserving",
+        oracle="Python execution engine plus 10% human adjudication",
+        statistical_analysis="Paired t-test on per-problem pass/fail deltas (p<0.05).",
+        resource_budget="CPU-only, <2 hours",
+        scenario_atoms=["verifier"],
+        controls=["no-correction", "apply-all"],
+        steps=["Build dataset", "Run corrections", "Evaluate"],
+        success_condition="Regression rate drops by >5% relative",
+        falsification_condition="No significant difference",
+        risks="Synthetic noise may not reflect real stylistic edits",
+    )
+    base.update(overrides)
+    return MinimalExperimentSchema(**base)
+
+
+def test_statistical_test_mismatch_on_ratio_metric_with_ttest():
+    """Ratio-style paired metrics analyzed by a plain t-test without a
+    non-parametric alternative must be flagged (E2E 2026-08-26 review)."""
+    from app.agent.steps.generate_minimal_experiments import _validate_experiment_plan
+    plan = _plan(statistical_analysis="Paired t-test on pass/fail outcomes (p<0.05).")
+    failures = _validate_experiment_plan(plan, phenomenon=None, expected_atoms=[], gap_text="")
+    assert "STATISTICAL_TEST_MISMATCH" in failures
+
+
+def test_statistical_test_passes_with_nonparametric_or_nonratio():
+    from app.agent.steps.generate_minimal_experiments import _validate_experiment_plan
+    # Non-parametric alternative named -> clean.
+    plan = _plan(statistical_analysis="McNemar's test on paired pass/fail outcomes.")
+    failures = _validate_experiment_plan(plan, phenomenon=None, expected_atoms=[], gap_text="")
+    assert "STATISTICAL_TEST_MISMATCH" not in failures
+    # t-test but ratio wording absent from metrics -> clean (conservative).
+    plan2 = _plan(statistical_analysis="Paired t-test (p<0.05).",
+                  metrics="mean edit distance and latency milliseconds")
+    failures2 = _validate_experiment_plan(plan2, phenomenon=None, expected_atoms=[], gap_text="")
+    assert "STATISTICAL_TEST_MISMATCH" not in failures2
+
+
+def test_model_scope_conflict_generalized():
+    from app.agent.steps.generate_minimal_experiments import _validate_experiment_plan
+    # Numeric cap from target_setting: <7B scope vs an 8B checkpoint.
+    plan = _plan(model_spec="Llama-3-8B-Instruct")
+    failures = _validate_experiment_plan(plan, phenomenon=None, expected_atoms=[],
+                                         gap_text="study small models under 7B parameters in code generation")
+    assert "MODEL_SCOPE_CONFLICT" in failures
+    # SLM keyword scope: defaults to a 7B cap.
+    plan2 = _plan(model_spec="Llama-3-13B-Instruct")
+    failures2 = _validate_experiment_plan(plan2, phenomenon=None, expected_atoms=[],
+                                          gap_text="applies to small language models generating code")
+    assert "MODEL_SCOPE_CONFLICT" in failures2
+    # Plural "SLMs" counts too (task 23ec8f20: gap target_setting said "SLMs or
+    # static analyzers" while plans used Llama-3-8B).
+    plan2b = _plan(model_spec="Llama-3-8B-Instruct")
+    failures2b = _validate_experiment_plan(plan2b, phenomenon=None, expected_atoms=[],
+                                           gap_text="Test-time self-correction using SLMs under compute budgets")
+    assert "MODEL_SCOPE_CONFLICT" in failures2b
+    # Within scope: 7B under a <7B cap is fine, and no scope wording means no check.
+    plan3 = _plan()
+    failures3 = _validate_experiment_plan(plan3, phenomenon=None, expected_atoms=[],
+                                          gap_text="scope: models smaller than 7B")
+    assert "MODEL_SCOPE_CONFLICT" not in failures3
+    plan4 = _plan(model_spec="GPT-4o")
+    failures4 = _validate_experiment_plan(plan4, phenomenon=None, expected_atoms=[], gap_text="")
+    assert "MODEL_SCOPE_CONFLICT" not in failures4
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,14 @@ For dataset and baselines, be concrete enough to actually run:
   hypothesis -> method -> expected outcome. Do NOT restate the intervention's
   engineering description; drop implementation details a reader of the idea does
   not need to judge the contribution.
+- STATISTICS: ratio-style paired metrics (pass rate, regression rate, accuracy,
+  success rate, proportions) must be analyzed with McNemar's test, Wilcoxon
+  signed-rank, a permutation test, or bootstrap confidence intervals — NEVER a
+  plain (paired) t-test on proportions. Continuous metrics (latency, edit
+  distance) may use t-tests.
+- MODEL SCOPE: honor the gap's compute/parameter scope verbatim — if the gap
+  targets small language models (<7B / SLM), the model_spec must stay within
+  that bound.
 """
 
 # Bumped when the experiment-generation RULES change so a resumed task
@@ -60,7 +68,17 @@ For dataset and baselines, be concrete enough to actually run:
 # mechanism (prefix-free), idea_method replaces verbatim intervention copying,
 # motivations quote evidence claims verbatim, and ideas from a previous
 # generation round are soft-deleted (superseded) when the phase re-runs.
-EXPERIMENT_GENERATION_POLICY_VERSION = "idea-metadata-v4"
+# v5 (2026-08-27): plan-consistency gates — STATISTICAL_TEST_MISMATCH (ratio
+# metrics analyzed by plain t-test with no non-parametric alternative) and
+# generalized MODEL_SCOPE_CONFLICT (numeric cap or SLM scope from the gap's
+# target_setting vs the plan's model_spec).
+# v6 (2026-08-27): fixes from the v5 E2E run — "SLMs" plural now matches the
+# scope keyword (target_setting "using SLMs" previously escaped the 7B cap
+# while plans used Llama-3-8B); the generation prompt now states the
+# statistics rule (McNemar/Wilcoxon/permutation/bootstrap for ratio metrics)
+# and model-scope rule up front so the feedback retry is not the model's
+# first exposure to them (v5 run: both retries rewrote t-test as t-test).
+EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v6"
 
 # Initial calibration point; revisit against historical task annotations (P3)
 # before changing — cluster merges REDUCE idea counts, so false merges are the
@@ -499,13 +517,67 @@ def _validate_experiment_plan(
     for atom in atoms:
         if not _text_has_atom(plan_text, atom):
             failures.append(f"SCENARIO_MISMATCH:{atom}")
-    scope_match = re.search(r"(?:<|<=|≤)\s*7\s*b", gap_text.lower())
-    if scope_match and re.search(r"(?:8|9|1[0-9])\s*b", plan.model_spec.lower()):
-        failures.append("MODEL_SCOPE_CONFLICT")
+    failures.extend(_check_model_scope(gap_text, plan.model_spec))
+    failures.extend(_check_statistical_method(plan))
     oracle_text = plan.oracle.lower()
     if "llm" in oracle_text and not any(term in oracle_text for term in ("execution", "test", "static", "formal", "human", "hidden")):
         failures.append("LLM_ONLY_ORACLE")
     return list(dict.fromkeys(failures))
+
+
+# Ratio-style metrics measured as paired binary outcomes (each sample
+# passes/fails, each correction regresses or not) need McNemar / Wilcoxon /
+# bootstrap / exact tests; a plain t-test on proportions is the documented
+# misuse (E2E 2026-08-26 review: "regression rate" compared with paired t-test).
+_RATIO_METRIC_TERMS = (
+    "pass rate", "pass@", "accuracy", "error rate", "failure rate",
+    "regression rate", "success rate", "proportion", "percentage of",
+)
+_NONPARAMETRIC_TERMS = (
+    "mcnemar", "wilcoxon", "bootstrap", "permutation test", "exact test",
+    "binomial", "sign test", "confidence interval via bootstrap",
+)
+
+
+def _check_statistical_method(plan: MinimalExperimentSchema) -> list[str]:
+    """STATISTICAL_TEST_MISMATCH: ratio-style paired metrics analyzed with a
+    plain t-test and no non-parametric / resampling alternative named."""
+    stats_text = (plan.statistical_analysis or "").lower()
+    metrics_text = (plan.metrics or "").lower()
+    has_ttest = any(term in stats_text for term in ("t-test", "t test", "student's t", "paired t"))
+    has_ratio_metric = any(term in metrics_text for term in _RATIO_METRIC_TERMS)
+    has_nonparametric = any(term in stats_text for term in _NONPARAMETRIC_TERMS)
+    if has_ttest and has_ratio_metric and not has_nonparametric:
+        return ["STATISTICAL_TEST_MISMATCH"]
+    return []
+
+
+def _check_model_scope(gap_text: str, model_spec: str) -> list[str]:
+    """MODEL_SCOPE_CONFLICT (generalized): the gap bounds the model size — an
+    explicit '<N b' style cap, or a 'small language model / SLM' scope — but the
+    plan's model_spec names a strictly larger checkpoint. E2E 2026-08-26 review:
+    scope '<7B' with experiments on Llama-3-8B. Conservative by design: only a
+    numeric parameter count above the extracted cap (or the SLM default of 7B)
+    triggers; vague wording never does."""
+    text = (gap_text or "").lower()
+    spec = (model_spec or "").lower()
+    if not spec:
+        return []
+    cap: float | None = None
+    m = re.search(
+        r"(?:<|<=|≤|under|below|smaller than|less than|up to)\s*(\d+(?:\.\d+)?)\s*b\b",
+        text,
+    )
+    if m:
+        cap = float(m.group(1))
+    elif re.search(r"\b(?:small language models?|small models?|slms?)\b", text):
+        cap = 7.0
+    if cap is None:
+        return []
+    for num in re.findall(r"\b(\d+(?:\.\d+)?)\s*b\b", spec):
+        if float(num) > cap:
+            return ["MODEL_SCOPE_CONFLICT"]
+    return []
 
 
 def _normalize_idea_title(title: str) -> str:
@@ -627,8 +699,11 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             GapPhenomenonPlan.task_id == task_id,
         ).order_by(GapPhenomenonPlan.created_at.desc()).first()
         expected_atoms = _derive_scenario_atoms(gap, audit, phenomenon)
+        # target_setting carries the model/compute scope (e.g. "<7B", "SLM") that
+        # MODEL_SCOPE_CONFLICT checks against the plan's model_spec.
         gap_text = " ".join([
-            gap.observed_problem or "", gap.claimed_delta or "", gap.testable_hypothesis or "",
+            gap.target_setting or "", gap.observed_problem or "",
+            gap.claimed_delta or "", gap.testable_hypothesis or "",
             gap.residual_gap or "", (audit.remaining_delta if audit else "") or "",
         ])
 
