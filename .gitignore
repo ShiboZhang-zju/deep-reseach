@@ -37,6 +37,16 @@ backend/tests/audit_report.txt
 backend/_*.py
 backend/_*.txt
 
+# ===== Workspace scratch: E2E poll snapshots / runtime dumps / commit msgs =====
+_*.json
+_*.jsonl
+_*.txt
+.e2e_runtime_*/
+
+# ===== Research-session artifacts (working notes, not source of truth) =====
+research_report_*.md
+research_plan_*.md
+
 # ===== Node.js / Frontend =====
 node_modules/
 frontend/dist/
