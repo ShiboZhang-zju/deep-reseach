@@ -69,6 +69,8 @@ def _audit_to_out(audit) -> GapAuditOut:
         audit_confidence=audit.audit_confidence,
         recommended_action=audit.recommended_action or "continue",
         rejection_reason=audit.rejection_reason,
+        failure_reason_codes=json.loads(audit.failure_reason_codes_json or "[]"),
+        evidence_delta=json.loads(audit.evidence_delta_json or "{}"),
         audit_round=audit.audit_round,
         created_at=audit.created_at.isoformat() + "+00:00" if audit.created_at else "",
     )

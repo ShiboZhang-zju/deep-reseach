@@ -183,6 +183,8 @@ class ResearchIdea(Base):
     risk = Column(Float)
     final_score = Column(Float)
     decision = Column(String)
+    score_status = Column(String, default="unscored")
+    score_error = Column(Text)
     related_paper_ids_json = Column(Text)
     # O1: graded output inherited from the backing intervention —
     # A / B / C confidence tier so users see a ranked list of directions
@@ -191,6 +193,8 @@ class ResearchIdea(Base):
     user_selected = Column(Boolean, default=False)
     # P1-5: soft-delete support for idea retry — 'active' (default) or 'superseded'
     idea_status = Column(String, default="active")
+    # P0/P1: deterministic quality classification and machine-readable blockers.
+    quality_reason_codes_json = Column(Text, default="[]")
     created_at = Column(DateTime, default=_utcnow)
 
     task = relationship("ResearchTask", back_populates="ideas")
@@ -212,6 +216,13 @@ class ExperimentPlan(Base):
     dataset = Column(Text)
     baselines = Column(Text)
     metrics = Column(Text)
+    # P1: structured experiment consistency contract.
+    model_spec = Column(Text)
+    dataset_provenance = Column(Text)
+    oracle = Column(Text)
+    statistical_analysis = Column(Text)
+    resource_budget = Column(Text)
+    scenario_atoms_json = Column(Text, default="[]")
     steps_markdown = Column(Text)
     steps_json = Column(Text)
     risks = Column(Text)
@@ -712,14 +723,18 @@ class SearchQueryRecord(Base):
         Index("idx_sqr_question", "target_question_id"),
         Index("idx_sqr_gap", "target_gap_id"),
         # Phase 3A Closure: Two partial unique indexes replace the old
-        # single unique index to support gap-driven queries.
+        # single unique index to support gap-driven queries. The search policy
+        # is part of the identity so a policy revision can create a fresh
+        # audit query without colliding with an older policy's record.
         # Discovery queries (target_gap_id IS NULL):
         Index("idx_sqr_unique_discovery", "task_id", "round_number",
-              "normalized_query_text", "target_question_id", unique=True,
+              "normalized_query_text", "target_question_id",
+              "search_policy_version", unique=True,
               sqlite_where=text("target_gap_id IS NULL")),
         # Gap queries (target_gap_id IS NOT NULL):
         Index("idx_sqr_unique_gap", "task_id", "round_number",
-              "normalized_query_text", "target_gap_id", unique=True,
+              "normalized_query_text", "target_gap_id",
+              "search_policy_version", unique=True,
               sqlite_where=text("target_gap_id IS NOT NULL")),
     )
 
@@ -1070,6 +1085,12 @@ class GapAudit(Base):
     # The gap's claimed_delta at the time of this audit. An audit judges exactly
     # that claim, so a later run needs it to tell "nothing changed, the verdict
     # would be identical" apart from "the claim was narrowed, judge it again".
+
+    # Audit diagnostics: machine-readable cause and marginal information. These
+    # are separate from rejection_reason because an uncertain audit need not be
+    # a rejection and may have several independent retrieval causes.
+    failure_reason_codes_json = Column(Text, default="[]")
+    evidence_delta_json = Column(Text, default="{}")
 
     # Audit metadata
     audit_round = Column(Integer, nullable=False, default=0)

@@ -99,7 +99,10 @@ class IdeaOut(BaseModel):
     risk: float | None = None
     final_score: float | None = None
     decision: str | None = None
+    score_status: str = "unscored"
+    score_error: str | None = None
     related_paper_ids_json: str | None = None
+    quality_reason_codes_json: str | None = None
     confidence_tier: str | None = None  # O1: A / B / C graded output
     user_selected: bool = False
     idea_status: str = "active"  # P1-5: active / superseded
@@ -116,6 +119,12 @@ class ExperimentOut(BaseModel):
     dataset: str | None = None
     baselines: str | None = None
     metrics: str | None = None
+    model_spec: str | None = None
+    dataset_provenance: str | None = None
+    oracle: str | None = None
+    statistical_analysis: str | None = None
+    resource_budget: str | None = None
+    scenario_atoms_json: str | None = None
     steps_markdown: str | None = None
     steps_json: str | None = None
     risks: str | None = None
@@ -616,7 +625,7 @@ class PaperRoleOut(BaseModel):
 class EvidenceExtractionSchema(BaseModel):
     """LLM output schema for evidence extraction from a paper chunk."""
     evidence_type: EvidenceType
-    normalized_claim: str = Field(..., min_length=5, description="归一化的claim（中文）")
+    normalized_claim: str | None = Field(None, min_length=5, description="归一化的claim（中文）")
     original_span: str = Field("", description="原文片段")
     dataset_name: str | None = None
     metric_name: str | None = None
@@ -760,6 +769,8 @@ class GapAuditOut(BaseModel):
     audit_confidence: float | None = None
     recommended_action: str = "continue"
     rejection_reason: str | None = None
+    failure_reason_codes: list[str] = Field(default_factory=list)
+    evidence_delta: dict = Field(default_factory=dict)
     audit_round: int = 0
     created_at: str
 

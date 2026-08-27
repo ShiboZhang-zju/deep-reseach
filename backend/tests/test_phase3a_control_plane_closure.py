@@ -150,6 +150,9 @@ def test_orm_alembic_consistency(temp_db):
     assert 'idx_sqr_unique_discovery' in index_names, f"Missing discovery unique index: {index_names}"
     assert 'idx_sqr_unique_gap' in index_names, f"Missing gap unique index: {index_names}"
     assert 'idx_sqr_unique' not in index_names, "Old unique index should be dropped"
+    index_columns = {idx['name']: idx['column_names'] for idx in sqr_indexes}
+    assert index_columns['idx_sqr_unique_discovery'][-1] == 'search_policy_version'
+    assert index_columns['idx_sqr_unique_gap'][-1] == 'search_policy_version'
 
 
 # === Test 4: Two gaps with same query don't cross-wire ===
@@ -209,10 +212,71 @@ def test_same_gap_same_query_idempotent(temp_db):
     db.commit()
 
     assert r1.id == r2.id
+
+    # query_family is descriptive metadata, so a duplicate normalized query
+    # from another family reuses the same database identity.
+    r3 = save_search_query(db, task.id, "QUERY", "gap_synonym",
+                           None, None, 1, target_gap_id=gap.id,
+                           query_family="synonym", search_policy_version="")
+    assert r3.id == r1.id
+
+    # A policy revision has a distinct identity and must persist separately.
+    r4 = save_search_query(db, task.id, "query", "gap_falsification",
+                           None, None, 1, target_gap_id=gap.id,
+                           query_family="exact_gap", search_policy_version="v2")
+    db.commit()
+    assert r4.id != r1.id
     db.close()
 
 
 # === Test 6: target_question_id can be None for gap queries ===
+
+@pytest.mark.asyncio
+async def test_failed_phase_rolls_back_before_persisting_failure(temp_db):
+    """A flush failure leaves a failed, terminal PhaseRun with original error."""
+    engine, Session = temp_db
+    db = Session()
+    from sqlalchemy.exc import IntegrityError
+    from app.db.models import ResearchTask, GapCandidate, SearchQueryRecord
+    from app.services.phase_service import execute_phase
+
+    task = ResearchTask(user_input="phase rollback", status="searching")
+    db.add(task)
+    db.commit()
+    gap = GapCandidate(task_id=task.id, gap_type="coverage_gap", description="gap")
+    db.add(gap)
+    db.commit()
+
+    async def failing_operation(session):
+        session.add_all([
+            SearchQueryRecord(
+                task_id=task.id, query_text="duplicate", normalized_query_text="duplicate",
+                intent="gap_exact_gap", round_number=1, target_gap_id=gap.id,
+                search_policy_version="v1",
+            ),
+            SearchQueryRecord(
+                task_id=task.id, query_text="DUPLICATE", normalized_query_text="duplicate",
+                intent="gap_synonym", round_number=1, target_gap_id=gap.id,
+                search_policy_version="v1",
+            ),
+        ])
+        session.flush()
+
+    with pytest.raises(IntegrityError):
+        await execute_phase(db, task.id, "failing_phase", failing_operation,
+                            input_version="rollback-test", round_number=1)
+
+    db.expire_all()
+    from app.db.models import PhaseRun
+    phase = db.query(PhaseRun).filter(
+        PhaseRun.task_id == task.id,
+        PhaseRun.phase_name == "failing_phase",
+    ).one()
+    assert phase.status == "failed"
+    assert phase.completed_at is not None
+    assert "UNIQUE constraint failed" in phase.error_message
+    db.close()
+
 
 def test_target_question_id_none_for_gap(temp_db):
     """Gap queries can have target_question_id=None."""

@@ -33,6 +33,12 @@ def export_experiment(task_id: str, plan_id: str, format: str = "markdown",
             "dataset": plan.dataset,
             "baselines": plan.baselines,
             "metrics": plan.metrics,
+            "model_spec": plan.model_spec,
+            "dataset_provenance": plan.dataset_provenance,
+            "oracle": plan.oracle,
+            "statistical_analysis": plan.statistical_analysis,
+            "resource_budget": plan.resource_budget,
+            "scenario_atoms": plan.scenario_atoms_json,
             "steps": plan.steps_json,
             "risks": plan.risks,
         }
@@ -52,6 +58,24 @@ def export_experiment(task_id: str, plan_id: str, format: str = "markdown",
 ## Metrics
 {plan.metrics or ''}
 
+## Model
+{plan.model_spec or ''}
+
+## Dataset provenance
+{plan.dataset_provenance or ''}
+
+## Oracle
+{plan.oracle or ''}
+
+## Statistical analysis
+{plan.statistical_analysis or ''}
+
+## Resource budget
+{plan.resource_budget or ''}
+
+## Scenario atoms
+{plan.scenario_atoms_json or '[]'}
+
 ## Steps
 {plan.steps_markdown or ''}
 
@@ -70,6 +94,12 @@ def _to_out(plan: ExperimentPlan) -> ExperimentOut:
         dataset=plan.dataset,
         baselines=plan.baselines,
         metrics=plan.metrics,
+        model_spec=plan.model_spec,
+        dataset_provenance=plan.dataset_provenance,
+        oracle=plan.oracle,
+        statistical_analysis=plan.statistical_analysis,
+        resource_budget=plan.resource_budget,
+        scenario_atoms_json=plan.scenario_atoms_json,
         steps_markdown=plan.steps_markdown,
         steps_json=plan.steps_json,
         risks=plan.risks,

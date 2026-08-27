@@ -113,14 +113,22 @@ async def execute_phase(db, task_id: str, phase_name: str, operation,
         return result
     except Exception as e:
         duration_ms = int((time.perf_counter() - started) * 1000)
-        phase_repo.fail_phase(db, pr.id, str(e))
+        error_message = str(e)
+        # The operation may have failed during flush/commit, leaving this
+        # Session in a failed transaction. Roll back before touching the
+        # already-committed PhaseRun, otherwise PendingRollbackError masks the
+        # original exception and leaves the control plane stuck in running.
+        db.rollback()
         try:
+            phase_repo.fail_phase(db, pr.id, error_message)
             paper_repo.save_trace(db, task_id, phase_name, "phase_duration",
                                   round_number=round_number, duration_ms=duration_ms,
-                                  output_data={"error": str(e)[:500]})
+                                  output_data={"error": error_message[:500]})
+            db.commit()
         except Exception:
-            pass
-        db.commit()
+            db.rollback()
+            logger.exception("Failed to persist failed PhaseRun %s for task %s",
+                             phase_name, task_id[:8])
         raise
 
 

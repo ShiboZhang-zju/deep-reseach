@@ -189,17 +189,28 @@ def _compute_confidence_tier(gap, gate_statuses: dict) -> str:
 
 def _evaluate_hard_gates(gap, audit, evidence_ids, candidate, contract) -> dict:
     evidence_status = "PASS" if len(evidence_ids) >= 2 else "FAIL"
-    evidence_reason = "至少两条可追溯证据支撑 Gap" if evidence_status == "PASS" else "Gap 缺少两条独立可追溯证据"
+    # E2E 2026-08-26: rationale must be instantiated (counts/verdicts), not a
+    # fixed template — a static string proved identical for every intervention
+    # and carried no reviewable basis.
+    evidence_reason = (
+        f"{len(evidence_ids)} 条可追溯证据支撑 Gap（门槛 ≥2）"
+        if evidence_status == "PASS"
+        else f"Gap 仅 {len(evidence_ids)} 条可追溯证据（门槛 ≥2）")
 
+    neighbor_ids_json = getattr(audit, "neighbor_paper_ids_json", None) if audit else None
+    neighbor_count = len(json.loads(neighbor_ids_json or "[]"))
+    novelty_confidence = getattr(audit, "novelty_confidence", None) if audit else None
     novelty_status = "UNKNOWN"
     novelty_reason = "缺少完成的近邻审计"
     if audit:
         if audit.audit_result == "confirmed" and audit.remaining_delta:
             novelty_status = "PASS"
-            novelty_reason = "近邻审计确认存在 remaining delta"
+            novelty_reason = (
+                f"近邻审计 confirmed（{neighbor_count} 篇近邻，"
+                f"novelty_confidence={novelty_confidence}，存在 remaining delta）")
         elif audit.audit_result == "closed":
             novelty_status = "FAIL"
-            novelty_reason = "近邻审计显示核心 claim 已被覆盖"
+            novelty_reason = f"近邻审计显示核心 claim 已被覆盖（{neighbor_count} 篇近邻）"
         elif audit.audit_result == "partially_closed" and audit.remaining_delta:
             novelty_status = "UNKNOWN"
             novelty_reason = "Gap 需先收窄后再判断新颖性"

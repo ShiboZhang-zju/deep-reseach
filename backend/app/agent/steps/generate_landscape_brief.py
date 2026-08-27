@@ -35,6 +35,7 @@ from app.db.models import (
     ResearchIdea,
 )
 from app.db.repositories import gap_repo, paper_repo
+from app.config import settings
 from sqlalchemy import func
 
 logger = logging.getLogger(__name__)
@@ -227,7 +228,6 @@ def build_landscape_brief_markdown(db, task_id: str, contract_id: str | None,
     _append_graded_directions(db, lines, task_id, contract_id)
 
     # --- 5c. Constrained-retrieval notice (high-priority #2) ---
-    from app.config import settings
     if settings.constrained_retrieval_mode:
         lines.append("## 检索供给提示\n")
         lines.append(

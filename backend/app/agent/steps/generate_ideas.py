@@ -512,6 +512,7 @@ async def _process_each_idea(db, state, llm, task_id, idea_list, high_papers,
 
         idea_data = {
             "title": item.title,
+            "score_status": "unscored",
             "description": item.description,
             "motivation": item.motivation,
             "method_sketch": enriched_method,
@@ -548,6 +549,15 @@ async def _process_each_idea(db, state, llm, task_id, idea_list, high_papers,
 
             paper_repo.update_idea_scores(db, idea.id, score.model_dump(), final_score, decision)
         except Exception as e:
+            idea.score_status = "failed"
+            idea.score_error = f"{type(e).__name__}: {str(e)[:300]}"
+            idea.decision = "conditional_review"
+            paper_repo.save_trace(db, task_id, "idea_quality_gate", "decision", output_data={
+                "idea_id": idea.id,
+                "status": "rejected",
+                "reason_codes": ["IDEA_SCORE_FAILED"],
+                "error": idea.score_error,
+            })
             logger.error("Failed to score idea %s: %s", idea.id, e)
 
         emit_event(task_id, "idea_generated", {"id": idea.id, "title": idea.title})

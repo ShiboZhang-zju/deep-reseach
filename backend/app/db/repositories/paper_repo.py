@@ -171,6 +171,8 @@ def update_idea_scores(db: Session, idea_id: str, scores: dict, final_score: flo
     idea.risk = scores.get("risk")
     idea.final_score = final_score
     idea.decision = decision
+    idea.score_status = "scored"
+    idea.score_error = None
     db.flush()
 
 
