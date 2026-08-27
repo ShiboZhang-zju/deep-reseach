@@ -156,10 +156,14 @@ candidate → auditing → confirmed → surviving        # 通过对抗审计�
                     ↘ closed → rejected             # 已被现有工作覆盖
 ```
 
-- **收窄**（`steps/narrow_gaps.py`）：采用审计给出的 remaining_delta 作为新的 claimed_delta，把近邻已覆盖的内容并入 existing_coverage，回到 auditing 重新争取 confirmed；不调用 LLM，无具体 delta 则不收窄，单 Gap 上限 2 次。
+- **收窄**（`steps/narrow_gaps.py`）：采用审计给出的 remaining_delta 作为新的 claimed_delta，把近邻已覆盖的内容并入 existing_coverage，回到 auditing 重新争取 confirmed；不调用 LLM，无具体 delta 则不收窄，单 Gap 上限 2 次（全局 `MAX_NARROWING_PASSES_TOTAL=3`）。
 - **只重审有新输入的 Gap**：收窄只改写一个 Gap 的主张，因此下一轮审计只判定被收窄的那些。重审一个输入未变的 Gap 会用同样的对抗 query 得到同样的结论。
 - **不可判定终结**：若上一次已判定的审计要求 `more_search`，而本轮的 claim 与近邻集合完全未变，说明这个诉求无法被满足（例如外部检索源被限流、拿不到任何新对照），该 Gap 直接关闭为不可判定（`audit_result` 保持 `uncertain`，`rejection_reason` 记 `novelty_undecidable`），不再消耗预算。它会作为"未获证实"被如实记录，而不是被静默丢弃。
-- 审计规则或准入规则变更时必须递增 `GAP_MINING_POLICY_VERSION` / `GAP_SEARCH_POLICY_VERSION`，否则续跑会命中阶段幂等直接复用旧结论。
+- **remediation 后复审而非重新挖掘**：定向补检索加入新证据后，evidence fingerprint 变化会让 mining 幂等失效。此时若直接重新 mining，会生成与旧 Gap 语义重复的新候选（措辞变体）并重复消耗审计预算。因此 remediation 轮优先把上一轮未决 Gap（`auditing` / `audited` / `inconclusive` 状态）置回 `candidate` 直接复审，只有 Gap 池全部闭合后才重新 mining。复审的 `audit_input_version` 包含 `remediation_round`，防止阶段幂等误判为相同输入。
+- **surviving 是 contract 级终态**：survivor 查询不限定本轮 gap 列表——早前轮次确认的 Gap 在后续复审其他 Gap 的轮次中依然有效。mining 产出为空（新候选全部被判 `DUPLICATE_GAP` 拦截）时，已确认的 survivor 仍继续流向下游，而不是误判 `no_evidence_backed_gap_candidates` 终止任务。
+- **对抗查询家族三级兜底**（`GAP_SEARCH_POLICY_VERSION` v10）：查询家族的变体验证失败不再直接丢弃家族——① raw 变体 ≥2 时降级接受（`LOW_CONFIDENCE_VARIANTS`）；② raw 变体为空但结构化 intent 完整时，由 `_synthesize_family_variants` 从 intent 的结构化字段（problem/mechanism/intervention 等）合成查询（`SYNTHESIZED_VARIANTS`；根因：pydantic `default_factory=list` 绕过 `min_length` 校验，LLM 返回空变体列表曾导致 4/5 家族被丢弃、准入必然失败）；③ 都不行才丢弃。审计流程内含两处 commit 检查点（搜索+评分后、相关性筛选后），超时回滚不再丢弃已完成的工作。
+- **语义去重**（`GAP_MINING_POLICY_VERSION` v5）：新候选与已有 Gap 的嵌入余弦相似度 ≥ 0.78 判 `DUPLICATE_GAP`（v4 为 0.85，拦不住措辞变体）；同时 mining prompt 注入已有 Gap 的 claimed_delta 列表，要求不得重新提出已覆盖的主张。
+- 审计规则或准入规则变更时必须递增 `GAP_MINING_POLICY_VERSION` / `GAP_SEARCH_POLICY_VERSION` / `EXPERIMENT_GENERATION_POLICY_VERSION`，否则续跑会命中阶段幂等直接复用旧结论。
 
 ## 项目结构
 
@@ -455,9 +459,13 @@ failed                        # 执行失败
 | potential_impact | FLOAT | 潜在影响范围（工程/产业/开源） 0-1 |
 | risk | FLOAT | 0-1 |
 | final_score | FLOAT | 综合评分 |
-| decision | TEXT | go / revise / reject |
+| decision | TEXT | V1: go / revise / reject；V2 四级: executable_candidate / conditional_review / research_direction_only / rejected（代码门禁定级，评分只排序） |
 | related_paper_ids_json | TEXT | 关联论文 ID 列表 |
 | user_selected | BOOL | 用户是否选择 |
+| score_status | TEXT | pending / passed / failed（评分失败不再静默） |
+| score_error | TEXT | 评分失败原因 |
+| quality_reason_codes_json | TEXT | 质量门禁 reason codes（如 SCENARIO_MISMATCH、MISSING_DATASET_PROVENANCE） |
+| variant_intervention_ids_json | TEXT | hypothesis cluster 门禁：并入本 Idea 消融臂的机制变体干预列表 |
 | created_at | TIMESTAMP | |
 
 ### `experiment_plans` — 实验方案
@@ -469,7 +477,13 @@ failed                        # 执行失败
 | idea_id | TEXT FK | |
 | hypothesis | TEXT | |
 | dataset | TEXT | |
-| baselines | TEXT | |
+| dataset_provenance | TEXT | 数据集来源与构造流程（防"需新构造却伪装现成"） |
+| model_spec | TEXT | 模型规格（须与研究范围一致） |
+| oracle | TEXT | 真值判定方式（LLM 不得作为唯一 oracle） |
+| statistical_analysis | TEXT | 统计方法（二元配对数据应为 McNemar 等） |
+| resource_budget | TEXT | 资源预算（GPU/时长） |
+| scenario_atoms_json | TEXT | 场景原子（实验文本须逐字包含，防实验偏离研究范围） |
+| baselines | TEXT | 对照组设计（含 cluster 变体消融臂） |
 | metrics | TEXT | |
 | steps_markdown | TEXT | Markdown 步骤 |
 | steps_json | TEXT | JSON 步骤 |
@@ -525,6 +539,8 @@ CREATE UNIQUE INDEX idx_rounds ON research_rounds(task_id, round_number);
 ```
 
 > SQLite 支持部分唯一索引（partial unique index），以上语法兼容 SQLite 3.8.0+。MVP 阶段也可以在 repository 层做去重兜底。
+>
+> **enrichment 唯一索引守卫**（`services/metadata_enrichment.py`）：同一物理论文可能存在两行（如 OpenAlex 行与 S2 行，检索去重未合并时），S2 enrichment 会把 A 行的 DOI"补"给 B 行。pipeline 模式（共享 agent session）下该改动悬在事务中不提交，后续 flush 时触发 `IntegrityError(papers.doi)` 毒化整个任务。因此 enrichment 写入前对 4 个唯一索引字段逐一查重——值已被其他行占用则丢弃该字段（记 debug log）；写区段经 `write_lock` 串行化 + `no_autoflush` 防止并发悬置改动互相不可见；失败分支统一 rollback + expire 解毒。
 
 ## 评分公式
 
@@ -563,15 +579,30 @@ idea_score = 0.20 × novelty + 0.20 × feasibility + 0.20 × significance + 0.20
 final_score = idea_score - 0.08 × risk
 ```
 
-> 该 8 维打分与加权公式由 V1（`generate_ideas.py` 的 `_score_idea`）与 V2（`generate_minimal_experiments.py` 复用同一函数）共用。V2 链路产出的 Idea `decision` 统一为 `conditional_go`（分级由 `confidence_tier` A/B/C 表达），而非 V1 的 go/revise/reject。
+> 该 8 维打分与加权公式由 V1（`generate_ideas.py` 的 `_score_idea`）与 V2（`generate_minimal_experiments.py` 复用同一函数）共用。评分只用于排序，不作为放行门禁。
 >
 > V1 链路另有验证惩罚：编造基线 -0.15/个（上限 -0.3），编造数据集 -0.05/个，指标-假设不匹配 -0.05/个，非新颖 -0.1。
 
-| 分数 | 决策（V1 链路） |
-|------|------|
-| >= 0.70 | go |
-| 0.50 - 0.70 | revise |
-| < 0.50 | reject |
+### Idea 四级分类（V2，代码门禁定级）
+
+```
+executable_candidate    # 硬门禁全过：所属干预 confidence_tier=A 且实验计划通过质量校验
+conditional_review      # tier B/C，或实验计划被拒（含反馈重试后仍失败）、评分失败
+research_direction_only # 仅方向性产出，无可执行实验载体
+rejected                # 实验计划被质量门禁拒绝（trace 记录 reason_codes + 计划摘要）
+```
+
+系统允许产出 0 个 `executable_candidate`（证据不足时诚实拒绝优于生成不可靠产物）。E2E 实证（任务 23ec8f20）：最高分 idea（0.7435）因跨语言 benchmark 的实验载体不足被判 `conditional_review`，评分排序未越过硬门禁。
+
+### Hypothesis cluster 门禁（`EXPERIMENT_GENERATION_POLICY_VERSION` = hypothesis-cluster-v2）
+
+同一 Gap 的多个 passed intervention 在生成实验计划前先做一次 LLM 结构化聚簇（`_cluster_interventions_by_hypothesis`），判定标准是"检验的实验假设是否相同"（测什么）而非"机制是否相似"（怎么做）：
+
+- 同簇只产出 1 个 Idea + 1 个实验计划，其余 intervention 作为机制变体并入该实验的 baselines 消融臂，并记录 `variant_intervention_ids` 供前端展示
+- LLM 聚簇失败 / 任一簇 confidence < 0.7 / 出现未知 intervention id 时保守降级：不合并（每个 intervention 独立成簇），记 `hypothesis_cluster` trace
+- 实验计划被质量校验拒绝后带 reason_codes 反馈重试一次（场景原子为字面子串匹配，如 "verification" 不满足原子 "verifier"，重试要求原子词逐字出现在 dataset/oracle/steps 等字段）；仍失败才判 rejected，trace 记录 `retry_attempted` 与被拒计划摘要
+
+E2E 实证：5 个 passed interventions 聚成 3 簇，产出 3 Idea + 3 实验（旧逻辑产出 5 个平行 Idea，其中两个检验同一假设却包装独立）。
 
 ## 去重策略（优先级从高到低）
 
@@ -637,6 +668,11 @@ class FallbackLLMProvider(LLMProvider):
     # 包装多个 provider，逐个尝试；仅 transport/服务错误（LLM call failed）时切换，
     # LLMBudgetExceeded / LLMContextOverflow 等确定性错误直接 raise 不降级。
     # 成功后同步 last_usage / total_tokens_used / call_count。
+    # 供应商级熔断（circuit breaker）：单个 provider 连续 2 次失败进入冷却，
+    # 冷却时长 30s 起步指数退避、上限 300s；冷却期间直接跳过该 provider，
+    # 避免主网关 502/传输故障被反复命中放大整条链路延迟。
+    # 参数：LLM_CIRCUIT_FAILURE_THRESHOLD / LLM_CIRCUIT_COOLDOWN_BASE_SECONDS /
+    #       LLM_CIRCUIT_COOLDOWN_MAX_SECONDS
     ...
 
 # 工厂模式
@@ -709,11 +745,18 @@ EMBEDDING_MODEL=text-embedding-v4
 EMBEDDING_DIM=1024                       # 必须与所选模型一致
 
 # Agent 参数
-MAX_ROUNDS=3
+MAX_ROUNDS=5
 QUERIES_PER_ROUND=5
 PAPERS_PER_SOURCE_PER_QUERY=15
 HIGH_PRIORITY_TARGET=15
-AGENT_TIMEOUT_SECONDS=10800              # 抽取约 50s/篇，是单次运行耗时主体
+AGENT_TIMEOUT_SECONDS=14400              # 抽取约 50s/篇，是单次运行耗时主体
+MAX_LLM_CALLS_PER_TASK=1500              # 任务级 LLM 调用预算（审计/聚簇/抽取共享）
+
+# Gap 审计（单 Gap 审计含查询生成/外部检索/相关性筛选/近邻证据抽取/判决，全流程一个超时罩）
+GAP_AUDIT_TIMEOUT_SECONDS=1500           # 600s 会掐断走到近邻抽取阶段的 Gap（E2E 实测）
+GAP_AUDIT_MAX_QUERIES=12                 # 每 Gap 对抗查询上限
+GAP_AUDIT_MAX_CANDIDATE_PAPERS=20        # 审计候选论文 cap
+AUDIT_NEIGHBOR_EVIDENCE_MAX_PAPERS=5     # 近邻全文证据抽取篇数上限
 
 # 证据抽取
 EVIDENCE_MAX_PAPERS=15                   # 每轮抽取的论文数
@@ -724,7 +767,8 @@ ENABLE_RAG_INDEXING=false                # 关闭 RAG 索引后仍会抽取证�
 
 # 优化参数
 MAX_REMEDIATION_ATTEMPTS=2               # O2 每个失败原因的定向补检索上限
-MAX_REMEDIATION_ROUNDS_TOTAL=3           # O2 全局定向补检索轮数上限
+MAX_REMEDIATION_ROUNDS_TOTAL=5           # O2 全局定向补检索轮数上限
+MAX_NARROWING_PASSES_TOTAL=3             # 收窄总次数上限
 SEARCH_PREFILTER_MIN_SIMILARITY=0.45     # O7 入库前主题相似度过滤阈值（0 关闭）
 SCORE_CALIBRATION_MIN_BATCH=5            # 评分批内校准最小批量
 SCORE_CALIBRATION_STRENGTH=0.15          # 校准强度
@@ -866,6 +910,22 @@ async def run_task(task_id: str):
 - [x] **证据供给对齐准入**：抽取的 chunk 预算按 section 轮转（conclusion 优先），修复 section 名硬编码为空串导致 section 提示从未生效的缺陷
 - [x] **关系语义统一**：新增 `agent/evidence_relations.py` 作为 supporting 语义与最低相关性的单一来源，覆盖度与挖掘共用
 - [x] **测试**：后端 263 个测试通过
+
+### Gap 审计收敛与 Idea 生成门禁（本轮）
+
+**目标**：解决"审计永远跑不完导致 0 surviving Gap"与"Idea 是 intervention 的复制视图、重复假设包装独立"两类结构性问题。全部由任务 9e56a131（0 Idea 失败链诊断）与 23ec8f20（三批次迭代验证）实测驱动。
+
+- [x] **审计超时结构**：审计内两处 commit 检查点，超时回滚不再丢弃已完成的搜索/评分/筛选工作；单 Gap 超时可配（默认 1500s）
+- [x] **查询家族三级兜底**（GAP_SEARCH_POLICY_VERSION v10）：raw 变体降级接受 / 结构化 intent 合成（`_synthesize_family_variants`，根治 pydantic `default_factory=list` 绕过 `min_length` 导致的空变体家族丢弃）/ 才丢弃
+- [x] **去重前移**（GAP_MINING_POLICY_VERSION v5）：语义阈值 0.85→0.78 + mining prompt 注入已有 claimed_delta；remediation 后复审 undetermined Gap 而非重新挖掘（循环积累化）
+- [x] **surviving 语义修正**：contract 级终态，不随轮次失效；mining 全被去重拦截时 survivor 续流下游
+- [x] **enrichment 唯一索引守卫**：S2 给重复行补 DOI 毒化 agent session 的 IntegrityError（写入前查重 + 写区段串行化）
+- [x] **实验计划反馈重试**：质量门禁拒绝后带 reason_codes 重写一次（场景原子字面匹配的措辞问题不放松门禁）；rejected trace 记录计划摘要（修诊断盲区）
+- [x] **hypothesis cluster 门禁**（P2-A，EXPERIMENT_GENERATION_POLICY_VERSION = hypothesis-cluster-v2）：同 Gap 多干预按"检验的假设"聚簇，同簇 1 Idea + 变体并入消融臂；Idea 四级分类（executable_candidate / conditional_review / research_direction_only / rejected）由代码门禁定级，评分只排序
+- [x] **LLM 供应商熔断**：连续 2 次失败冷却（30s 起步指数退避，上限 300s）
+- [x] **测试**：后端 329 个测试通过
+
+**E2E 实证**（任务 23ec8f20，Test-Time Verification 主题，三次续跑迭代）：560 篇论文 → 2 个 surviving Gap（收窄链 v1 partially_closed → narrow → v2 confirmed 完整走通）→ 5 个 passed interventions 聚 3 簇 → 3 个 Idea（2 executable + 1 conditional_review）+ 3 份实验计划，终态 `waiting_for_user_review`。对照基线任务 9e56a131（修复前同主题）：9 个候选 Gap 全部 inconclusive、0 Idea、`no_surviving_gap_after_audit`。
 
 ### 实测运行画像（RAG 主题，单卡资源约束）
 
