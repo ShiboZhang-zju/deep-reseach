@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # fallback so the primary behaves exactly as before.
     fallback_venus_llm_proxy_url: str = _FALLBACK_MODEL.base_url
     fallback_venus_llm_model: str = _FALLBACK_MODEL.model
+    # Per-provider circuit breaker for transient transport/service failures.
+    llm_circuit_failure_threshold: int = 2
+    llm_circuit_cooldown_seconds: float = 30.0
+    llm_circuit_max_cooldown_seconds: float = 300.0
 
     # OpenAI fallback
     openai_api_key: str = ""
@@ -140,6 +144,11 @@ class Settings(BaseSettings):
     # old family (which previously let an old gap eat a new gap's only chance,
     # see task 08005641). Narrowed versions (v1 -> v2) share the family budget.
     max_remediation_attempts_per_gap: int = 2
+    # Total deterministic gap-narrowing passes in the opportunity pipeline.
+    # Narrowing is cheaper than remediation but still re-runs adversarial search;
+    # keep a task-level cap so multiple gap families cannot create an unbounded
+    # sequence of re-audits.
+    max_narrowing_passes_total: int = 3
 
     # RAG / PDF download
     enable_scihub: bool = False  # P0-4: Sci-Hub disabled by default for legal compliance
@@ -198,9 +207,9 @@ class Settings(BaseSettings):
     # rest are marked low-priority without an LLM call. 0 disables the prefilter
     # (score everything). This bounds the very slow LLM scoring stage.
     score_llm_top_n: int = 40
-    # Background metadata enrichment re-queries S2/OpenAlex for newly found
-    # papers. Without an S2 key these share the same rate-limited quota as the
-    # main search loop and slow it down for little gain. Disable to skip it.
+    # Metadata enrichment re-queries S2/OpenAlex for newly found papers. It is
+    # awaited within the search phase and uses the phase session, so it does not
+    # create a concurrent SQLite writer. Disable to skip its network latency.
     enable_metadata_enrichment: bool = True
 
     # Scoring weights (P1-7: authority bumped from 0.25 to 0.30)
@@ -313,6 +322,21 @@ class Settings(BaseSettings):
     gap_relevance_screen_top_m: int = 20
     gap_relevance_scoring_version: str = "gap-rel-v1"
     variant_regenerate_budget: int = 2          # per-variant regenerate attempts before dropping
+
+    # Per-Gap audit guardrails. These are operational heuristics: they cap
+    # external-search cost without changing the scientific verdict thresholds.
+    gap_audit_max_queries: int = 12
+    gap_audit_max_candidate_papers: int = 20
+    gap_audit_timeout_seconds: int = 600
+    # Evidence-funnel repair (E2E 2026-08-26: audit-recalled papers stayed
+    # priority=NULL and never entered evidence extraction, so 94/94 round-3
+    # papers were invisible downstream and NO_FULLTEXT_EVIDENCE was structural).
+    # Score audit-recalled papers like main-round papers, and extract full-text
+    # evidence for the selected NPA neighbors before the evidence delta is
+    # computed, bounded to keep the per-gap audit timeout meaningful.
+    audit_score_retrieved_papers: bool = True
+    audit_neighbor_evidence_extraction: bool = True
+    audit_neighbor_evidence_max_papers: int = 5
 
     @property
     def effective_openalex_rate_per_min(self) -> int:

@@ -24,7 +24,8 @@ def get_llm() -> LLMProvider:
                 base_url=settings.fallback_venus_llm_proxy_url,
                 model=settings.fallback_venus_llm_model,
             )
-            _provider_instance = FallbackLLMProvider([primary, fallback])
+            _provider_instance = FallbackLLMProvider(
+                [primary, fallback], provider_names=["primary", "fallback"])
         else:
             _provider_instance = primary
     elif provider_name == "openai":
