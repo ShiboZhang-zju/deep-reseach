@@ -768,3 +768,121 @@ def test_unknown_schema_rejected():
                 os.unlink(db_path)
             except PermissionError:
                 pass
+
+
+@pytest.mark.asyncio
+async def test_metadata_enrichment_uses_search_phase_session(temp_db):
+    """Search enrichment is awaited and receives the caller's Session."""
+    _, Session = temp_db
+    db = Session()
+    from app.db.models import ResearchTask
+    from app.agent.state import ResearchState
+    from app.agent.steps.generate_queries import SearchQueryExecution
+    from app.agent.steps.search_papers import search_and_save_papers
+
+    task = ResearchTask(user_input="metadata session ownership", status="pending")
+    state = ResearchState(task_id=task.id, user_input=task.user_input, pipeline_version=2)
+    db.add(task)
+    db.commit()
+    fake_search = FakeSearchService()
+    enrichment = AsyncMock()
+    enrichment.return_value = {"enriched": 1, "skipped": 0, "failed": 0}
+    qe = SearchQueryExecution(
+        query_id="metadata-q", query_text="metadata session ownership",
+        intent="recent_work", target_question_id="qq1",
+        expected_evidence_type="result",
+    )
+
+    with patch("app.agent.steps.search_papers.search_service", fake_search), \
+         patch("app.agent.steps.search_papers.settings.enable_metadata_enrichment", True), \
+         patch("app.agent.steps.search_papers._trigger_metadata_enrichment", enrichment):
+        _, _, paper_ids = await search_and_save_papers(db, state, [qe], task.id, round_num=1)
+
+    enrichment.assert_awaited_once()
+    assert enrichment.await_args.args[0] == paper_ids
+    assert enrichment.await_args.args[1] is db
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_session_enrichment_commits_with_caller(temp_db):
+    """Shared-session enrichment never commits independently and survives caller commit."""
+    _, Session = temp_db
+    db = Session()
+    from app.db.models import Paper
+    from app.services import metadata_enrichment
+
+    paper = Paper(title="Needs metadata", abstract="An abstract", citation_count=0)
+    db.add(paper)
+    db.commit()
+    paper_id = paper.id
+
+    async def fake_enrich_one(_paper):
+        return {"citation_count": 42, "year": 2024, "venue": "Test Venue"}
+
+    with patch("app.services.metadata_enrichment._enrich_one", fake_enrich_one):
+        result = await metadata_enrichment.enrich_papers_metadata([paper_id], db_session=db)
+
+    assert result["enriched"] == 1
+    assert paper.citation_count == 42
+    assert paper.year == 2024
+    assert paper.venue == "Test Venue"
+    db.commit()
+
+    check = Session()
+    persisted = check.query(Paper).filter(Paper.id == paper_id).one()
+    assert persisted.citation_count == 42
+    assert persisted.year == 2024
+    assert persisted.venue == "Test Venue"
+    check.close()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_enrichment_drops_external_id_owned_by_another_row(temp_db):
+    """S2 'enriching' a duplicate row with the original row's DOI must not
+    poison the caller's session with a pending UNIQUE violation.
+
+    Task 23ec8f20 (2026-08-27): the same physical paper existed as two rows
+    (OpenAlex row + S2 row dedup failed to merge). Enrichment set row B's doi
+    to row A's already-indexed DOI, own_session=False so nothing committed,
+    and the next flush in the agent loop raised IntegrityError papers.doi —
+    failing the whole audit phase. The guard must drop the clashing field.
+    """
+    _, Session = temp_db
+    db = Session()
+    from app.db.models import Paper
+    from app.services import metadata_enrichment
+
+    row_a = Paper(title="Original row", abstract="a", citation_count=5,
+                  doi="10.1145/3712345")
+    row_b = Paper(title="Duplicate row (unmerged)", abstract="b", citation_count=0)
+    db.add(row_a)
+    db.add(row_b)
+    db.commit()
+
+    async def fake_enrich_one(paper):
+        if paper.id == row_b.id:
+            # S2 hands back row A's DOI plus a legit citation bump.
+            return {"doi": "10.1145/3712345", "citation_count": 7, "year": 2025}
+        return None
+
+    with patch("app.services.metadata_enrichment._enrich_one", fake_enrich_one):
+        result = await metadata_enrichment.enrich_papers_metadata(
+            [row_b.id], db_session=db)
+
+    assert result["enriched"] == 1
+    assert row_b.doi is None          # clashing DOI dropped, not copied
+    assert row_b.citation_count == 7  # non-unique fields still applied
+    assert row_b.year == 2025
+    # The caller's session must survive a flush/commit cleanly.
+    db.commit()
+
+    check = Session()
+    persisted = check.query(Paper).filter(Paper.id == row_b.id).one()
+    assert persisted.doi is None
+    assert persisted.citation_count == 7
+    owners = check.query(Paper).filter(Paper.doi == "10.1145/3712345").all()
+    assert [p.id for p in owners] == [row_a.id]  # exactly one owner
+    check.close()
+    db.close()

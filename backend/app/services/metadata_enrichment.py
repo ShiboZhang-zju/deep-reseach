@@ -3,8 +3,10 @@
 Problem: CORE/arXiv sources lack citation_count/venue/year for many papers,
 leading to inaccurate authority scoring.
 
-Solution: After papers are saved, asynchronously query Semantic Scholar / OpenAlex
+Solution: After papers are saved, query Semantic Scholar / OpenAlex
 by DOI or title to fill in missing citation_count, venue, year, and external IDs.
+When called from the search phase, it uses that phase's Session and leaves the
+transaction boundary to the caller, so it cannot race SQLite's main writer.
 
 Usage:
     from app.services.metadata_enrichment import enrich_papers_metadata
@@ -176,11 +178,9 @@ async def _enrich_one(paper: Paper) -> dict | None:
 async def _commit_with_retry(db, max_retries: int = 6, base_delay: float = 0.25):
     """Commit with exponential backoff on SQLite write-lock contention.
 
-    Enrichment runs as a fire-and-forget background task writing to the same
-    SQLite file as the main pipeline. WAL allows concurrent readers but only a
-    single writer, so a commit can transiently collide with the main loop's own
-    write and raise "database is locked". Retry briefly instead of aborting the
-    whole batch, which silently lost every metadata update.
+    This helper is retained for standalone callers that own a separate session.
+    The search phase passes its own session and does not call this helper, so
+    normal pipeline enrichment no longer creates an independent SQLite writer.
     """
     from sqlalchemy.exc import OperationalError
 
@@ -229,6 +229,15 @@ async def enrich_papers_metadata(paper_ids: list[str], db_session=None) -> dict:
 
         semaphore = asyncio.Semaphore(3)  # limit concurrent API calls
         commit_lock = asyncio.Lock()      # serialize commits (SQLite single writer)
+        # Serializes the check-then-set critical section. The pipeline passes
+        # the agent's own session (own_session=False), so enrichment updates
+        # stay UNCOMMITTED in the session until the pipeline later flushes;
+        # concurrent enrichments of the same batch cannot see each other's
+        # pending attribute writes, so without serialization two papers can
+        # both take the same external ID and blow up on flush.
+        write_lock = asyncio.Lock()
+        # Fields under partial UNIQUE indexes in the papers table.
+        _unique_fields = ("doi", "arxiv_id", "semantic_scholar_id", "openalex_id")
         enriched = 0
         failed = 0
 
@@ -238,27 +247,58 @@ async def enrich_papers_metadata(paper_ids: list[str], db_session=None) -> dict:
                 try:
                     updates = await _enrich_one(paper)
                     if updates:
-                        for field, value in updates.items():
-                            setattr(paper, field, value)
-                        # Commit per paper as a short transaction, serialized
-                        # behind a lock and retried on lock contention. A single
-                        # batch commit held the write lock long enough to collide
-                        # with the main pipeline and raise "database is locked",
-                        # silently losing the whole batch.
-                        if own_session:
-                            async with commit_lock:
-                                await _commit_with_retry(db)
+                        # Guard external-ID fields against the papers table's
+                        # UNIQUE indexes BEFORE touching the ORM object. The
+                        # same physical paper can exist as two rows (an
+                        # OpenAlex row and an S2 row the search dedup failed to
+                        # merge); S2 then "enriches" row B with row A's DOI and
+                        # the UPDATE explodes on flush — poisoning the agent's
+                        # session and failing the whole audit phase (task
+                        # 23ec8f20: IntegrityError papers.doi). Values already
+                        # owned by another row are dropped, not copied.
+                        async with write_lock:
+                            with db.no_autoflush:
+                                for field in _unique_fields:
+                                    value = updates.get(field)
+                                    if not value:
+                                        continue
+                                    attr = getattr(Paper, field)
+                                    clash = db.query(Paper.id).filter(
+                                        attr == value, Paper.id != paper.id).first()
+                                    if clash is not None:
+                                        logger.debug(
+                                            "Enrichment for paper %s: dropping %s=%s "
+                                            "(already owned by paper %s)",
+                                            paper.id[:8], field, str(value)[:40],
+                                            clash[0][:8])
+                                        updates.pop(field)
+                            for field, value in updates.items():
+                                setattr(paper, field, value)
+                            # Commit per paper as a short transaction, serialized
+                            # behind a lock and retried on lock contention. A single
+                            # batch commit held the write lock long enough to collide
+                            # with the main pipeline and raise "database is locked",
+                            # silently losing the whole batch.
+                            if own_session:
+                                async with commit_lock:
+                                    await _commit_with_retry(db)
                         enriched += 1
                         logger.debug("Enriched paper %s: %s", paper.id[:8],
                                     list(updates.keys()))
                 except Exception as e:
                     logger.debug("Enrich failed for paper %s: %s", paper.id[:8], e)
                     failed += 1
-                    if own_session:
-                        try:
-                            db.rollback()
-                        except Exception:
-                            pass
+                    # Roll back even on the pipeline's shared session: an
+                    # enrichment that raised mid-update leaves the paper object
+                    # (and possibly the session) dirty, and the next flush in
+                    # the agent loop would surface it as a task-killing
+                    # IntegrityError. expire() then discards any pending
+                    # attribute writes on this object.
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    db.expire(paper)
 
         # Process in small batches to avoid overwhelming the API
         batch_size = 10
