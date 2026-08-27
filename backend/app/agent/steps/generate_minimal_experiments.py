@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 from app.agent.state import ResearchState
+from app.config import settings
 from app.db.models import GapCandidate, GapPhenomenonPlan, InterventionCandidate
 from app.db.repositories import paper_repo
 
@@ -33,6 +34,13 @@ For dataset and baselines, be concrete enough to actually run:
   oracle, statistical_analysis, resource_budget, and scenario_atoms explicitly.
 - An LLM may assist labeling, but it MUST NOT be the sole correctness oracle.
 - Keep model_spec consistent with the gap's parameter/compute scope.
+- TITLE: name the concrete mechanism under test (e.g. "Diff-Risk Classification for
+  Self-Correction Filtering"), NOT the gap topic. Never prefix with "Minimal
+  Experiment:" or similar — sibling ideas must be distinguishable by title alone.
+- IDEA_METHOD: 3-6 sentences describing the method from the IDEA's perspective —
+  hypothesis -> method -> expected outcome. Do NOT restate the intervention's
+  engineering description; drop implementation details a reader of the idea does
+  not need to judge the contribution.
 """
 
 # Bumped when the experiment-generation RULES change so a resumed task
@@ -46,7 +54,13 @@ For dataset and baselines, be concrete enough to actually run:
 # surfacing as "independent" ideas (task 23ec8f20: two tier-A interventions
 # produced two executable_candidates testing the identical hypothesis
 # "apply only logical fixes vs apply all").
-EXPERIMENT_GENERATION_POLICY_VERSION = "hypothesis-cluster-v2"
+# v3 (2026-08-27): idea-level novelty quick-check (P2-C) — retrieval against
+# the cluster's hypothesis + primary mechanism; METHOD_ALREADY_PUBLISHED demotion.
+# v4 (2026-08-27): idea metadata differentiation (P2-B) — titles name the concrete
+# mechanism (prefix-free), idea_method replaces verbatim intervention copying,
+# motivations quote evidence claims verbatim, and ideas from a previous
+# generation round are soft-deleted (superseded) when the phase re-runs.
+EXPERIMENT_GENERATION_POLICY_VERSION = "idea-metadata-v4"
 
 # Initial calibration point; revisit against historical task annotations (P3)
 # before changing — cluster merges REDUCE idea counts, so false merges are the
@@ -89,6 +103,24 @@ class HypothesisClusterSchema(BaseModel):
 
 class HypothesisClusterListSchema(BaseModel):
     clusters: list[HypothesisClusterSchema] = Field(default_factory=list)
+
+
+class IdeaNoveltyQueriesSchema(BaseModel):
+    """Adversarial queries for the idea-level novelty quick-check (P2-C)."""
+    queries: list[str] = Field(min_length=1, description="Up to 3 self-contained English keyword queries")
+
+
+class IdeaNoveltyVerdictSchema(BaseModel):
+    """Verdict on whether the cluster's specific method is already implemented.
+
+    already_implemented=true requires one listed paper to directly implement the
+    SAME core mechanism (same technique for the same purpose); related-but-
+    different methods (different technique, different purpose, or only a
+    component of the proposal) must yield false.
+    """
+    already_implemented: bool
+    evidence_paper_id: str | None = None
+    rationale: str = Field(min_length=5)
 
 
 _HYPOTHESIS_CLUSTER_SYSTEM = """You group research interventions by the experimental HYPOTHESIS they test, not by their mechanisms.
@@ -204,8 +236,170 @@ async def _cluster_interventions_by_hypothesis(llm, phenomenon, gap_intervention
     return clusters
 
 
+_IDEA_NOVELTY_QUERIES_SYSTEM = """You generate adversarial literature-search queries to check whether a proposed research
+method has ALREADY been directly implemented in prior work. Output up to 3 short English queries:
+1) exact-method: names the concrete technique (e.g. "diff-based regression risk classifier for code correction filtering");
+2) method-neighbour: close variants of the technique under other terminology;
+3) adjacent-domain: casts the technique into a neighbouring field that would plausibly have published it first
+   (e.g. correction filtering -> automated program repair patch filtering; evaluation gating -> test selection).
+Queries are self-contained keyword phrases: no quotes, no boolean operators, no field prefixes."""
+
+
+_IDEA_NOVELTY_VERDICT_SYSTEM = """You judge whether a proposed research method has ALREADY been directly implemented by prior work.
+already_implemented=true ONLY when one listed paper directly implements the SAME core mechanism — same technique
+used for the same purpose. Related-but-different work (different technique, different purpose, only one component of
+the proposal, or a survey) must yield false. If true, set evidence_paper_id to the implementing paper's id exactly
+as listed. Be conservative: uncertainty means false."""
+
+
+async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
+                               intervention, existing_paper_ids):
+    """P2-C idea-level novelty quick-check.
+
+    The gap audit validated the GAP's novelty (the mechanism is missing from the
+    literature), not the specific method's (someone may already have built this
+    exact technique). This check retrieves against the cluster's hypothesis +
+    primary mechanism and asks whether prior art directly implements it.
+
+    Returns (verdict, matched_paper_id) where verdict is one of:
+    - "disabled":           check turned off by configuration
+    - "already_implemented": demote the idea (METHOD_ALREADY_PUBLISHED) — the
+                            LLM identified a listed paper implementing the method
+    - "passed":             no direct implementation found among retrieved papers
+    - "passed_no_results":  retrieval succeeded but returned nothing (novel by
+                            absence of evidence, not proof — recorded as passed)
+    - "degraded":           infrastructure failure (LLM/search). NEVER demotes:
+                            an external-source outage is not evidence about the
+                            idea (distinct from a successful search that found
+                            prior art).
+    """
+    if not settings.idea_novelty_check_enabled:
+        return "disabled", None
+    from app.agent.steps.generate_queries import SearchQueryExecution
+    from app.agent.steps.search_papers import search_and_save_papers
+    from app.db.models import Paper, SearchQueryPaper
+    from app.db.repositories.search_query_repo import save_search_query
+
+    queries: list[str] = []
+    try:
+        spec = await llm.chat_json([
+            {"role": "system", "content": _IDEA_NOVELTY_QUERIES_SYSTEM},
+            {"role": "user", "content": json.dumps({
+                "hypothesis": cluster_hypothesis or "",
+                "primary_mechanism": intervention.proposed_intervention or "",
+                "failure_mechanism": intervention.failure_mechanism or "",
+            }, ensure_ascii=False)},
+        ], IdeaNoveltyQueriesSchema)
+        queries = [q.strip() for q in (spec.queries if spec else []) if q and q.strip()]
+    except Exception as exc:
+        logger.warning("Task %s: idea novelty query generation degraded: %s", task_id[:8], exc)
+        paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
+            "gap_id": gap.id, "intervention_id": intervention.id,
+            "verdict": "degraded", "stage": "query_generation", "error": str(exc)[:200],
+        })
+        return "degraded", None
+    if not queries:
+        paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
+            "gap_id": gap.id, "intervention_id": intervention.id,
+            "verdict": "degraded", "stage": "query_generation", "error": "no queries returned",
+        })
+        return "degraded", None
+
+    round_num = state.current_round
+    executions = []
+    for idx, text in enumerate(queries):
+        record = save_search_query(
+            db, task_id, text, f"idea_novelty_{idx + 1}", None, None, round_num,
+            target_gap_id=gap.id, query_family=f"idea_novelty_{idx + 1}",
+            search_policy_version=EXPERIMENT_GENERATION_POLICY_VERSION,
+        )
+        executions.append(SearchQueryExecution(
+            query_id=record.id, query_text=text, intent=f"idea_novelty_{idx + 1}",
+            target_question_id=None, expected_evidence_type=None, target_gap_id=gap.id,
+        ))
+    db.commit()
+    try:
+        await search_and_save_papers(db, state, executions, task_id, round_num)
+    except Exception as exc:
+        logger.warning("Task %s: idea novelty retrieval degraded: %s", task_id[:8], exc)
+        paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
+            "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
+            "verdict": "degraded", "stage": "retrieval", "error": str(exc)[:200],
+        })
+        return "degraded", None
+
+    # Top-k papers by rank across the novelty queries (dedup across queries).
+    top_rows = (
+        db.query(SearchQueryPaper, Paper)
+        .join(Paper, SearchQueryPaper.paper_id == Paper.id)
+        .filter(SearchQueryPaper.query_id.in_([e.query_id for e in executions]))
+        .order_by(SearchQueryPaper.rank)
+        .limit(settings.idea_novelty_check_top_k * 3)
+        .all()
+    )
+    seen_ids: set[str] = set()
+    top_papers: list[Paper] = []
+    for _sqp, paper in top_rows:
+        if paper.id in seen_ids:
+            continue
+        seen_ids.add(paper.id)
+        top_papers.append(paper)
+        if len(top_papers) >= settings.idea_novelty_check_top_k:
+            break
+    if not top_papers:
+        paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
+            "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
+            "verdict": "passed_no_results",
+        })
+        return "passed_no_results", None
+
+    paper_list = [{
+        "id": p.id, "title": (p.title or "")[:150], "abstract": (p.abstract or "")[:500],
+    } for p in top_papers]
+    try:
+        verdict = await llm.chat_json([
+            {"role": "system", "content": _IDEA_NOVELTY_VERDICT_SYSTEM},
+            {"role": "user", "content": json.dumps({
+                "hypothesis": cluster_hypothesis or "",
+                "proposed_method": intervention.proposed_intervention or "",
+                "papers": paper_list,
+            }, ensure_ascii=False)},
+        ], IdeaNoveltyVerdictSchema)
+    except Exception as exc:
+        logger.warning("Task %s: idea novelty verdict degraded: %s", task_id[:8], exc)
+        paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
+            "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
+            "verdict": "degraded", "stage": "verdict", "error": str(exc)[:200],
+        })
+        return "degraded", None
+    if verdict is None:
+        paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
+            "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
+            "verdict": "degraded", "stage": "verdict", "error": "no verdict returned",
+        })
+        return "degraded", None
+
+    matched = None
+    if verdict.already_implemented and verdict.evidence_paper_id and verdict.evidence_paper_id in seen_ids:
+        matched = verdict.evidence_paper_id
+    final_verdict = "already_implemented" if matched else "passed"
+    paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
+        "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
+        "verdict": final_verdict, "matched_paper_id": matched,
+        "rationale": (verdict.rationale or "")[:400],
+        "checked_paper_ids": [p.id for p in top_papers],
+    })
+    return final_verdict, matched
+
+
 class MinimalExperimentSchema(BaseModel):
+    # P2-B: title names the concrete mechanism (no "Minimal Experiment:" prefix
+    # — that prefix restates the gap topic and made sibling ideas read as
+    # duplicates); idea_method is the idea-level method sketch (hypothesis ->
+    # method -> expected outcome), distinct from the intervention's engineering
+    # description which used to be copied verbatim into method_sketch.
     title: str = Field(min_length=5)
+    idea_method: str = ""
     summary: str = Field(min_length=10)
     hypothesis: str = Field(min_length=10)
     dataset: str
@@ -314,7 +508,36 @@ def _validate_experiment_plan(
     return list(dict.fromkeys(failures))
 
 
-def _build_idea_motivation(gap: GapCandidate, intervention: InterventionCandidate) -> str:
+def _normalize_idea_title(title: str) -> str:
+    """P2-B: strip the legacy "Minimal Experiment:" style prefixes even when the
+    LLM still emits them despite the prompt constraint — the prefix restates the
+    gap topic and makes sibling ideas read as duplicates."""
+    text = (title or "").strip()
+    for prefix in ("Minimal Experiment:", "Minimal experiment:", "minimal experiment:"):
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].strip()
+            break
+    return text or "Untitled experiment"
+
+
+def _load_gap_evidence_claims(db, gap_id: str, limit: int = 2) -> list[str]:
+    """P2-B: quote the gap's supporting evidence claims verbatim so the idea's
+    motivation cites the actual text (previously it only said "3 traceable
+    evidence units", which a reader could not verify)."""
+    from app.db.models import EvidenceUnit, GapEvidenceLink
+    rows = (
+        db.query(EvidenceUnit.normalized_claim)
+        .join(GapEvidenceLink, GapEvidenceLink.evidence_id == EvidenceUnit.id)
+        .filter(GapEvidenceLink.gap_id == gap_id)
+        .order_by(GapEvidenceLink.relevance_score.desc().nullslast())
+        .limit(limit)
+        .all()
+    )
+    return [(r[0] or "").strip() for r in rows if (r[0] or "").strip()]
+
+
+def _build_idea_motivation(gap: GapCandidate, intervention: InterventionCandidate,
+                           evidence_claims: list[str] | None = None) -> str:
     """Compose a per-idea motivation that differs across interventions.
 
     Two interventions over the same gap used to share gap.observed_problem
@@ -322,17 +545,22 @@ def _build_idea_motivation(gap: GapCandidate, intervention: InterventionCandidat
     distinct failure mechanism so each idea states why *this* direction matters.
     E2E 2026-08-26: also lead with the intervention type, so two ideas diverge
     from the very first line instead of only in the trailing mechanism note.
+    P2-B: quote the top evidence claims verbatim so the motivation is
+    independently checkable against the evidence store.
     """
     observed = (gap.observed_problem or "").strip()
     mechanism = (intervention.failure_mechanism or "").strip()
     itype = (intervention.intervention_type or "").strip()
     if not observed:
         return mechanism or "(motivation not specified)"
-    if not mechanism:
-        return observed
     lead = f"{itype}: " if itype else ""
-    return (f"{lead}{observed}\n\nThis direction specifically targets the "
-            f"failure mechanism: {mechanism}.")
+    parts = [f"{lead}{observed}"]
+    if evidence_claims:
+        quoted = "\n".join(f"- \"{c[:280]}\"" for c in evidence_claims[:2])
+        parts.append(f"Supporting evidence (verbatim):\n{quoted}")
+    if mechanism:
+        parts.append(f"This direction specifically targets the failure mechanism: {mechanism}.")
+    return "\n\n".join(parts)
 
 
 async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: str) -> MinimalExperimentResult:
@@ -348,6 +576,29 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
         InterventionCandidate.contract_id == contract.id,
         InterventionCandidate.status == "passed",
     ).all()
+    # P2-B: when the phase RE-RUNS (policy bump / resume), ideas from the
+    # previous generation round are the old rules' output — soft-delete them so
+    # the task surfaces exactly one coherent generation instead of new + stale
+    # side by side (task 23ec8f20: v1 and v2/v3 ideas coexisted in the UI).
+    # The API exposes history via include_superseded=true. If this run produces
+    # zero new ideas, the honest state is "zero active ideas under the current
+    # rules", which is exactly the allowed-zero-candidates semantics.
+    if interventions:
+        from app.db.models import ResearchIdea
+        stale = db.query(ResearchIdea).filter(
+            ResearchIdea.task_id == task_id,
+            ResearchIdea.idea_status == "active",
+        ).all()
+        for stale_idea in stale:
+            stale_idea.idea_status = "superseded"
+        if stale:
+            db.commit()
+            paper_repo.save_trace(db, task_id, "supersede_stale_ideas", "decision", output_data={
+                "superseded_idea_ids": [s.id for s in stale],
+                "policy_version": EXPERIMENT_GENERATION_POLICY_VERSION,
+            })
+            logger.info("Task %s: superseded %d stale idea(s) from previous generation round",
+                        task_id[:8], len(stale))
     idea_ids = []
     experiment_ids = []
     seen_titles: set[str] = set()
@@ -485,7 +736,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             # De-duplicate titles: two interventions over the same gap can collapse
             # to an identical experiment title, which surfaces as duplicate ideas in
             # the UI. Append a short mechanism disambiguator when a title repeats.
-            final_title = plan.title
+            final_title = _normalize_idea_title(plan.title)
             if final_title in seen_titles:
                 mech = (intervention.failure_mechanism or "").strip()
                 suffix = mech[:40] if mech else "variant"
@@ -503,7 +754,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                         quality_reason_codes.append(f"{gate_name.upper()}_{gate_value}")
             if not phenomenon:
                 quality_reason_codes.append("MISSING_PHENOMENON_PLAN")
-            motivation = _build_idea_motivation(gap, intervention)
+            motivation = _build_idea_motivation(
+                gap, intervention,
+                evidence_claims=_load_gap_evidence_claims(db, gap.id))
             if variants:
                 # Cluster annotation: the variant mechanisms live on in this idea's
                 # experiment as ablation arms — surface that on the idea so the
@@ -517,7 +770,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 "title": final_title,
                 "description": plan.summary,
                 "motivation": motivation,
-                "method_sketch": intervention.proposed_intervention,
+                # P2-B: prefer the LLM's idea-level method sketch; fall back to
+                # the intervention text only when the model omitted the field.
+                "method_sketch": (plan.idea_method or "").strip() or intervention.proposed_intervention,
                 "expected_contribution": intervention.measurable_outcome,
                 "related_paper_ids_json": json.dumps(paper_ids, ensure_ascii=False),
                 "contract_id": contract.id,
@@ -547,6 +802,20 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 decision = "executable_candidate" if tier == "A" else "conditional_review"
                 if decision != "executable_candidate":
                     quality_reason_codes.append("EVIDENCE_OR_FEASIBILITY_REVIEW_REQUIRED")
+                # P2-C idea-level novelty quick-check: the gap audit validated
+                # the GAP's novelty, not the specific method's. Retrieve against
+                # the cluster's hypothesis + primary mechanism; a direct prior-
+                # art implementation demotes the idea to conditional_review.
+                # Infrastructure failures degrade to a trace and never demote.
+                novelty_verdict, matched_paper_id = await _check_idea_novelty(
+                    db, state, llm, task_id, gap,
+                    cluster["hypothesis"], intervention, paper_ids)
+                if novelty_verdict == "already_implemented":
+                    decision = "conditional_review"
+                    quality_reason_codes.append("METHOD_ALREADY_PUBLISHED")
+                    if matched_paper_id and matched_paper_id not in paper_ids:
+                        paper_ids.append(matched_paper_id)
+                        idea.related_paper_ids_json = json.dumps(paper_ids, ensure_ascii=False)
                 idea.quality_reason_codes_json = json.dumps(quality_reason_codes, ensure_ascii=False)
                 paper_repo.update_idea_scores(db, idea.id, score.model_dump(), final_score, decision)
                 paper_repo.save_trace(db, task_id, "idea_quality_gate", "decision", output_data={

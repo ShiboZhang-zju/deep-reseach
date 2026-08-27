@@ -16,6 +16,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.agent.steps.generate_minimal_experiments import (
+    EXPERIMENT_GENERATION_POLICY_VERSION,
+    IdeaNoveltyQueriesSchema,
+    IdeaNoveltyVerdictSchema,
     MinimalExperimentSchema,
     _cluster_interventions_by_hypothesis,
     _derive_scenario_atoms,
@@ -292,3 +295,191 @@ async def test_single_intervention_skips_cluster_llm(temp_db):
     assert clusters[0]["variants"] == []
     assert llm.cluster_calls == 0
     db.close()
+
+
+class _NoveltyMockLLM(_ClusterMockLLM):
+    """Extends the cluster mock with the P2-C novelty-check LLM branches."""
+
+    def __init__(self, cluster_response, plan_texts,
+                 novelty_queries=None, novelty_verdict=None):
+        super().__init__(cluster_response=cluster_response, plan_texts=plan_texts)
+        self.novelty_queries = novelty_queries
+        self.novelty_verdict = novelty_verdict
+
+    async def chat_json(self, messages, schema):
+        name = schema.__name__
+        if name == "IdeaNoveltyQueriesSchema":
+            if isinstance(self.novelty_queries, Exception):
+                raise self.novelty_queries
+            if self.novelty_queries is None:
+                return None
+            return IdeaNoveltyQueriesSchema(queries=self.novelty_queries)
+        if name == "IdeaNoveltyVerdictSchema":
+            if isinstance(self.novelty_verdict, Exception):
+                raise self.novelty_verdict
+            if self.novelty_verdict is None:
+                return None
+            return self.novelty_verdict
+        return await super().chat_json(messages, schema)
+
+
+def _patch_retrieval(monkeypatch, prior_art_id):
+    """Replace external retrieval with a fake that surfaces one prior-art paper."""
+    from app.db.models import SearchQueryPaper
+
+    async def fake_search(db, state, executions, task_id, round_num):
+        for e in executions:
+            db.add(SearchQueryPaper(query_id=e.query_id, paper_id=prior_art_id,
+                                     rank=1, source="test", is_new_for_task=False))
+        db.commit()
+        return (1, 1, [])
+
+    monkeypatch.setattr("app.agent.steps.search_papers.search_and_save_papers", fake_search)
+
+
+def _seed_prior_art(db, title="Directly implements the diff-risk classifier"):
+    from app.db.models import Paper
+    paper = Paper(title=title, abstract="Prior art implementing the exact method.",
+                  citation_count=1)
+    db.add(paper)
+    db.commit()
+    return paper
+
+
+@pytest.mark.asyncio
+async def test_novelty_check_demotes_already_implemented(temp_db, monkeypatch):
+    """P2-C: prior art directly implementing the method demotes the idea to
+    conditional_review with METHOD_ALREADY_PUBLISHED and links the paper."""
+    from app.agent.state import ResearchState
+    from app.db.models import AgentTrace, Paper, ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=1)
+    prior_art = _seed_prior_art(db)
+    _patch_retrieval(monkeypatch, prior_art.id)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _NoveltyMockLLM(
+        cluster_response=None, plan_texts=atoms,
+        novelty_queries=["diff risk classifier correction filtering",
+                         "patch classification regression risk",
+                         "program repair patch filtering"],
+        novelty_verdict=IdeaNoveltyVerdictSchema(
+            already_implemented=True, evidence_paper_id=prior_art.id,
+            rationale="The paper builds the same classifier for the same purpose."),
+    )
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    idea = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).one()
+    assert idea.decision == "conditional_review"
+    assert "METHOD_ALREADY_PUBLISHED" in json.loads(idea.quality_reason_codes_json or "[]")
+    assert prior_art.id in json.loads(idea.related_paper_ids_json or "[]")
+    traces = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id, AgentTrace.step_name == "idea_novelty_check").all()
+    assert any(json.loads(t.output_json).get("verdict") == "already_implemented" for t in traces)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_novelty_check_passed_keeps_executable(temp_db, monkeypatch):
+    """Related-but-different prior art must NOT demote."""
+    from app.agent.state import ResearchState
+    from app.db.models import ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=1)
+    prior_art = _seed_prior_art(db, title="A survey of code correction (different technique)")
+    _patch_retrieval(monkeypatch, prior_art.id)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _NoveltyMockLLM(
+        cluster_response=None, plan_texts=atoms,
+        novelty_queries=["diff risk classifier correction filtering"],
+        novelty_verdict=IdeaNoveltyVerdictSchema(
+            already_implemented=False, evidence_paper_id=None,
+            rationale="Survey is related work, not the same mechanism."),
+    )
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    idea = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).one()
+    assert idea.decision == "executable_candidate"
+    assert "METHOD_ALREADY_PUBLISHED" not in json.loads(idea.quality_reason_codes_json or "[]")
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
+    """Infrastructure failure (query generation raises) degrades to a trace and
+    keeps the executable decision — an outage is not evidence about the idea."""
+    from app.agent.state import ResearchState
+    from app.db.models import AgentTrace, ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=1)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _NoveltyMockLLM(
+        cluster_response=None, plan_texts=atoms,
+        novelty_queries=RuntimeError("gateway 502"),
+    )
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    idea = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).one()
+    assert idea.decision == "executable_candidate"
+    traces = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id, AgentTrace.step_name == "idea_novelty_check").all()
+    assert any(json.loads(t.output_json).get("verdict") == "degraded" for t in traces)
+    db.close()
+
+
+def test_policy_version_bumped():
+    """The experiment policy version encodes the novelty-check rules."""
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "idea-metadata-v4"
+
+
+@pytest.mark.asyncio
+async def test_stale_ideas_superseded_on_regenerate(temp_db):
+    """P2-B: a phase re-run soft-deletes the previous round's active ideas so the
+    task surfaces one coherent generation (task 23ec8f20: v1/v2/v3 ideas
+    coexisted side by side in the UI)."""
+    from app.agent.state import ResearchState
+    from app.db.models import ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=1)
+    stale = ResearchIdea(task_id=task.id, title="Old round idea", description="old",
+                         motivation="old", method_sketch="old",
+                         expected_contribution="old", decision="executable_candidate",
+                         idea_status="active", score_status="unscored",
+                         related_paper_ids_json="[]")
+    db.add(stale)
+    db.commit()
+    stale_id = stale.id
+
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _ClusterMockLLM(cluster_response=None, plan_texts=atoms)
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    old = db.query(ResearchIdea).filter(ResearchIdea.id == stale_id).one()
+    assert old.idea_status == "superseded"
+    fresh = db.query(ResearchIdea).filter(
+        ResearchIdea.task_id == task.id, ResearchIdea.idea_status == "active").all()
+    assert len(fresh) == 1
+    # P2-B: title prefix is stripped even if the model emits it.
+    assert not fresh[0].title.lower().startswith("minimal experiment")
+
+
+def test_normalize_idea_title_strips_prefix():
+    from app.agent.steps.generate_minimal_experiments import _normalize_idea_title
+    assert _normalize_idea_title("Minimal Experiment: Foo Bar") == "Foo Bar"
+    assert _normalize_idea_title("  Diff-Risk Classification  ") == "Diff-Risk Classification"
+    assert _normalize_idea_title("") == "Untitled experiment"

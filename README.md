@@ -594,7 +594,7 @@ rejected                # 实验计划被质量门禁拒绝（trace 记录 reaso
 
 系统允许产出 0 个 `executable_candidate`（证据不足时诚实拒绝优于生成不可靠产物）。E2E 实证（任务 23ec8f20）：最高分 idea（0.7435）因跨语言 benchmark 的实验载体不足被判 `conditional_review`，评分排序未越过硬门禁。
 
-### Hypothesis cluster 门禁（`EXPERIMENT_GENERATION_POLICY_VERSION` = hypothesis-cluster-v2）
+### Hypothesis cluster 门禁与 idea 级新颖性检索（P2，`EXPERIMENT_GENERATION_POLICY_VERSION` = idea-metadata-v4）
 
 同一 Gap 的多个 passed intervention 在生成实验计划前先做一次 LLM 结构化聚簇（`_cluster_interventions_by_hypothesis`），判定标准是"检验的实验假设是否相同"（测什么）而非"机制是否相似"（怎么做）：
 
@@ -602,7 +602,11 @@ rejected                # 实验计划被质量门禁拒绝（trace 记录 reaso
 - LLM 聚簇失败 / 任一簇 confidence < 0.7 / 出现未知 intervention id 时保守降级：不合并（每个 intervention 独立成簇），记 `hypothesis_cluster` trace
 - 实验计划被质量校验拒绝后带 reason_codes 反馈重试一次（场景原子为字面子串匹配，如 "verification" 不满足原子 "verifier"，重试要求原子词逐字出现在 dataset/oracle/steps 等字段）；仍失败才判 rejected，trace 记录 `retry_attempted` 与被拒计划摘要
 
-E2E 实证：5 个 passed interventions 聚成 3 簇，产出 3 Idea + 3 实验（旧逻辑产出 5 个平行 Idea，其中两个检验同一假设却包装独立）。
+**idea 级 novelty 快检（P2-C）**：Gap 审计验证的是 GAP 的新颖性（机制缺失），不是具体方法的新颖性（可能已有人造出了这个技术）。每个 cluster 的 idea 在定级后执行独立检索：LLM 生成 3 条对抗查询（exact-method / method-neighbour / **adjacent-domain**——把方法投射到最可能率先发表它的相邻领域，如 correction filtering → program repair patch filtering），按 rank 取 top-5 论文，LLM 保守判定"是否直接实现了同一机制+同一目的"。命中 → 降级 `conditional_review` + `METHOD_ALREADY_PUBLISHED` + 命中论文并入 related_paper_ids；**基础设施失败（LLM/检索异常）只记 trace 不降级**——外部源波动不是关于 idea 的证据。E2E 实证：三组查询全部覆盖 program repair 方向，verdict 全部 passed（无误杀）。
+
+**idea 元数据差异化（P2-B）**：title 由模型按具体机制命名（"Diff-Risk Classification for Self-Correction Filtering"），prompt 禁止 + 代码 strip 双保险杜绝 "Minimal Experiment:" 前缀；method_sketch 使用 idea 视角的假设-方法-预期结果概述（`idea_method` 字段），不再逐字复制 intervention 工程描述；motivation 逐字引用 gap 的 top-2 证据 claim（可独立核对）；阶段重跑时上一代 active idea 全部软删除（`superseded`，API 经 `include_superseded=true` 可看历史），任务始终只呈现当前规则下的一代产物——重跑产出 0 个新 idea 时如实显示 0（允许零候选语义）。
+
+E2E 实证：5 个 passed interventions 聚成 3 簇，产 3 Idea + 3 实验（旧逻辑产出 5 个平行 Idea，其中两个检验同一假设却包装独立）；历史 8 个旧代 idea 全部 superseded。
 
 ## 去重策略（优先级从高到低）
 
@@ -922,8 +926,10 @@ async def run_task(task_id: str):
 - [x] **enrichment 唯一索引守卫**：S2 给重复行补 DOI 毒化 agent session 的 IntegrityError（写入前查重 + 写区段串行化）
 - [x] **实验计划反馈重试**：质量门禁拒绝后带 reason_codes 重写一次（场景原子字面匹配的措辞问题不放松门禁）；rejected trace 记录计划摘要（修诊断盲区）
 - [x] **hypothesis cluster 门禁**（P2-A，EXPERIMENT_GENERATION_POLICY_VERSION = hypothesis-cluster-v2）：同 Gap 多干预按"检验的假设"聚簇，同簇 1 Idea + 变体并入消融臂；Idea 四级分类（executable_candidate / conditional_review / research_direction_only / rejected）由代码门禁定级，评分只排序
+- [x] **idea 级 novelty 快检**（P2-C）：cluster 假设 + 机制生成 3 条对抗查询（含 adjacent-domain 家族引入相邻领域文献），命中直接实现 → 降级 conditional_review + METHOD_ALREADY_PUBLISHED；基础设施失败只记 trace 不降级
+- [x] **idea 元数据差异化**（P2-B）：title 按机制命名（禁前缀 + 代码 strip 兜底）、method_sketch 用 idea 视角概述（idea_method）、motivation 逐字引用证据 claim、重跑时旧代 idea 全部 superseded（单代呈现）
 - [x] **LLM 供应商熔断**：连续 2 次失败冷却（30s 起步指数退避，上限 300s）
-- [x] **测试**：后端 329 个测试通过
+- [x] **测试**：后端 335 个测试通过
 
 **E2E 实证**（任务 23ec8f20，Test-Time Verification 主题，三次续跑迭代）：560 篇论文 → 2 个 surviving Gap（收窄链 v1 partially_closed → narrow → v2 confirmed 完整走通）→ 5 个 passed interventions 聚 3 簇 → 3 个 Idea（2 executable + 1 conditional_review）+ 3 份实验计划，终态 `waiting_for_user_review`。对照基线任务 9e56a131（修复前同主题）：9 个候选 Gap 全部 inconclusive、0 Idea、`no_surviving_gap_after_audit`。
 

@@ -338,6 +338,14 @@ class Settings(BaseSettings):
     audit_neighbor_evidence_extraction: bool = True
     audit_neighbor_evidence_max_papers: int = 5
 
+    # P2-C idea-level novelty quick-check (generate_minimal_experiments):
+    # retrieval against each hypothesis cluster's hypothesis + primary
+    # mechanism. already_implemented verdicts demote the idea to
+    # conditional_review (METHOD_ALREADY_PUBLISHED); retrieval-infrastructure
+    # failures degrade to a trace, never a demotion.
+    idea_novelty_check_enabled: bool = True
+    idea_novelty_check_top_k: int = 5
+
     @property
     def effective_openalex_rate_per_min(self) -> int:
         """OpenAlex rate: high when an email/key is present (polite pool)."""
