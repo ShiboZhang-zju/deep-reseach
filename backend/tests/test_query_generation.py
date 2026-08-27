@@ -146,12 +146,53 @@ async def test_under_two_valid_variants_marks_query_generation_invalid(temp_db, 
 
     db = temp_db()
     task, gap = _seed_gap(db)
+    # P1-2 (task 9e56a131): validation failure no longer drops the family —
+    # raw LLM variants run flagged LOW_CONFIDENCE_VARIANTS. Dropping 4/5
+    # families this way left the audit with a single family and it failed
+    # admission on INSUFFICIENT_QUERY_FAMILIES before any search even ran.
     llm = IntentLLM([_intent(n_variants=3)])
     specs = await ag.generate_english_adversarial_queries(db, llm, gap)
+    assert len(specs) == 3
 
-    # All variants drifted and could not be regenerated -> no valid family, so the
-    # query set is EMPTY (never an invalid family masquerading as queries).
-    assert len(specs) == 0
+    # With unusable raw variants BUT a complete structured intent, the family
+    # is now synthesized from its structured fields (SYNTHESIZED_VARIANTS) —
+    # never dropped, never an invalid family masquerading as queries.
+    blank = _intent(n_variants=2)
+    blank = blank.model_copy(update={"variants": ["  ", ""]})
+    llm_blank = IntentLLM([blank])
+    specs_blank = await ag.generate_english_adversarial_queries(db, llm_blank, gap)
+    assert len(specs_blank) == 2
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_variants_with_structured_intent_synthesizes_queries(temp_db, monkeypatch):
+    """Tier-3 fallback (task 23ec8f20 re-audit): the two-step generator returned
+    complete canonical intents but an EMPTY variants list (default_factory=list
+    bypasses min_length), 4/5 families were dropped, and the gap failed
+    admission on INSUFFICIENT_QUERY_FAMILIES twice. A complete structured
+    intent must yield synthesized family queries instead of being dropped."""
+    import app.agent.steps.audit_gaps as ag
+
+    async def _always_drifted(canonical_text, variant, threshold):
+        return False
+    async def _regenerate_empty(llm, intent, bad_variant):
+        return ""
+    monkeypatch.setattr(ag, "_variant_is_invariant", _always_drifted)
+    monkeypatch.setattr(ag, "_regenerate_variant", _regenerate_empty)
+
+    db = temp_db()
+    task, gap = _seed_gap(db)
+    # Complete structured intent, empty variants — the exact 23ec8f20 shape.
+    intent = _intent(n_variants=2).model_copy(update={"variants": []})
+    llm = IntentLLM([intent])
+    specs = await ag.generate_english_adversarial_queries(db, llm, gap)
+
+    # Two synthesized variants per family, all tagged with the family.
+    assert len(specs) == 2
+    assert all(s.family == "exact_gap" for s in specs)
+    assert all(len(s.query_text) >= 20 for s in specs)
+    assert len({s.query_text for s in specs}) == 2  # distinct variants
     db.close()
 
 

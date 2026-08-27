@@ -364,6 +364,11 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
     for (prio, sec_name, chunk_text, chunk_hash), evidence_list in zip(candidates, extraction_results):
         page_num = _find_page_for_text(chunk_text, page_texts, sec_name)
         for ev in evidence_list:
+            normalized_claim = (ev.normalized_claim or "").strip()
+            if len(normalized_claim) < 5:
+                logger.debug("Paper %s: evidence missing a valid normalized_claim, skipping",
+                             paper.id[:8])
+                continue
             # (#6) Validate original_span exists in chunk
             located = locate_span_in_chunk(ev.original_span, chunk_text)
             if located is None:
@@ -383,7 +388,7 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
                 task_id=task_id,
                 paper_id=paper.id,
                 evidence_type=ev.evidence_type,
-                normalized_claim=ev.normalized_claim,
+                normalized_claim=normalized_claim,
                 original_span=ev.original_span[:500] if ev.original_span else "",
                 section=sec_name,
                 page_number=page_num,
@@ -426,12 +431,17 @@ async def _extract_from_abstract(db, llm, task_id, paper, abstract, round_number
         evidence_list = result.evidence_units
         evidence_count = 0
         for ev in evidence_list:
+            normalized_claim = (ev.normalized_claim or "").strip()
+            if len(normalized_claim) < 5:
+                logger.debug("Paper %s: abstract evidence missing a valid normalized_claim, skipping",
+                             paper.id[:8])
+                continue
             span_pos = find_span_in_chunk(ev.original_span, abstract)
             eu = EvidenceUnit(
                 task_id=task_id,
                 paper_id=paper.id,
                 evidence_type=ev.evidence_type,
-                normalized_claim=ev.normalized_claim,
+                normalized_claim=normalized_claim,
                 original_span=ev.original_span[:500] if ev.original_span else "",
                 section="abstract",
                 page_number=None,

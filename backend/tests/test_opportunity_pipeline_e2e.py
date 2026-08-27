@@ -70,7 +70,10 @@ class ScriptedLLM:
             )])
         if schema.__name__ == "MinimalExperimentSchema":
             from app.agent.steps.generate_minimal_experiments import MinimalExperimentSchema
-            return MinimalExperimentSchema(title="State-change memory evaluation", summary="A minimal evaluation of state-change retention.", hypothesis="State changes reduce fixed-budget memory accuracy.", dataset="A small existing task subset", baselines="Existing memory baseline", metrics="State-change accuracy", controls=["same budget"], steps=["Construct stable and state-change examples", "Compare the same memory baseline"], success_condition="The difference is measurable.", falsification_condition="No difference appears.")
+            return MinimalExperimentSchema(title="State-change memory evaluation", summary="A minimal evaluation of state-change retention.", hypothesis="State changes reduce fixed-budget memory accuracy.", dataset="A small existing state-change task subset", baselines="Existing memory baseline", metrics="State-change accuracy", model_spec="3B inference-only model", dataset_provenance="Existing task subset; verify source availability", oracle="Executable held-out tests plus manual adjudication", statistical_analysis="Paired bootstrap confidence interval", resource_budget="One CPU run within 30 minutes", scenario_atoms=["state change"], controls=["same budget"], steps=["Construct stable and state-change examples", "Compare the same memory baseline"], success_condition="The difference is measurable.", falsification_condition="No difference appears.")
+        if schema.__name__ == "IdeaScore":
+            from app.schemas.schemas import IdeaScore
+            return IdeaScore(novelty=0.8, feasibility=0.8, significance=0.8, evidence_support=0.8, differentiation=0.7, experimentability=0.9, potential_impact=0.8, risk=0.1, reason="Grounded in the confirmed state-change gap.")
         raise AssertionError(f"Unexpected schema: {schema.__name__}")
 
 
@@ -136,6 +139,17 @@ async def test_opportunity_pipeline_is_lineage_safe_and_idempotent(temp_db, monk
     llm = ScriptedLLM()
     gaps = await mine_gap_candidates(db, state, llm, task.id)
     audits = await audit_gap_candidates(db, state, llm, task.id)
+    from app.db.models import GapPhenomenonPlan
+    db.add(GapPhenomenonPlan(task_id=task.id, contract_id=contract.id, gap_id=gaps[0].id,
+                             phenomenon="State changes cause measurable memory degradation.",
+                             mechanism_under_test="State-change retention under fixed budget.",
+                             supports_gap_claim="State-change accuracy is lower than stable-fact accuracy.",
+                             critical_unknown="Whether the drop exceeds baseline variance.",
+                             expected_observation="Lower state-change accuracy.",
+                             alternative_explanation="Task complexity differs.", comparator="H0 no accuracy gap; H1 lower state-change accuracy.",
+                             oracle_experiment="Compare executable held-out tests.", kill_criterion="No meaningful accuracy gap.",
+                             kill_criterion_basis="minimum_meaningful_effect: pre-registered effect.", measurement="state-change accuracy"))
+    db.flush()
     interventions = await generate_interventions(db, state, llm, task.id)
     experiments = await generate_minimal_experiments(db, state, llm, task.id)
 
@@ -148,8 +162,10 @@ async def test_opportunity_pipeline_is_lineage_safe_and_idempotent(temp_db, monk
     assert idea.gap_id == gaps[0].id
     assert idea.intervention_id == interventions.passed_intervention_ids[0]
     assert idea.pipeline_version == 2
-    assert idea.decision == "conditional_go"
-    assert idea.final_score is None
+    assert idea.decision == "executable_candidate"
+    assert idea.quality_reason_codes_json == "[]"
+    assert idea.final_score is not None
+    assert idea.final_score > 0.0
 
     calls_before = list(llm.calls)
     assert await mine_gap_candidates(db, state, llm, task.id)

@@ -52,15 +52,11 @@ from app.agent.steps import (
 from app.agent.steps.analyze_papers import analyze_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION, compute_evidence_fingerprint
 from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION
-from app.agent.steps.narrow_gaps import MAX_NARROW_ATTEMPTS, narrow_audited_gaps
-
-# Upper bound on narrowing passes in one pipeline run. Each pass advances a
-# single gap by one attempt, so this covers roughly four gaps at
-# MAX_NARROW_ATTEMPTS each — beyond that, more papers are more useful than a
-# smaller claim.
-_MAX_NARROW_ITERATIONS = MAX_NARROW_ATTEMPTS * 4
+from app.agent.steps.generate_minimal_experiments import EXPERIMENT_GENERATION_POLICY_VERSION
+from app.agent.steps.narrow_gaps import narrow_audited_gaps
 from app.llm.factory import get_llm
 from app.llm.base import LLMBudgetExceeded, LLMContextOverflow
+from app.llm.fallback_provider import set_observation_context
 from app.services.event_service import emit_event, emit_event_with_cleanup
 
 logger = logging.getLogger(__name__)
@@ -335,6 +331,20 @@ def recover_interrupted_tasks():
         db.close()
 
 
+async def _save_llm_observability(db, task_id: str, llm) -> None:
+    """Persist provider/circuit metrics without masking the task outcome."""
+    if not llm or not hasattr(llm, "get_observability"):
+        return
+    metrics = llm.get_observability(task_id)
+    if not metrics.get("logical_calls"):
+        return
+    paper_repo.save_trace(
+        db, task_id, "llm_provider_observability", "observation",
+        output_data=metrics,
+    )
+    db.commit()
+
+
 async def run_task(task_id: str):
     """Main agent loop.
 
@@ -347,9 +357,13 @@ async def run_task(task_id: str):
     is already set.
     """
     db = SessionLocal()
+    llm = None
+    set_observation_context(task_id)
     try:
         state = task_repo.get_state(db, task_id)
         llm = get_llm()
+        if hasattr(llm, "reset_observability"):
+            llm.reset_observability(task_id)
         # A resumed task still carries the stop_reason of the run that ended
         # (e.g. "interrupted_by_restart", or a previous terminal reason).
         # Leaving it in place makes the API/UI report a stale terminal reason
@@ -606,6 +620,14 @@ async def run_task(task_id: str):
             task_repo.update_stop_reason(db, task_id, "llm_budget_exceeded")
             db.commit()
     finally:
+        try:
+            await _save_llm_observability(db, task_id, llm)
+        except Exception as observability_error:
+            db.rollback()
+            logger.warning("Task %s: failed to save LLM observability: %s",
+                           task_id[:8], observability_error)
+        if llm is not None and hasattr(llm, "reset_observability"):
+            llm.reset_observability(task_id)
         db.close()
 
 
@@ -696,80 +718,120 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
     # iterations that gap narrowing can consume — narrowing re-audits without
     # spending a remediation round, so it needs its own headroom.
     #
-    # Narrowing headroom is per gap, not per batch: in practice one audit round
-    # leaves a single gap at partially_closed while the others are still
-    # undecided, so each pass advances one gap and costs one iteration (observed:
-    # 3 consecutive single-gap narrowing passes on one task). Budgeting only
-    # MAX_NARROW_ATTEMPTS would exhaust the loop mid-narrowing and end the task
-    # as more_research_required with work still pending. The narrowing passes are
-    # counted separately so they cannot silently eat the remediation budget.
-    narrow_iterations = 0
+    # Narrowing is separately budgeted from O2 remediation because it re-runs
+    # adversarial search without collecting a new paper round. Persist the
+    # counter in ResearchState so a backend restart cannot reset the budget.
+    max_narrow_iterations = max(0, settings.max_narrowing_passes_total)
+    narrow_iterations = int(getattr(state, "narrowing_passes", 0))
     # Set to the gaps a narrowing pass just rewrote, so the next audit only
     # re-judges those. Everything else would be re-audited with an identical
     # claim and identical queries.
     pending_audit_gap_ids: list[str] | None = None
     max_pipeline_iters = (1 + settings.max_remediation_rounds_total
-                         + _MAX_NARROW_ITERATIONS)
+                         + max_narrow_iterations)
     for _iter in range(max_pipeline_iters):
         state = task_repo.get_state(db, task_id)
 
-        # --- Gap mining ---
-        logger.info("Task %s: mining evidence-backed gap candidates...", task_id[:8])
-        task_repo.update_status(db, task_id, "mining_gaps")
-        db.commit()
-        emit_event(task_id, "status", {"status": "mining_gaps"})
-        # Evidence-sensitive idempotency: hash the CURRENT evidence pool +
-        # question links into the mining input_version. A remediation round adds
-        # evidence without advancing current_round, so without this the version
-        # was unchanged and PhaseRun idempotency skipped mining, discarding the
-        # new evidence. The fingerprint is content-based (stable, sorted rows),
-        # so an unchanged pool hashes identically and only real changes re-mine.
-        evidence_fingerprint = compute_evidence_fingerprint(db, task_id)
-        gap_input_version = hashlib.sha256(json.dumps({
-            "contract_id": state.contract_id,
-            "round": state.current_round,
-            "pipeline_version": state.pipeline_version,
-            "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
-            "evidence_fingerprint": evidence_fingerprint,
-        }, sort_keys=True).encode()).hexdigest()
+        # P0-2: re-audit undetermined gaps instead of re-mining. On task
+        # 9e56a131 every remediation round re-mined reworded duplicates of gaps
+        # the audit had left undetermined (auditing / narrowed awaiting
+        # re-audit / inconclusive), each duplicate burned a full adversarial
+        # audit, and the originals were never re-judged on the richer pool.
+        # Re-open the undetermined gaps and audit them directly; mining only
+        # resumes once this pool empties (gaps rejected/confirmed), so fresh
+        # candidates are complementary rather than reworded.
+        undetermined_gaps = [g for g in gap_repo.list_gaps_for_contract(
+            db, task_id, state.contract_id)
+            if g.mining_policy_version == GAP_MINING_POLICY_VERSION
+            and g.status in ("auditing", "audited", "inconclusive")]
+        if (undetermined_gaps
+                and int(state.remediation_round or 0) > 0
+                and pending_audit_gap_ids is None):
+            for _g in undetermined_gaps:
+                _g.status = "candidate"
+            db.commit()
+            logger.info("Task %s: re-auditing %d undetermined gap(s) on the "
+                        "richer pool instead of re-mining (remediation round %d)",
+                        task_id[:8], len(undetermined_gaps), state.remediation_round)
+            emit_event(task_id, "status", {
+                "status": "auditing_gaps", "gap_count": len(undetermined_gaps),
+                "reaudit": True,
+            })
+            gaps = undetermined_gaps
+        else:
+            # --- Gap mining ---
+            logger.info("Task %s: mining evidence-backed gap candidates...", task_id[:8])
+            task_repo.update_status(db, task_id, "mining_gaps")
+            db.commit()
+            emit_event(task_id, "status", {"status": "mining_gaps"})
+            # Evidence-sensitive idempotency: hash the CURRENT evidence pool +
+            # question links into the mining input_version. A remediation round adds
+            # evidence without advancing current_round, so without this the version
+            # was unchanged and PhaseRun idempotency skipped mining, discarding the
+            # new evidence. The fingerprint is content-based (stable, sorted rows),
+            # so an unchanged pool hashes identically and only real changes re-mine.
+            evidence_fingerprint = compute_evidence_fingerprint(db, task_id)
+            gap_input_version = hashlib.sha256(json.dumps({
+                "contract_id": state.contract_id,
+                "round": state.current_round,
+                "pipeline_version": state.pipeline_version,
+                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+                "evidence_fingerprint": evidence_fingerprint,
+            }, sort_keys=True).encode()).hexdigest()
 
-        async def _mine_gaps_op(db):
-            return await mine_gap_candidates(
-                db, state, llm, task_id, input_version=gap_input_version)
+            async def _mine_gaps_op(db):
+                return await mine_gap_candidates(
+                    db, state, llm, task_id, input_version=gap_input_version)
 
-        try:
-            gaps = await phase_service.execute_phase(
-                db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
-            )
-        except LLMBudgetExceeded:
-            raise
-        except Exception as mining_err:
-            # Mining is a single LLM call over an evidence pool that grows with
-            # every round, so it is where a prompt first outgrows the context
-            # window. Failing the task discarded several rounds of retrieval,
-            # evidence and coverage — hours of work — over a recoverable
-            # input-size problem. Keep the output and let the task be resumed.
-            reason = ("gap_mining_prompt_too_large"
-                      if isinstance(mining_err, LLMContextOverflow)
-                      else f"gap_mining_failed: {str(mining_err)[:160]}")
-            logger.error("Task %s: gap mining failed (%s); degrading to "
-                         "more_research_required instead of discarding the run",
-                         task_id[:8], mining_err)
-            db.rollback()
+            try:
+                gaps = await phase_service.execute_phase(
+                    db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
+                )
+            except LLMBudgetExceeded:
+                raise
+            except Exception as mining_err:
+                # Mining is a single LLM call over an evidence pool that grows with
+                # every round, so it is where a prompt first outgrows the context
+                # window. Failing the task discarded several rounds of retrieval,
+                # evidence and coverage — hours of work — over a recoverable
+                # input-size problem. Keep the output and let the task be resumed.
+                reason = ("gap_mining_prompt_too_large"
+                          if isinstance(mining_err, LLMContextOverflow)
+                          else f"gap_mining_failed: {str(mining_err)[:160]}")
+                logger.error("Task %s: gap mining failed (%s); degrading to "
+                             "more_research_required instead of discarding the run",
+                             task_id[:8], mining_err)
+                db.rollback()
+                state = task_repo.get_state(db, task_id)
+                await _terminate_more_research(db, state, task_id,
+                                              "more_research_required", reason)
+                return
+            if gaps is None:
+                gaps = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
+                        if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
             state = task_repo.get_state(db, task_id)
-            await _terminate_more_research(db, state, task_id,
-                                          "more_research_required", reason)
-            return
-        if gaps is None:
-            gaps = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
-                    if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
-        state = task_repo.get_state(db, task_id)
-        if not gaps:
-            if await _try_remediate(db, state, llm, task_id, "no_evidence_backed_gap_candidates"):
-                continue
-            await _terminate_more_research(db, state, task_id,
-                                           "more_research_required", "no_evidence_backed_gap_candidates")
-            return
+            if not gaps:
+                # A resumed task can legitimately re-mine to zero NEW candidates
+                # when every LLM proposal duplicates an already-confirmed gap
+                # (dedup working as intended — task 23ec8f20 re-resume: all 3
+                # candidates rejected as DUPLICATE_GAP). Already-confirmed
+                # survivors must still flow downstream (re-audit is skipped,
+                # the survivor lookup picks them up) instead of terminating
+                # with no_evidence_backed_gap_candidates while a valid
+                # surviving gap sits in the DB.
+                confirmed_survivors = [
+                    g for g in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
+                    if g.mining_policy_version == GAP_MINING_POLICY_VERSION
+                    and g.status == "surviving"
+                ]
+                if confirmed_survivors:
+                    gaps = confirmed_survivors
+                else:
+                    if await _try_remediate(db, state, llm, task_id, "no_evidence_backed_gap_candidates"):
+                        continue
+                    await _terminate_more_research(db, state, task_id,
+                                                   "more_research_required", "no_evidence_backed_gap_candidates")
+                    return
 
         # --- Gap audit ---
         task_repo.update_status(db, task_id, "auditing_gaps")
@@ -807,6 +869,12 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             # the same reason mining includes its policy: changing the audit rules
             # must invalidate a previously stamped audit run.
             "gap_search_policy_version": GAP_SEARCH_POLICY_VERSION,
+            "claim_salvage_policy_version": "claim-salvage-v1",
+            # P0-2: the re-audit channel judges the SAME gaps against a pool the
+            # remediation round just enriched. Without this field the version
+            # hashes identically to the previous audit and PhaseRun idempotency
+            # replays the old verdict instead of re-judging on the new material.
+            "remediation_round": int(state.remediation_round or 0),
         }, sort_keys=True).encode()).hexdigest()
         if audit_gap_ids:
             await phase_service.execute_phase(
@@ -815,10 +883,17 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
             GapCandidate.task_id == task_id,
             GapCandidate.contract_id == state.contract_id,
-            GapCandidate.id.in_(current_gap_ids),
             GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
             GapCandidate.status == "surviving",
         ).all()]
+        # NOTE (P0-2 follow-up, task 23ec8f20): the survivor lookup is
+        # deliberately NOT restricted to current_gap_ids. "surviving" is a
+        # contract-level terminal state — a gap confirmed in an earlier loop
+        # iteration stays confirmed when a later re-audit round (targeting
+        # OTHER undetermined gaps) runs. Scoping the query to the current
+        # round's gap list dropped the already-confirmed survivor after a
+        # resume and burned the whole remediation budget re-deciding gaps
+        # while a valid survivor sat in the DB.
         task_repo.save_state(db, task_id, state)
         db.commit()
         state = task_repo.get_state(db, task_id)
@@ -826,15 +901,18 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             # A partially closed gap comes with an explicit remaining delta, so
             # shrink the claim to it and re-audit before paying for another
             # remediation round of paper collection.
-            if narrow_iterations < _MAX_NARROW_ITERATIONS:
+            if narrow_iterations < max_narrow_iterations:
                 narrowed = narrow_audited_gaps(db, state, task_id)
                 if narrowed:
                     narrow_iterations += 1
+                    state.narrowing_passes = narrow_iterations
+                    task_repo.save_state(db, task_id, state)
+                    db.commit()
                     # Only the rewritten gaps need a new verdict.
                     pending_audit_gap_ids = narrowed
                     logger.info("Task %s: narrowed %d audited gap(s), re-auditing "
                                 "(narrowing pass %d/%d)", task_id[:8], len(narrowed),
-                                narrow_iterations, _MAX_NARROW_ITERATIONS)
+                                narrow_iterations, max_narrow_iterations)
                     continue
             else:
                 logger.info("Task %s: narrowing budget exhausted (%d passes), "
@@ -925,6 +1003,11 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             "contract_id": state.contract_id,
             "pipeline_version": state.pipeline_version,
             "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+            # The experiment phase's own rules (e.g. rejection-aware feedback
+            # retry) belong in its input identity: changing them must
+            # invalidate a previously stamped run instead of replaying its
+            # old output (task 23ec8f20: idea_ids=[] replayed on resume).
+            "experiment_generation_policy_version": EXPERIMENT_GENERATION_POLICY_VERSION,
         }, sort_keys=True).encode()).hexdigest()
         experiment_result = await phase_service.execute_phase(
             db, task_id, "generate_minimal_experiments", _minimal_experiments_op,
@@ -936,7 +1019,8 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                 ResearchIdea.contract_id == state.contract_id,
                 ResearchIdea.intervention_id.in_(passed_intervention_ids),
                 ResearchIdea.pipeline_version == state.pipeline_version,
-                ResearchIdea.decision == "conditional_go",
+                ResearchIdea.decision.in_(["executable_candidate", "conditional_go"]),
+                ResearchIdea.final_score.isnot(None),
                 ResearchIdea.idea_status == "active",
             ).all()]
         else:
@@ -947,6 +1031,11 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             return
 
         # --- Success ---
+        # E2E 2026-08-26: close any auditing gaps before the terminal status.
+        # The more-research exits already did this via _terminate_more_research;
+        # a successful run that leaves uncertain gaps dangling in "auditing"
+        # shows a perpetual "in progress" state in the UI after the task ended.
+        _finalize_inconclusive_gaps(db, task_id)
         await _generate_landscape_brief_phase(
             db, state, task_id, "waiting_for_user_review", "evidence_grounded_ideas_ready")
         task_repo.update_status(db, task_id, "waiting_for_user_review")
@@ -992,15 +1081,26 @@ async def _try_remediate(db, state: ResearchState, llm, task_id: str, reason: st
         return False
     logger.info("Task %s: remediation added %d papers, %d evidence (exhausted=%s)",
                 task_id[:8], result.new_paper_count, result.new_evidence_count, result.exhausted)
+    if result.new_paper_count <= 0 and result.new_evidence_count <= 0:
+        # The attempt is already charged to the persisted budget, but retrying
+        # the entire opportunity pipeline with an unchanged evidence pool only
+        # repeats the same audit and can consume another long pass.
+        logger.info("Task %s: remediation made no progress; terminating this gate",
+                    task_id[:8])
+        return False
     return True
 
 
 async def run_experiment_generation(task_id: str, idea_ids: list[str]):
     """Generate experiment plans for selected ideas."""
     db = SessionLocal()
+    llm = None
+    set_observation_context(task_id)
     try:
         state = task_repo.get_state(db, task_id)
         llm = get_llm()
+        if hasattr(llm, "reset_observability"):
+            llm.reset_observability(task_id)
 
         task_repo.update_status(db, task_id, "judging_ideas")
         emit_event(task_id, "status", {"status": "judging_ideas"})
@@ -1008,17 +1108,27 @@ async def run_experiment_generation(task_id: str, idea_ids: list[str]):
         result = await generate_experiments(db, state, llm, task_id, idea_ids)
 
         if result.get("status") == "need_more_research":
+            _finalize_inconclusive_gaps(db, task_id)
             task_repo.update_status(db, task_id, "waiting_for_user_review")
             emit_event(task_id, "status", {"status": "waiting_for_user_review", "reason": "no_idea_ready"})
             db.commit()
             return result
 
+        _finalize_inconclusive_gaps(db, task_id)
         task_repo.update_status(db, task_id, "done")
         emit_event_with_cleanup(task_id, "status", {"status": "done"})
         db.commit()
         return result
 
     finally:
+        try:
+            await _save_llm_observability(db, task_id, llm)
+        except Exception as observability_error:
+            db.rollback()
+            logger.warning("Task %s: failed to save LLM observability: %s",
+                           task_id[:8], observability_error)
+        if llm is not None and hasattr(llm, "reset_observability"):
+            llm.reset_observability(task_id)
         db.close()
 
 
@@ -1760,6 +1870,7 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
         if go_count > 0 or revise_count > 0:
             logger.info("Task %s: ideas ready (%d go, %d revise), waiting for user review",
                        task_id[:8], go_count, revise_count)
+            _finalize_inconclusive_gaps(db, task_id)
             task_repo.update_status(db, task_id, "waiting_for_user_review")
             emit_event(task_id, "status", {"status": "waiting_for_user_review"})
             db.commit()

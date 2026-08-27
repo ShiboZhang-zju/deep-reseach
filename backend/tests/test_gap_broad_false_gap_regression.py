@@ -214,7 +214,7 @@ def _pin_admission_and_neighbors(monkeypatch, db, gap, neighbor):
     monkeypatch.setattr(module, "evaluate_gap_search_admission",
                         lambda db, gap, query_ids: Admission())
     monkeypatch.setattr(module, "select_gap_specific_neighbors",
-                        lambda db, gap, query_ids, limit=5: [neighbor])
+                        lambda db, gap, query_ids, limit=5, **kwargs: [neighbor])
     return neighbor
 
 

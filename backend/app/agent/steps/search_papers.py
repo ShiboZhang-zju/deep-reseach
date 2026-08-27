@@ -241,11 +241,13 @@ async def search_and_save_papers(db, state: ResearchState,
     logger.info("Round %d: %d raw papers, %d after dedup, %d completed queries, %d failed",
                 round_num, papers_found, len(deduped), len(completed_query_ids), len(failed_query_ids))
 
-    # P1-8: Async metadata enrichment for newly found papers (non-blocking).
-    # O3: skippable — without an S2 key it competes with the main search loop
-    # for the same rate-limited quota and slows it down for little gain.
+    # Metadata enrichment must share the phase session and run after the search
+    # commit. Fire-and-forget with a second SessionLocal let it race the main
+    # pipeline for SQLite's single writer and caused silent enrichment loss.
+    # It remains best-effort, but its writes are now part of the caller's next
+    # phase commit rather than an independent background transaction.
     if new_paper_ids and settings.enable_metadata_enrichment:
-        asyncio.create_task(_trigger_metadata_enrichment(list(new_paper_ids)))
+        await _trigger_metadata_enrichment(list(new_paper_ids), db)
 
     return papers_found, len(deduped), new_paper_ids
 
@@ -327,15 +329,16 @@ async def _prefilter_by_similarity(raw_papers: list, state: ResearchState,
         return raw_papers
 
 
-async def _trigger_metadata_enrichment(paper_ids: list[str]):
-    """Fire-and-forget metadata enrichment for newly discovered papers.
+async def _trigger_metadata_enrichment(paper_ids: list[str], db):
+    """Run best-effort enrichment in the current phase session.
 
-    Runs in background — does not block the search loop. Failures are logged
-    but do not affect the main task.
+    The call is intentionally awaited so it cannot write SQLite concurrently
+    with the search phase. The shared session is not committed here; the
+    caller owns the transaction boundary.
     """
     try:
         from app.services.metadata_enrichment import enrich_papers_metadata
-        result = await enrich_papers_metadata(paper_ids)
+        result = await enrich_papers_metadata(paper_ids, db_session=db)
         if result.get("enriched", 0) > 0:
             logger.info("Metadata enrichment: %s", result)
     except Exception as e:

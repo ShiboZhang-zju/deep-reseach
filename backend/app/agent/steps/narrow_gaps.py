@@ -90,7 +90,7 @@ def narrow_audited_gaps(db, state: ResearchState, task_id: str) -> list[str]:
             skipped.append({"gap_id": gap.id, "reason": "NO_CONCRETE_REMAINING_DELTA"})
             continue
         attempts = _narrow_attempts(db, gap.id)
-        if attempts > MAX_NARROW_ATTEMPTS:
+        if attempts >= MAX_NARROW_ATTEMPTS:
             skipped.append({"gap_id": gap.id, "reason": "NARROW_ATTEMPTS_EXHAUSTED",
                             "attempts": attempts})
             continue

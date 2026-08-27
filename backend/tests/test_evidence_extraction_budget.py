@@ -81,6 +81,20 @@ class _CapturingLLM:
         return schema(evidence_units=[])
 
 
+def test_missing_normalized_claim_is_parseable_but_not_valid_for_persistence():
+    from app.schemas.schemas import EvidenceExtractionList
+
+    result = EvidenceExtractionList.model_validate({
+        "evidence_units": [
+            {"evidence_type": "result", "original_span": "missing claim"},
+            {"evidence_type": "limitation", "normalized_claim": "A valid claim", "original_span": "valid"},
+        ]
+    })
+
+    assert result.evidence_units[0].normalized_claim is None
+    assert result.evidence_units[1].normalized_claim == "A valid claim"
+
+
 @pytest.mark.asyncio
 async def test_section_specific_hints_reach_the_model():
     """The hints only work if the real section name is passed through."""

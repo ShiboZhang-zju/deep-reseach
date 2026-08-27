@@ -3,11 +3,13 @@
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from collections import defaultdict
 
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.agent.state import ResearchState
 from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
@@ -29,6 +31,18 @@ _MIN_NEIGHBOR_SIMILARITY = 0.3
 # contradictory signal that flags retrieval failure (observed: 5 application-
 # domain neighbors at max similarity 0.15 yet novelty_confidence 0.95).
 _HIGH_NOVELTY = 0.8
+# E2E 2026-08-26: the surviving gap's audit output had structured fields
+# confirmed/continue while its own remaining_delta concluded verbatim
+# "Therefore, the decision is uncertain." Match only unambiguous
+# conclusion-of-uncertainty phrasings; anything weaker is left to the verdict
+# fields so this guard cannot fire on hedged-but-committed text.
+_AUDIT_TEXT_CONFLICT_RE = re.compile(
+    r"\bdecision is (?:uncertain|inconclusive)\b"
+    r"|\b(?:cannot|unable to) (?:confirm|conclude)\b"
+    r"|\binsufficient evidence to confirm\b"
+    r"|\bnovelty (?:cannot|can not) be (?:confirmed|established)\b",
+    re.IGNORECASE,
+)
 # v2 made corpus papers from the same research questions admissible comparison
 # material; v3 closes a gap as undecidable when a repeated adversarial round
 # brings no new material for the same claim; v4 generates English adversarial
@@ -37,7 +51,18 @@ _HIGH_NOVELTY = 0.8
 # have ruled prior work out. Like the mining policy version, this is what
 # invalidates audits already stamped for a round, so an admission-or-verdict
 # rule change must bump it or resumed tasks keep their old verdicts.
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v5"
+# v8 repairs the evidence funnel: audit-recalled papers are scored (priority
+# was NULL, so they never entered evidence extraction) and NPA neighbors get
+# full-text evidence extracted + injected into the audit prompt.
+# v9 (2026-08-27): variant-validation failure no longer drops a query family —
+# raw LLM variants are accepted flagged LOW_CONFIDENCE_VARIANTS. v8 runs with
+# 4/5 families dropped (task 9e56a131) structurally failed admission on
+# INSUFFICIENT_QUERY_FAMILIES before any search even ran.
+# v10 (2026-08-27): third tier — a family whose variants list is EMPTY but
+# whose structured intent is complete gets variants synthesized from its
+# structured fields (task 23ec8f20 re-audit: default_factory=list bypasses
+# min_length, 4/5 families empty, admission failed twice on family count).
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v10"
 
 
 # --- Canonical atomic claims (Phase 3H) ---
@@ -150,7 +175,7 @@ def _derive_verdict_from_claims(db, gap: GapCandidate) -> tuple[str, str, list[s
         else:
             none.append(claim.id)               # every NPA explicitly judged NONE
 
-    residual_ids = none + partial               # claims not FULL-covered
+    residual_ids = none + partial + uncertain   # claims not FULL-covered
     if uncertain:
         return ("uncertain", "more_search", residual_ids)
     if not none and not partial:
@@ -311,6 +336,44 @@ def build_adversarial_queries(gap: GapCandidate) -> list[AdversarialQuerySpec]:
     ]
     seen = set()
     return [spec for spec in specs if spec.query_text and not (spec.query_text.lower() in seen or seen.add(spec.query_text.lower()))]
+
+
+def _cap_query_specs_family_balanced(query_specs: list, cap: int) -> list:
+    """Family-balanced query cap (E2E 2026-08-26 fix).
+
+    Sequential truncation let a small cap collapse all executed queries into
+    the first one or two families (observed: cap=4 -> 3 exact_gap + 1 synonym,
+    or 0 exact_gap + 4 synonym after exact_gap variants were dropped by
+    dedup/validation), which made INSUFFICIENT_QUERY_FAMILIES structural and
+    left family-internal stability uncomputable. Round-robin across families
+    instead, preserving in-family order, so any cap >= 2 retains as many
+    distinct families as the generated spec set actually contains.
+    """
+    if cap >= len(query_specs):
+        return list(query_specs)
+    by_family: dict[str, list] = {}
+    family_order: list[str] = []
+    for spec in query_specs:
+        fam = spec.family
+        if fam not in by_family:
+            by_family[fam] = []
+            family_order.append(fam)
+        by_family[fam].append(spec)
+    selected: list = []
+    depth = 0
+    while len(selected) < cap:
+        progressed = False
+        for fam in family_order:
+            if len(selected) >= cap:
+                break
+            family_specs = by_family.get(fam, [])
+            if depth < len(family_specs):
+                selected.append(family_specs[depth])
+                progressed = True
+        if not progressed:
+            break
+        depth += 1
+    return selected
 
 
 class IntentWithVariantsSchema(BaseModel):
@@ -486,6 +549,52 @@ async def _validate_and_regenerate_variants(llm, intent, budget: int) -> list[st
     return deduped
 
 
+def _synthesize_family_variants(intent) -> list[str]:
+    """Build family queries from the structured intent when the LLM returned
+    no usable variants.
+
+    Task 23ec8f20 re-audit (2026-08-27): the two-step generator returned a
+    complete canonical intent (problem/mechanism/intervention/... all present)
+    but an EMPTY variants list for 4 of 5 families — the schema's
+    default_factory=list bypasses min_length validation, so the structured
+    fallback never triggers. The structured fields fully determine the
+    family's queries (same construction philosophy as
+    build_adversarial_queries), so synthesize two field-combination variants
+    instead of dropping the family; the verdict-side NPA convergence gate
+    still guards retrieval stability.
+    """
+    combinations = {
+        "exact_gap": (
+            " ".join(filter(None, [intent.problem, intent.intervention])),
+            " ".join(filter(None, [intent.task_scope, intent.problem])),
+        ),
+        "synonym": (
+            " ".join(filter(None, [intent.mechanism, "standard terminology prior work"])),
+            " ".join(filter(None, [intent.intervention, "related work terminology"])),
+        ),
+        "mechanism": (
+            " ".join(filter(None, [intent.mechanism, "failure mechanism"])),
+            " ".join(filter(None, [intent.problem, "mechanism analysis"])),
+        ),
+        "benchmark": (
+            " ".join(filter(None, [intent.evaluation_setting, "benchmark evaluation"])),
+            " ".join(filter(None, [intent.task_scope, "benchmark dataset"])),
+        ),
+        "method_neighbor": (
+            " ".join(filter(None, [intent.intervention, "method"])),
+            " ".join(filter(None, [intent.mechanism, "alternative approach"])),
+        ),
+    }
+    seen: set[str] = set()
+    out: list[str] = []
+    for text in combinations.get(intent.family, ()):
+        text = " ".join(text.split())
+        if len(text) >= 20 and text.lower() not in seen:
+            seen.add(text.lower())
+            out.append(text)
+    return out
+
+
 def _cover_standard_terms(intent, variants: list[str]) -> list[str]:
     """Deterministic term-coverage enforcement for the synonym family.
 
@@ -560,18 +669,57 @@ async def generate_english_adversarial_queries(db, llm, gap: GapCandidate) -> li
                            intent.family, exc)
             valid_variants = []
         if len(valid_variants) < 2:
-            # QUERY_GENERATION_INVALID: cannot compute a meaningful family-internal
-            # stability, and must NOT be read as SEARCH_UNSTABLE.
-            intents_summary.append({
-                "family": intent.family, "status": "QUERY_GENERATION_INVALID",
-                "valid_variant_count": len(valid_variants),
-                "standard_terms": intent.standard_terms,
-                "problem": intent.problem, "mechanism": intent.mechanism,
-                "intervention": intent.intervention,
-                "evaluation_setting": intent.evaluation_setting,
-                "task_scope": intent.task_scope,
-            })
-            continue
+            # P1-2 fallback: dropping the whole family is worse than running it
+            # unvalidated. Observed on task 9e56a131: 4 of 5 families hit
+            # QUERY_GENERATION_INVALID, the gap was left with a single synonym
+            # family and failed search admission on INSUFFICIENT_QUERY_FAMILIES
+            # before any search even ran. The raw LLM variants still encode the
+            # canonical intent (the generator received the structured intent),
+            # so run them flagged LOW_CONFIDENCE_VARIANTS — the verdict-side NPA
+            # convergence gate still guards against unstable retrieval.
+            raw_variants = [v.strip() for v in (intent.variants or []) if v and v.strip()]
+            if len(raw_variants) >= 2:
+                valid_variants = raw_variants[:3]
+                intents_summary.append({
+                    "family": intent.family, "status": "LOW_CONFIDENCE_VARIANTS",
+                    "valid_variant_count": len(valid_variants),
+                    "raw_variant_count": len(raw_variants),
+                    "standard_terms": intent.standard_terms,
+                    "problem": intent.problem, "mechanism": intent.mechanism,
+                    "intervention": intent.intervention,
+                    "evaluation_setting": intent.evaluation_setting,
+                    "task_scope": intent.task_scope,
+                })
+            else:
+                # Structured-intent fallback (task 23ec8f20 re-audit): the
+                # generator returned a complete canonical intent but NO usable
+                # variants for 4/5 families, and the gap failed admission on
+                # INSUFFICIENT_QUERY_FAMILIES before any search ran — twice.
+                synthesized = _synthesize_family_variants(intent)
+                if synthesized:
+                    valid_variants = synthesized
+                    intents_summary.append({
+                        "family": intent.family, "status": "SYNTHESIZED_VARIANTS",
+                        "valid_variant_count": len(valid_variants),
+                        "standard_terms": intent.standard_terms,
+                        "problem": intent.problem, "mechanism": intent.mechanism,
+                        "intervention": intent.intervention,
+                        "evaluation_setting": intent.evaluation_setting,
+                        "task_scope": intent.task_scope,
+                    })
+                else:
+                    # QUERY_GENERATION_INVALID: cannot compute a meaningful family-internal
+                    # stability, and must NOT be read as SEARCH_UNSTABLE.
+                    intents_summary.append({
+                        "family": intent.family, "status": "QUERY_GENERATION_INVALID",
+                        "valid_variant_count": len(valid_variants),
+                        "standard_terms": intent.standard_terms,
+                        "problem": intent.problem, "mechanism": intent.mechanism,
+                        "intervention": intent.intervention,
+                        "evaluation_setting": intent.evaluation_setting,
+                        "task_scope": intent.task_scope,
+                    })
+                    continue
         for vi, variant in enumerate(valid_variants):
             specs.append(AdversarialQuerySpec(intent.family, variant, variant_index=vi))
         constructed = (valid_variants if intent.family != "synonym"
@@ -668,7 +816,8 @@ def evaluate_gap_search_admission(db, gap, query_ids):
     if not sources: reasons.append("NO_SUCCESSFUL_SOURCE")
     # Only the *amount* of comparison material may be topped up from the corpus.
     corpus_paper_ids = collect_same_question_neighbors(db, gap)
-    paper_ids = sorted(retrieved_paper_ids | set(corpus_paper_ids))
+    paper_ids = sorted({paper_id for paper_id in retrieved_paper_ids | set(corpus_paper_ids)
+                        if db.get(Paper, paper_id) is not None})
     if len(paper_ids) < min_papers: reasons.append("INSUFFICIENT_GAP_SPECIFIC_PAPERS")
     support_papers = {db.get(EvidenceUnit, link.evidence_id).paper_id for link in gap_repo.list_gap_evidence(db, gap.id) if link.relation_type == "suggests" and db.get(EvidenceUnit, link.evidence_id)}
     external = [item for item in paper_ids if item not in support_papers]
@@ -679,11 +828,35 @@ def evaluate_gap_search_admission(db, gap, query_ids):
                     gap.id[:8], min_completed, min_families, min_papers)
     return GapSearchAdmission(gap.id, "PASS" if not reasons else "UNKNOWN", reasons, [item.id for item in queries], [item.id for item in completed], [item.id for item in failed], families, len(sources), paper_ids, external)
 
-def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS):
+
+def _cap_gap_candidate_papers(db, paper_ids: list[str], limit: int) -> list[str]:
+    if len(paper_ids) <= limit:
+        return list(paper_ids)
+    rows = db.query(TaskPaper).filter(TaskPaper.paper_id.in_(paper_ids)).all()
+    score_by_paper: dict[str, tuple[float, int]] = {}
+    for row in rows:
+        value = (
+            float(row.final_score if row.final_score is not None else -1.0),
+            int(row.discovered_round or 0),
+        )
+        if value > score_by_paper.get(row.paper_id, (-1.0, 0)):
+            score_by_paper[row.paper_id] = value
+    return sorted(
+        paper_ids,
+        key=lambda paper_id: score_by_paper.get(paper_id, (-1.0, 0)),
+        reverse=True,
+    )[:limit]
+
+
+def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS,
+                                  candidate_paper_ids: list[str] | None = None):
+    allowed_ids = set(candidate_paper_ids) if candidate_paper_ids is not None else None
     mappings = db.query(SearchQueryPaper).filter(SearchQueryPaper.query_id.in_(query_ids)).all()
     query_family = {item.id: item.query_family for item in db.query(SearchQueryRecord).filter(SearchQueryRecord.id.in_(query_ids)).all()}
     stats = defaultdict(lambda: {"hits": 0, "families": set(), "sources": set(), "best_rank": 10**6})
     for mapping in mappings:
+        if allowed_ids is not None and mapping.paper_id not in allowed_ids:
+            continue
         item = stats[mapping.paper_id]
         item["hits"] += 1
         item["families"].add(query_family.get(mapping.query_id, ""))
@@ -734,6 +907,8 @@ def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS):
     seen = {paper.id for paper in neighbors}
     fallback = []
     for paper_id in collect_same_question_neighbors(db, gap):
+        if allowed_ids is not None and paper_id not in allowed_ids:
+            continue
         if paper_id in seen or paper_id in stats:
             continue
         paper = db.get(Paper, paper_id)
@@ -757,6 +932,76 @@ def _save_search_admission_trace(db, task_id, admission):
         "reason_codes": admission.reason_codes,
     })
 
+
+def _audit_evidence_delta(db, gap, query_ids: list[str], admission, neighbors: list[Paper]) -> tuple[list[str], dict]:
+    """Compute marginal papers and evidence for the current admitted audit."""
+    current_query_ids = set(query_ids)
+    current_paper_ids = set(admission.candidate_paper_ids)
+    current_neighbor_ids = {paper.id for paper in neighbors}
+    previous = (db.query(GapAudit)
+                .filter(GapAudit.gap_id == gap.id,
+                        GapAudit.search_admission_status == "PASS")
+                .order_by(GapAudit.created_at.desc()).first())
+    previous_query_ids = set(json.loads(previous.search_query_ids_json or "[]")) if previous else set()
+    previous_paper_ids = set(json.loads(previous.neighbor_paper_ids_json or "[]")) if previous else set()
+    if previous_query_ids:
+        previous_paper_ids.update(row.paper_id for row in db.query(SearchQueryPaper).filter(
+            SearchQueryPaper.query_id.in_(previous_query_ids)).all())
+    new_paper_ids = sorted(current_paper_ids - previous_paper_ids)
+    evidence = db.query(EvidenceUnit).filter(
+        EvidenceUnit.task_id == gap.task_id,
+        EvidenceUnit.paper_id.in_(current_paper_ids or {"__none__"}),
+    ).all()
+    new_evidence = [item for item in evidence if item.paper_id in set(new_paper_ids)]
+    fulltext_evidence = [item for item in evidence if item.verification_status in {"verified", "upgraded"}]
+    new_neighbor_ids = sorted(current_neighbor_ids - previous_paper_ids)
+    delta = {
+        "query_count": len(current_query_ids),
+        "completed_query_count": len(admission.completed_query_ids),
+        "candidate_paper_count": len(current_paper_ids),
+        "neighbor_paper_count": len(current_neighbor_ids),
+        "new_paper_count": len(new_paper_ids),
+        "new_paper_ids": new_paper_ids,
+        "new_neighbor_count": len(new_neighbor_ids),
+        "new_neighbor_ids": new_neighbor_ids,
+        "evidence_count": len(evidence),
+        "new_evidence_count": len(new_evidence),
+        "new_evidence_ids": sorted(item.id for item in new_evidence),
+        "fulltext_evidence_count": len(fulltext_evidence),
+        "previous_audit_id": previous.id if previous else None,
+    }
+    codes = list(admission.reason_codes or [])
+    if current_paper_ids and not new_paper_ids and previous:
+        codes.append("NO_NEW_PAPERS")
+    if evidence and not new_evidence and previous:
+        codes.append("NO_NEW_EVIDENCE")
+    if current_paper_ids and not fulltext_evidence:
+        codes.append("NO_FULLTEXT_EVIDENCE")
+    if admission.status == "PASS" and not current_neighbor_ids:
+        codes.append("NO_COMPARABLE_PRIOR_ART")
+    return sorted(set(codes)), delta
+
+
+def _record_audit_timeout(db, task_id: str, gap: GapCandidate, audit_round: int) -> GapAuditResult:
+    gap.status = "auditing"
+    gap_repo.create_gap_audit(
+        db, gap_id=gap.id, task_id=task_id, adversarial_queries=[],
+        audit_result="uncertain", neighbor_paper_ids=[], recommended_action="more_search",
+        audit_round=audit_round, search_policy_version=GAP_SEARCH_POLICY_VERSION,
+        search_admission_status="AUDIT_TIMEOUT", search_admission_reasons=["AUDIT_TIMEOUT"],
+        search_query_ids=[], audited_claimed_delta=gap.claimed_delta or "",
+        failure_reason_codes=["AUDIT_TIMEOUT"], evidence_delta={
+            "query_count": 0, "candidate_paper_count": 0,
+            "new_paper_count": 0, "new_evidence_count": 0,
+        },
+    )
+    paper_repo.save_trace(db, task_id, "gap_audit_timeout", "decision", output_data={
+        "gap_id": gap.id, "timeout_seconds": settings.gap_audit_timeout_seconds,
+    })
+    db.commit()
+    return GapAuditResult(gap.id, "uncertain", "more_search", "")
+
+
 async def audit_gap_candidates(
     db,
     state: ResearchState,
@@ -776,8 +1021,19 @@ async def audit_gap_candidates(
         query = query.filter(GapCandidate.id.in_(gap_ids))
     gaps = query.all()
     results = []
+    from app.config import settings
+    timeout_seconds = max(float(settings.gap_audit_timeout_seconds), 0.001)
     for gap in gaps:
-        results.append(await audit_gap_candidate(db, state, llm, task_id, gap, perform_search))
+        try:
+            results.append(await asyncio.wait_for(
+                audit_gap_candidate(db, state, llm, task_id, gap, perform_search),
+                timeout=timeout_seconds,
+            ))
+        except asyncio.TimeoutError:
+            db.rollback()
+            refreshed_gap = gap_repo.get_gap(db, gap.id)
+            results.append(_record_audit_timeout(db, task_id, refreshed_gap, state.current_round + 1))
+            logger.warning("Gap %s audit exceeded %.1fs and was capped", gap.id[:8], timeout_seconds)
     # Read the surviving set back from the database rather than from this batch:
     # when only some gaps are re-audited (e.g. after narrowing), gaps confirmed
     # by an earlier batch are still surviving and must not be dropped from the
@@ -838,7 +1094,7 @@ async def audit_gap_candidate(
     gap: GapCandidate,
     perform_search: bool = True,
 ) -> GapAuditResult:
-    """Run one bounded audit: three query families and at most five neighbors."""
+    """Run one bounded audit with configurable query, paper and time limits."""
     if gap.task_id != task_id:
         raise ValueError("Gap does not belong to task")
 
@@ -861,9 +1117,37 @@ async def audit_gap_candidate(
             search_admission_status="QUERY_GENERATION_INVALID",
             search_admission_reasons=["QUERY_GENERATION_INVALID"],
             search_query_ids=[], audited_claimed_delta=gap.claimed_delta or "",
+            failure_reason_codes=["QUERY_GENERATION_INVALID"],
+            evidence_delta={"query_count": 0, "candidate_paper_count": 0, "new_paper_count": 0, "new_evidence_count": 0},
         )
         db.commit()
         return GapAuditResult(gap.id, "uncertain", "more_search", "")
+    # Query identity is task + round + normalized text + target gap + policy;
+    # generated families are descriptive metadata. Deduplicate globally before
+    # persistence so equivalent variants from different families cannot create
+    # multiple executions for one database identity.
+    unique_specs = []
+    seen_normalized = set()
+    for spec in query_specs:
+        normalized = " ".join((spec.query_text or "").split()).casefold()
+        if not normalized or normalized in seen_normalized:
+            continue
+        seen_normalized.add(normalized)
+        unique_specs.append(spec)
+    query_specs = unique_specs
+    query_cap = max(settings.gap_audit_max_queries, 1)
+    generated_query_count = len(query_specs)
+    if generated_query_count > query_cap:
+        query_specs = _cap_query_specs_family_balanced(query_specs, query_cap)
+        paper_repo.save_trace(db, task_id, "gap_audit_query_cap", "decision", output_data={
+            "gap_id": gap.id,
+            "configured_limit": query_cap,
+            "generated_count": generated_query_count,
+            "executed_count": len(query_specs),
+            "skipped_count": generated_query_count - len(query_specs),
+            "executed_families": sorted({spec.family for spec in query_specs}),
+            "reason_code": "AUDIT_QUERY_CAP_REACHED",
+        })
     queries = [spec.query_text for spec in query_specs]
     executions = []
     for spec in query_specs:
@@ -880,19 +1164,72 @@ async def audit_gap_candidate(
     if perform_search and executions:
         try:
             await search_and_save_papers(db, state, executions, task_id, audit_round)
+            # Evidence-funnel repair: audit-recalled papers used to stay
+            # priority=NULL (main-round scoring never saw them), so they were
+            # invisible to extract_evidence (priority in [high, medium]) and
+            # downstream phases. Score them under the same policy so the cap
+            # ranking and the evidence pipeline both see real priorities.
+            if settings.audit_score_retrieved_papers:
+                try:
+                    from app.agent.steps.score_papers import score_papers
+                    await score_papers(db, state, llm, task_id, audit_round)
+                except Exception as exc:
+                    logger.warning("Gap %s: audit-round paper scoring failed "
+                                   "(non-fatal, papers stay unscored): %s",
+                                   gap.id[:8], exc)
         except RuntimeError as exc:
             logger.info("Gap %s search admission deferred: %s", gap.id[:8], exc)
+    # P0-1: persist search + scoring work as soon as it completes. The audit
+    # runs under a hard per-gap timeout whose handler rolls the session back;
+    # without this checkpoint a timeout discards the whole adversarial search
+    # round (queries, recalled papers, scores) and a re-audit starts from zero.
+    # (Task 9e56a131: 7/9 audits timed out with everything lost.)
+    db.commit()
     admission = evaluate_gap_search_admission(db, gap, [item.query_id for item in executions])
+    candidate_cap = max(settings.gap_audit_max_candidate_papers, 1)
+    original_candidate_count = len(admission.candidate_paper_ids)
+    if original_candidate_count > candidate_cap:
+        capped_ids = _cap_gap_candidate_papers(db, admission.candidate_paper_ids, candidate_cap)
+        capped_set = set(capped_ids)
+        capped_external = [pid for pid in admission.external_neighbor_ids if pid in capped_set]
+        capped_reasons = list(admission.reason_codes) + ["AUDIT_CANDIDATE_CAP_REACHED"]
+        constrained = settings.constrained_retrieval_mode
+        min_admitted_papers = (
+            settings.gap_admission_min_gap_papers_constrained
+            if constrained else settings.gap_admission_min_gap_papers
+        )
+        if len(capped_ids) < min_admitted_papers:
+            capped_reasons.append("INSUFFICIENT_GAP_SPECIFIC_PAPERS")
+        if not capped_external:
+            capped_reasons.append("NO_EXTERNAL_NEIGHBOR")
+        blocking_reasons = [code for code in capped_reasons
+                            if code != "AUDIT_CANDIDATE_CAP_REACHED"]
+        admission = replace(
+            admission,
+            status="PASS" if not blocking_reasons else "UNKNOWN",
+            candidate_paper_ids=capped_ids,
+            external_neighbor_ids=capped_external,
+            reason_codes=sorted(set(capped_reasons)),
+        )
+        paper_repo.save_trace(db, task_id, "gap_audit_candidate_cap", "decision", output_data={
+            "gap_id": gap.id, "configured_limit": candidate_cap,
+            "original_count": original_candidate_count, "capped_count": len(capped_ids),
+            "reason_code": "AUDIT_CANDIDATE_CAP_REACHED",
+        })
     _save_search_admission_trace(db, task_id, admission)
     if admission.status != "PASS":
         gap.status = "auditing"
+        failure_codes, evidence_delta = _audit_evidence_delta(
+            db, gap, admission.query_ids, admission, [])
         gap_repo.create_gap_audit(
             db, gap_id=gap.id, task_id=task_id, adversarial_queries=queries,
-            audit_result="uncertain", neighbor_paper_ids=admission.candidate_paper_ids,
+            audit_result="uncertain", neighbor_paper_ids=[],
             recommended_action="more_search", audit_round=audit_round,
             search_policy_version=GAP_SEARCH_POLICY_VERSION, search_admission_status=admission.status,
             search_admission_reasons=admission.reason_codes, search_query_ids=admission.query_ids,
             audited_claimed_delta=gap.claimed_delta or "",
+            failure_reason_codes=failure_codes,
+            evidence_delta=evidence_delta,
         )
         db.commit()
         return GapAuditResult(gap.id, "uncertain", "more_search", "")
@@ -904,7 +1241,6 @@ async def audit_gap_candidate(
     # scored papers are reused, so this never re-hits the LLM for the same
     # (gap, paper) under the same scoring version.
     try:
-        from app.config import settings
         scored = await score_all_gap_candidates(
             db, llm, gap, admission.candidate_paper_ids, task_id)
         if scored:
@@ -923,7 +1259,43 @@ async def audit_gap_candidate(
     except Exception as exc:
         logger.warning("Gap %s: gap-relevance screening failed (non-fatal): %s",
                        gap.id[:8], exc)
-    neighbors = select_gap_specific_neighbors(db, gap, admission.completed_query_ids)
+    # P0-1: same checkpoint rationale as the search phase — relevance scores are
+    # (gap, paper)-cached and reused on re-audit, so they must survive a
+    # downstream timeout rollback.
+    db.commit()
+    neighbors = select_gap_specific_neighbors(
+        db, gap, admission.completed_query_ids,
+        candidate_paper_ids=admission.candidate_paper_ids,
+    )
+    # Evidence-funnel repair: neighbors without verified full-text evidence
+    # used to make NO_FULLTEXT_EVIDENCE structural (abstract-only comparison
+    # material). Extract bounded full-text evidence for the selected neighbors
+    # BEFORE the evidence delta is computed, so the audit's fulltext count and
+    # the claim-level verdict see real extracted material.
+    if settings.audit_neighbor_evidence_extraction and neighbors:
+        await _ensure_neighbor_evidence(db, state, llm, task_id, gap, neighbors, audit_round)
+    failure_codes, evidence_delta = _audit_evidence_delta(
+        db, gap, admission.query_ids, admission, neighbors)
+    if not neighbors:
+        gap.status = "auditing"
+        failure_codes = sorted(set(failure_codes + ["NO_COMPARABLE_PRIOR_ART"]))
+        gap_repo.create_gap_audit(
+            db, gap_id=gap.id, task_id=task_id, adversarial_queries=queries,
+            audit_result="uncertain", neighbor_paper_ids=[],
+            recommended_action="more_search", audit_round=audit_round,
+            search_policy_version=GAP_SEARCH_POLICY_VERSION,
+            search_admission_status=admission.status,
+            search_admission_reasons=admission.reason_codes,
+            search_query_ids=admission.query_ids,
+            audited_claimed_delta=gap.claimed_delta or "",
+            failure_reason_codes=failure_codes,
+            evidence_delta=evidence_delta,
+        )
+        paper_repo.save_trace(db, task_id, "gap_audit_no_comparable_prior_art", "decision",
+                              output_data={"gap_id": gap.id, "candidate_paper_count": len(admission.candidate_paper_ids),
+                                           "neighbor_paper_count": 0})
+        db.commit()
+        return GapAuditResult(gap.id, "uncertain", "more_search", "")
     # Recall waterfall diagnostic: record per-family raw/canonical/post-filter/
     # final overlap on every admitted audit (not only confirmed gaps), so the
     # instability root cause can be located regardless of the verdict.
@@ -962,6 +1334,8 @@ async def audit_gap_candidate(
             search_policy_version=GAP_SEARCH_POLICY_VERSION, search_admission_status=admission.status,
             search_admission_reasons=admission.reason_codes, search_query_ids=admission.query_ids,
             audited_claimed_delta=gap.claimed_delta or "",
+            failure_reason_codes=sorted(set(failure_codes + ["NO_NEW_COMPARISON_MATERIAL"])),
+            evidence_delta=evidence_delta,
         )
         paper_repo.save_trace(db, task_id, "gap_audit_undecidable", "decision", output_data={
             "gap_id": gap.id,
@@ -984,7 +1358,7 @@ async def audit_gap_candidate(
             supporting_evidence_ids=_gap_evidence_ids(db, gap.id, "suggests"),
             contradicting_evidence_ids=_gap_evidence_ids(db, gap.id, "contradicts"),
             atomic_claims=_format_atomic_claims(atomic_claims),
-            neighbors=_format_neighbors(neighbors),
+            neighbors=_format_neighbors(db, neighbors),
         )},
     ], GapAuditDecisionSchema)
 
@@ -1008,6 +1382,8 @@ async def audit_gap_candidate(
             search_admission_status=admission.status,
             search_admission_reasons=admission.reason_codes, search_query_ids=admission.query_ids,
             audited_claimed_delta=gap.claimed_delta or "",
+            failure_reason_codes=failure_codes + ["INVALID_AUDIT_DECISION"],
+            evidence_delta=evidence_delta,
         )
         paper_repo.save_trace(db, task_id, "gap_audit_invalid_decision", "decision", output_data={
             "gap_id": gap.id, "error": str(err),
@@ -1093,6 +1469,27 @@ async def audit_gap_candidate(
     claim_verdict = _derive_verdict_from_claims(db, gap)
     if claim_verdict is not None:
         derived_result, derived_action, residual_ids = claim_verdict
+        # A model can correctly identify a concrete partial remaining delta while
+        # omitting one per-claim coverage row. Do not promote it to confirmed;
+        # retain only the safe partial/narrow path so the explicit delta gets a
+        # fresh audit. This prevents an output-format omission from turning a
+        # usable narrowing signal into an expensive blind remediation search.
+        if (derived_result == "uncertain"
+                and decision.audit_result == "partially_closed"
+                and decision.recommended_action == "narrow"
+                and (decision.remaining_delta or "").strip()
+                and residual_ids):
+            derived_result = "partially_closed"
+            derived_action = "narrow"
+            failure_codes.append("CLAIM_COVERAGE_INCOMPLETE_RETAINED_FOR_NARROWING")
+            paper_repo.save_trace(
+                db, task_id, "gap_audit_partial_salvage", "decision",
+                output_data={
+                    "gap_id": gap.id,
+                    "residual_claim_ids": residual_ids,
+                    "remaining_delta": decision.remaining_delta,
+                    "reason_code": "CLAIM_COVERAGE_INCOMPLETE_RETAINED_FOR_NARROWING",
+                })
         decision.audit_result = derived_result
         decision.recommended_action = derived_action
         gap.residual_claim_ids_json = json.dumps(residual_ids)
@@ -1108,17 +1505,28 @@ async def audit_gap_candidate(
         # persistently non-converging union cannot loop forever. We deliberately
         # do NOT gate on family-internal Jaccard: variants complement each
         # other, so low pairwise overlap is expected and uninformative.
+        # E2E 2026-08-26: convergence is None means fewer than two completed
+        # queries, so union stability is UNMEASURED. Treating unmeasured as
+        # pass-through let a single-query audit (constrained mode) promote a
+        # confirmed verdict with no convergence evidence at all. Both
+        # "measured below threshold" and "unmeasured" now downgrade, still
+        # bounded by the more_search budget.
         if derived_result == "confirmed":
-            from app.config import settings
             diagnostics = _compute_npa_diagnostics(db, gap)
-            if (diagnostics.cumulative_convergence is not None
-                    and diagnostics.cumulative_convergence < settings.npa_stability_medium):
+            convergence_unstable = (
+                diagnostics.cumulative_convergence is None
+                or diagnostics.cumulative_convergence < settings.npa_stability_medium
+            )
+            if convergence_unstable:
                 more_search_count = sum(
                     1 for a in gap_repo.list_gap_audits(db, gap.id)
                     if a.recommended_action == "more_search")
                 if more_search_count < settings.family_instability_more_search_budget:
                     decision.audit_result = "uncertain"
                     decision.recommended_action = "more_search"
+                    failure_codes.append(
+                        "NPA_UNMEASURED" if diagnostics.cumulative_convergence is None
+                        else "NPA_UNCONVERGED")
                     paper_repo.save_trace(
                         db, task_id, "gap_audit_npa_unconverged", "decision",
                         output_data={
@@ -1130,8 +1538,30 @@ async def audit_gap_candidate(
 
     action = decision.recommended_action
     if action == "continue" and decision.audit_result == "confirmed":
-        gap.status = "surviving"
-        _record_nearest_prior_art(db, gap, decision)
+        # E2E 2026-08-26: text-verdict consistency guard. A confirmed/continue
+        # decision whose own remaining_delta concludes "the decision is
+        # uncertain" is the model contradicting its structured fields; promoting
+        # it to surviving stamps a verdict the audit text itself does not
+        # support (observed verbatim on the surviving gap of run 2026-08-26_b).
+        # Runs AFTER claim-verdict derivation and the NPA gate so it guards the
+        # final decision regardless of which path produced "confirmed".
+        if _AUDIT_TEXT_CONFLICT_RE.search(decision.remaining_delta or ""):
+            decision.audit_result = "uncertain"
+            decision.recommended_action = "more_search"
+            action = "more_search"
+            gap.status = "auditing"
+            decision.rejection_reason = (
+                "audit text-verdict conflict: remaining_delta concludes the "
+                "decision is uncertain while structured fields said confirmed/continue"
+            )
+            failure_codes.append("AUDIT_TEXT_VERDICT_CONFLICT")
+            paper_repo.save_trace(db, task_id, "gap_audit_text_verdict_conflict",
+                                  "decision", output_data={"gap_id": gap.id})
+            logger.warning("Gap %s: downgrading confirmed->uncertain (remaining_delta "
+                           "text contradicts the structured verdict)", gap.id[:8])
+        else:
+            gap.status = "surviving"
+            _record_nearest_prior_art(db, gap, decision)
     elif action == "reject" or decision.audit_result == "closed":
         gap.status = "rejected"
         action = "reject"
@@ -1164,6 +1594,8 @@ async def audit_gap_candidate(
         search_admission_reasons=admission.reason_codes,
         search_query_ids=admission.query_ids,
         audited_claimed_delta=gap.claimed_delta or "",
+        failure_reason_codes=failure_codes,
+        evidence_delta=evidence_delta,
     )
     paper_repo.save_trace(db, task_id, "audit_gap_candidate", "decision", output_data={
         "gap_id": gap.id,
@@ -1185,13 +1617,110 @@ def _select_neighbors(db, task_id: str) -> list[Paper]:
     ).limit(_MAX_NEIGHBORS).all()
 
 
-def _format_neighbors(neighbors: list[Paper]) -> str:
+_EVIDENCE_TYPE_AUDIT_ORDER = {
+    "limitation": 0, "future_work": 1, "negative_result": 2,
+    "comparison": 3, "result": 4, "method": 5,
+}
+
+
+def _neighbor_verified_evidence(db, paper_id: str, limit: int = 2) -> list[EvidenceUnit]:
+    """Bounded full-text evidence excerpts per neighbor for the audit prompt.
+
+    Limitation-type signals come first: they are the material a novelty audit
+    actually needs to decide claim coverage. The bound (2 per neighbor) keeps
+    the prompt injection small regardless of how much evidence exists.
+    """
+    units = db.query(EvidenceUnit).filter(
+        EvidenceUnit.paper_id == paper_id,
+        EvidenceUnit.verification_status.in_(("verified", "upgraded")),
+    ).limit(12).all()
+    units.sort(key=lambda u: _EVIDENCE_TYPE_AUDIT_ORDER.get(u.evidence_type or "", 9))
+    return units[:limit]
+
+
+async def _ensure_neighbor_evidence(db, state, llm, task_id: str, gap: GapCandidate,
+                                    neighbors: list[Paper], audit_round: int) -> None:
+    """Extract full-text evidence for audit neighbors that lack it (bounded).
+
+    E2E 2026-08-26: one gap's audit recalled 10 candidate papers with 42 pieces
+    of abstract-only evidence and zero full-text units — the claim-level
+    verdict and NO_FULLTEXT_EVIDENCE both reflected an extraction gap, not the
+    literature. Only neighbors without verified evidence go through the
+    standard extraction path (PDF download + section extraction, idempotent by
+    chunk hash), bounded by settings.audit_neighbor_evidence_max_papers.
+    Failures are non-fatal: the audit proceeds with whatever material exists.
+    """
+    from app.agent.steps.extract_evidence import (
+        _download_pdfs, _extract_from_paper_safe,
+    )
+
+    limit = max(settings.audit_neighbor_evidence_max_papers, 0)
+    if limit == 0:
+        return
+    pending: list[tuple[Paper, TaskPaper]] = []
+    for paper in neighbors[:limit]:
+        has_fulltext = db.query(EvidenceUnit.id).filter(
+            EvidenceUnit.paper_id == paper.id,
+            EvidenceUnit.verification_status.in_(("verified", "upgraded")),
+        ).limit(1).first() is not None
+        if has_fulltext:
+            continue
+        tp = db.query(TaskPaper).filter(
+            TaskPaper.task_id == task_id,
+            TaskPaper.paper_id == paper.id,
+        ).first()
+        if tp is not None:
+            pending.append((paper, tp))
+    if not pending:
+        return
+    logger.info("Gap %s audit: extracting full-text evidence for %d neighbor(s) "
+                "(round %d)", gap.id[:8], len(pending), audit_round)
+    try:
+        pdf_paths = await _download_pdfs(pending, task_id)
+        semaphore = asyncio.Semaphore(len(pending))
+        tasks_list = [
+            _extract_from_paper_safe(
+                task_id, paper, tp, pdf_paths.get(paper.id), llm, audit_round, semaphore
+            )
+            for paper, tp in pending
+        ]
+        results = await asyncio.gather(*tasks_list, return_exceptions=True)
+        extracted = sum(r for r in results if isinstance(r, int))
+        fulltext_after = db.query(EvidenceUnit).filter(
+            EvidenceUnit.paper_id.in_([p.id for p, _ in pending]),
+            EvidenceUnit.verification_status.in_(("verified", "upgraded")),
+        ).count()
+        paper_repo.save_trace(db, task_id, "audit_neighbor_evidence", "action",
+                              output_data={
+                                  "gap_id": gap.id,
+                                  "round": audit_round,
+                                  "papers_attempted": len(pending),
+                                  "evidence_extracted": extracted,
+                                  "fulltext_evidence_after": fulltext_after,
+                              })
+        db.commit()
+    except Exception as exc:
+        logger.warning("Gap %s: neighbor evidence extraction failed (non-fatal): %s",
+                       gap.id[:8], exc)
+
+
+def _format_neighbors(db, neighbors: list[Paper]) -> str:
     if not neighbors:
         return "(No neighboring papers were retrieved; return uncertain.)"
-    return "\n".join(
-        f"- Paper ID: {paper.id}\n  Title: {paper.title}\n  Abstract: {(paper.abstract or '')[:1200]}"
-        for paper in neighbors
-    )
+    parts = []
+    for paper in neighbors:
+        lines = [
+            f"- Paper ID: {paper.id}",
+            f"  Title: {paper.title}",
+            f"  Abstract: {(paper.abstract or '')[:1200]}",
+        ]
+        for eu in _neighbor_verified_evidence(db, paper.id, limit=2):
+            claim = (eu.normalized_claim or "").strip()
+            if claim:
+                lines.append(f"  Verified full-text evidence ({eu.evidence_type}): "
+                             f"{claim[:200]}")
+        parts.append("\n".join(lines))
+    return "\n".join(parts)
 
 
 def _median(values):

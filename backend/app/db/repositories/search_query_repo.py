@@ -27,12 +27,15 @@ def save_search_query(db: Session, task_id: str, query_text: str, intent: str,
     """
     normalized = _normalize(query_text)
 
-    # Check for existing (idempotent) — includes target_gap_id in match
+    # Match the database identity exactly. query_family is descriptive metadata,
+    # not identity: two families can intentionally produce the same normalized
+    # query and must share one SearchQueryRecord rather than race into a unique
+    # constraint failure. search_policy_version is part of identity because a
+    # policy revision must not reuse an older audit record.
     query = db.query(SearchQueryRecord).filter(
         SearchQueryRecord.task_id == task_id,
         SearchQueryRecord.round_number == round_number,
         SearchQueryRecord.normalized_query_text == normalized,
-        SearchQueryRecord.query_family == query_family,
         SearchQueryRecord.search_policy_version == search_policy_version,
     )
     if target_gap_id is not None:

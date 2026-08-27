@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -26,6 +27,7 @@ def temp_db():
 from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION, audit_gap_candidates, evaluate_gap_search_admission, select_gap_specific_neighbors
 from app.agent.state import ResearchState
 from app.db.models import Paper, SearchQueryPaper, SearchQueryRecord
+from app.db.repositories import gap_repo
 from tests.test_audit_gaps import _seed_gap
 
 class FailingIfCalledLLM:
@@ -39,6 +41,11 @@ async def test_search_admission_blocks_llm_without_gap_papers(temp_db):
     state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
     results = await audit_gap_candidates(db, state, FailingIfCalledLLM(), task.id, perform_search=False)
     assert results[0].audit_result == "uncertain"
+    audit = gap_repo.list_gap_audits(db, gap.id)[-1]
+    assert isinstance(json.loads(audit.failure_reason_codes_json), list)
+    delta = json.loads(audit.evidence_delta_json)
+    assert "candidate_paper_count" in delta
+    assert "new_evidence_count" in delta
 
 def test_gap_specific_neighbor_selection_excludes_task_only_paper(temp_db):
     db = temp_db()

@@ -53,6 +53,10 @@ class ResearchState:
     # Bounded per family by settings.max_remediation_attempts_per_gap.
     gap_remediation_used: dict = field(default_factory=dict)
 
+    # Total narrowing passes consumed by the opportunity pipeline. Persisted in
+    # state so a backend restart cannot reset the task-level narrowing budget.
+    narrowing_passes: int = 0
+
     # Pipeline orchestration
     current_phase: str = "pending"
     pipeline_version: int = 2

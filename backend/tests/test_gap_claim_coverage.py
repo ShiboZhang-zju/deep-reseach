@@ -127,6 +127,16 @@ def test_missing_judgment_is_uncertain_not_none(temp_db):
     db.close()
 
 
+def test_uncertain_claims_remain_in_residual(temp_db):
+    db = temp_db()
+    gap, claims = _seed(db, {0: ["NONE"], 1: ["UNCERTAIN"]})
+    from app.agent.steps.audit_gaps import _derive_verdict_from_claims
+    result = _derive_verdict_from_claims(db, gap)
+    assert result[0] == "uncertain"
+    assert set(result[2]) == {claim.id for claim in claims}
+    db.close()
+
+
 def test_full_removes_from_residual(temp_db):
     # residual only subtracts FULL; PARTIAL stays (partially addressed).
     db = temp_db()

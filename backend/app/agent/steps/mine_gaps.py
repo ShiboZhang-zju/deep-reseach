@@ -36,7 +36,12 @@ _MAX_PROMPT_EVIDENCE = 40
 # version is what invalidates gaps already stamped for a round, so a change to
 # the admission rules must bump it or the new rules never take effect on a
 # resumed task.
-GAP_MINING_POLICY_VERSION = "evidence-admission-v4"
+# v5 (2026-08-27): already-proposed gaps are injected into the mining prompt
+# (complementary claims over reworded duplicates) and the semantic-dedup
+# threshold tightened 0.85 -> 0.78. Task 9e56a131: 9 candidates collapsed into
+# 3-4 semantic clusters; remediation rounds re-mined reworded duplicates while
+# the undetermined originals were never re-audited.
+GAP_MINING_POLICY_VERSION = "evidence-admission-v5"
 
 # Semantic-dedup threshold: two gap candidates whose fingerprint (observed
 # problem + missing capability + claimed delta) embeds to a cosine similarity at
@@ -44,7 +49,12 @@ GAP_MINING_POLICY_VERSION = "evidence-admission-v4"
 # enters the audit twice under different wording and can be rejected once and
 # "confirmed" once — the single most damaging false signal a research-idea
 # system can emit.
-_GAP_DEDUP_SIMILARITY = 0.85
+# 0.78 (2026-08-27): at 0.85 the filter only caught verbatim-level rewordings —
+# task 9e56a131 slipped 9 candidates into 3-4 semantic clusters (only 1 was
+# caught as DUPLICATE_GAP). 0.78 keeps distinct-mechanism gaps apart while
+# merging same-claim rewordings; misclassified candidates get another shot via
+# the runner's re-audit channel.
+_GAP_DEDUP_SIMILARITY = 0.78
 
 
 def compute_evidence_fingerprint(db, task_id: str) -> str:
@@ -221,6 +231,11 @@ Research questions:
 
 Evidence (only these IDs may be cited):
 {evidence}
+
+Gaps already proposed in earlier rounds (do NOT re-propose a gap whose claimed
+delta substantially overlaps any of these — reworded duplicates are dropped by
+a similarity filter; propose a complementary claim instead):
+{existing_gaps}
 
 Generate at most {max_gaps} evidence-backed candidate gaps."""
 
@@ -443,13 +458,26 @@ async def mine_gap_candidates(
         f"- Question ID: {question.id}\n  Type: {question.question_type}\n  Question: {question.question}"
         for question in questions if question.id in passed_admissions
     )
+    # P0-2: surface already-proposed gaps to the generator. Task 9e56a131
+    # produced 9 candidates forming only 3-4 semantic clusters — remediation
+    # rounds re-mined reworded duplicates while the undetermined originals
+    # were never re-audited. Showing the model what is already on the table
+    # pushes new candidates toward complementary claims; the embedding dedup
+    # below remains the hard backstop.
+    existing_gaps = [g for g in gap_repo.list_gaps_for_contract(
+        db, task_id, contract.id, include_superseded=True)
+        if g.status != "rejected"]
+    existing_claims = [f"- {(g.claimed_delta or '').strip()[:220]}"
+                       for g in existing_gaps[:10] if (g.claimed_delta or "").strip()]
+    existing_gaps_block = "\n".join(existing_claims) if existing_claims else "(none yet)"
     result = await llm.chat_json([{
         "role": "system", "content": _GAP_MINING_SYSTEM,
     }, {
         "role": "user", "content": _GAP_MINING_USER.format(
             topic=contract.topic, target_problem=contract.target_problem or "(not specified)",
             target_setting=contract.target_setting or "(not specified)", questions=question_text,
-            evidence=_format_evidence(evidence, question_ids_by_evidence), max_gaps=max_gaps,
+            evidence=_format_evidence(evidence, question_ids_by_evidence),
+            existing_gaps=existing_gaps_block, max_gaps=max_gaps,
         ),
     }], GapCandidateList)
 
@@ -457,14 +485,12 @@ async def mine_gap_candidates(
     # excluded) and every returned candidate, then embed them once. Dedup is
     # non-fatal — if embedding is unavailable we skip it rather than blocking
     # mining — so a duplicate can only slip through when embeddings fail.
-    # Compare against every non-rejected gap in the contract, INCLUDING
-    # superseded versions: a gap that was narrowed (v1 superseded -> v2) must
-    # still block a later candidate that rewords v1's original broad claim,
-    # otherwise "reword the rejected broad claim" defeats the lineage. Only
-    # genuinely rejected gaps (audit said closed) leave the comparison pool.
-    existing_gaps = [g for g in gap_repo.list_gaps_for_contract(
-        db, task_id, contract.id, include_superseded=True)
-        if g.status != "rejected"]
+    # `existing_gaps` is the same pool loaded above for the prompt — every
+    # non-rejected gap in the contract, INCLUDING superseded versions: a gap
+    # that was narrowed (v1 superseded -> v2) must still block a later
+    # candidate that rewords v1's original broad claim, otherwise "reword the
+    # rejected broad claim" defeats the lineage. Only genuinely rejected gaps
+    # (audit said closed) leave the comparison pool.
     existing_fps = [_gap_fingerprint(g.observed_problem, g.missing_capability,
                                      g.claimed_delta) for g in existing_gaps]
     candidate_objs = result.gaps[:max_gaps]
