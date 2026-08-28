@@ -47,17 +47,20 @@ For dataset and baselines, be concrete enough to actually run:
   mechanism (what we would know afterwards that we do not know now). Do NOT
   restate the intervention's measurable outcome; that only names the metric,
   not the knowledge gain.
-- IDENTITY FIELDS (required, construct validity): core_manipulation names THE
-  variable the experiment manipulates and at which LAYER — e.g. displayed
-  source attribution ("Self/External label on identical content") vs actual
-  generation provenance (judge's own output vs another model's output) vs
-  content factuality. The title and claims must not exceed what the
-  manipulation establishes: a label-swap-only design measures attribution
-  bias, NOT self-preference over one's own generations. expected_signature
-  states the observable pattern if the mechanism works. mechanism_being_tested
-  names the mechanism. If sibling experiments are listed in the user message,
-  your core_manipulation MUST differ from theirs at the variable layer —
-  duplicating a sibling's manipulation collapses the study.
+- IDENTITY FIELDS (required, construct validity): core_factor names the single
+  factor the experiment manipulates (e.g. "displayed source attribution" —
+  distinct from actual generation provenance or content factuality);
+  core_operation the operation applied to that factor (e.g. swap_label,
+  remove_label); core_contrast the compared conditions (e.g. self_vs_external).
+  The title and claims must not exceed what the manipulation establishes: a
+  label-swap-only design measures attribution bias, NOT self-preference over
+  one's own generations. expected_signature states the observable pattern if
+  the mechanism works. mechanism_being_tested names the mechanism. When
+  sibling experiments are listed in the user message, your experiment must
+  differ materially in its MANIPULATION (operation/contrast), predicted
+  signature, or tested mechanism — the variable LAYER itself does NOT need to
+  differ: two experiments on the same factor with different operations (e.g.
+  swap_label vs remove_label) are complementary and both valuable.
 - STATISTICS: ratio-style paired metrics (pass rate, regression rate, accuracy,
   success rate, proportions) must be analyzed with McNemar's test, Wilcoxon
   signed-rank, a permutation test, or bootstrap confidence intervals — NEVER a
@@ -125,13 +128,26 @@ For dataset and baselines, be concrete enough to actually run:
 # merged as condition variants of the sibling's idea instead of spawning
 # lookalike ideas (run7: P1 label-swap and P2 anonymous-evaluation both
 # collapsed into near-identical "Self vs External" experiments).
-EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v10"
+# v11 (2026-08-28, run7 review round 2): the concatenated-text 0.82 threshold
+# could not separate COMPLEMENTARY designs (same factor, swap_label vs
+# remove_label — semantically close, causally distinct). core_manipulation is
+# now the structured triple core_factor / core_operation / core_contrast, and
+# the sibling relation is a three-way classification: DUPLICATE (same factor +
+# same operation + similar signature/mechanism -> merge), COMPLEMENTARY (same
+# factor, different operation -> same idea, separate experiment),
+# INDEPENDENT (different factor -> separate idea). The prompt's
+# "must differ at the variable layer" constraint is relaxed to "must differ
+# materially in manipulation/signature/mechanism" — complementary same-layer
+# designs are exactly what a factorial evidence chain needs.
+EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v11"
 
-# Sibling merge: embedding similarity threshold over the concatenated
-# manipulation/signature/mechanism identity text. Aligned with the gap-dedup
-# family of thresholds; embedding failures fail-open (no merge — an outage is
-# not evidence of collapse).
-_SIBLING_MERGE_SIMILARITY = 0.82
+# Sibling relation thresholds (run7 review round 2): per-field embedding
+# cosine bounds. These are workflow heuristics for relation triage, not
+# calibrated truths — the review's calibration rule applies.
+_SIBLING_SAME_FACTOR_SIM = 0.85
+_SIBLING_SAME_OPERATION_SIM = 0.90
+_SIBLING_DUPLICATE_SIGNATURE_SIM = 0.85
+_SIBLING_DUPLICATE_MECHANISM_SIM = 0.80
 
 # P0-3: rejection-aware rewrite attempts per cluster. Two was too few once the
 # feedback became specific — one attempt burns on absorbing the feedback, the
@@ -181,16 +197,18 @@ Resource constraints: GPU={gpu_available}; max GPU hours={max_gpu_hours}; runtim
 {sibling_section}"""
 
 _SIBLING_SECTION_TEMPLATE = """
-Sibling experiment(s) already funded for this gap — your experiment MUST
-manipulate a DIFFERENT variable layer (construct validity):
+Sibling experiment(s) already funded for this gap — your experiment must
+differ materially in its manipulation (operation or contrast), predicted
+signature, or tested mechanism. The variable LAYER itself does NOT need to
+differ:
 {entries}
-If this cluster's mechanism genuinely cannot support a manipulation distinct
-from the sibling(s) above, prefer leaving the design clearly marked as a
-condition variant of the sibling manipulation rather than rebranding the
-same design with new wording."""
+Two experiments on the SAME factor with different operations (e.g.
+swap_label vs remove_label) are complementary and both belong under this
+gap; merely re-wording a sibling's manipulation is a duplicate and will be
+merged into the sibling's idea."""
 
 _SIBLING_ENTRY_TEMPLATE = """- Sibling hypothesis: {hypothesis}
-  core_manipulation: {manipulation}
+  factor: {factor} | operation: {operation} | contrast: {contrast}
   expected_signature: {signature}"""
 
 
@@ -518,65 +536,71 @@ def _persist_parked_cluster_idea(db, task_id, state, contract, gap, cluster,
                 task_id[:8], rank, idea.id[:8])
 
 
-def _sibling_identity_text(manipulation: str, signature: str, mechanism: str) -> str:
-    return " ".join(filter(None, [
-        (manipulation or "").strip(),
-        (signature or "").strip(),
-        (mechanism or "").strip(),
-    ]))
+def _classify_sibling_relation(plan, sibling: dict) -> tuple[str, dict]:
+    """Three-way deterministic sibling relation (run7 review fix).
 
+    DUPLICATE:      same factor AND same operation AND similar signature and
+                    mechanism — a re-worded sibling design; merge it.
+    COMPLEMENTARY:  same factor, different operation (swap_label vs
+                    remove_label) — tests different causal questions on one
+                    factor; same idea, separate experiment.
+    INDEPENDENT:    different factor — a genuinely separate study.
 
-def _find_sibling_merge(plan, funded_siblings: list[dict]) -> tuple[dict, float] | None:
-    """Deterministic sibling-collapse detection (run7 regression fix).
-
-    Compares the plan's identity text (core_manipulation + expected_signature
-    + mechanism_being_tested) against every funded sibling of the same gap via
-    embedding cosine similarity. Returns (sibling, similarity) when the best
-    match clears _SIBLING_MERGE_SIMILARITY — the caller merges this plan into
-    that sibling's idea as a condition variant instead of spawning a lookalike
-    idea. Embedding failure returns None (fail-open: an outage is not evidence
-    of collapse) — deterministic comparison, never an LLM judgement call.
+    Per-field embeddings replace the v10 concatenated-text similarity, which
+    could not separate complementary designs (semantically close, causally
+    distinct). Embedding failure fails open to INDEPENDENT — an outage is not
+    evidence of collapse.
     """
-    if not funded_siblings:
-        return None
-    new_text = _sibling_identity_text(
-        plan.core_manipulation, plan.expected_signature, plan.mechanism_being_tested)
-    if not new_text:
-        return None
     try:
-        sibling_texts = [
-            _sibling_identity_text(s["core_manipulation"], s["expected_signature"],
-                                   s["mechanism"])
-            for s in funded_siblings
+        texts = [
+            plan.core_factor, sibling["core_factor"],
+            plan.core_operation, sibling["core_operation"],
+            plan.expected_signature, sibling["expected_signature"],
+            plan.mechanism_being_tested, sibling["mechanism"],
         ]
-        vectors = embedding_service.embed_texts([new_text] + sibling_texts)
+        vectors = embedding_service.embed_texts(texts)
         if not vectors or any(not v for v in vectors):
-            return None
-        best, best_sim = None, 0.0
-        for idx, sibling in enumerate(funded_siblings):
-            sim = embedding_service.cosine_similarity(vectors[0], vectors[idx + 1])
-            if sim > best_sim:
-                best, best_sim = sibling, sim
-        if best is not None and best_sim >= _SIBLING_MERGE_SIMILARITY:
-            return best, best_sim
-        return None
+            return "INDEPENDENT", {"degraded": True}
+
+        def sim(i: int, j: int) -> float:
+            return embedding_service.cosine_similarity(vectors[i], vectors[j])
+
+        detail = {
+            "factor": round(sim(0, 1), 3),
+            "operation": round(sim(2, 3), 3),
+            "signature": round(sim(4, 5), 3),
+            "mechanism": round(sim(6, 7), 3),
+        }
+        same_factor = detail["factor"] >= _SIBLING_SAME_FACTOR_SIM
+        op_equal = (plan.core_operation or "").strip().lower() == \
+            (sibling["core_operation"] or "").strip().lower()
+        same_operation = op_equal or detail["operation"] >= _SIBLING_SAME_OPERATION_SIM
+        if (same_factor and same_operation
+                and detail["signature"] >= _SIBLING_DUPLICATE_SIGNATURE_SIM
+                and detail["mechanism"] >= _SIBLING_DUPLICATE_MECHANISM_SIM):
+            return "DUPLICATE", detail
+        if same_factor:
+            return "COMPLEMENTARY", detail
+        return "INDEPENDENT", detail
     except Exception as exc:
-        logger.warning("Sibling merge similarity check degraded (fail-open, "
-                       "keeping ideas separate): %s", exc)
-        return None
+        logger.warning("Sibling relation check degraded (fail-open, "
+                       "independent): %s", exc)
+        return "INDEPENDENT", {"degraded": True}
 
 
-def _persist_merged_condition_variant(db, task_id, state, contract, gap,
-                                      intervention, variants, plan, merge_target,
-                                      similarity, direction_only_idea_ids):
-    """Persist a collapsed sibling plan as a condition variant of the main idea.
+def _persist_sibling_experiment(db, task_id, gap, intervention, variants, plan,
+                                relation_target, relation, detail):
+    """Persist a DUPLICATE or COMPLEMENTARY plan under the sibling's idea.
 
-    One idea, N mechanism experiments: the plan is saved as an experiment
-    hanging off the merge-target idea (the data model already supports many
-    experiments per idea), tagged with its manipulation and the sibling it
-    collapsed into. No lookalike idea is created.
+    One idea, N mechanism experiments (run7 review): the plan is saved as an
+    experiment hanging off the sibling's idea (the data model already supports
+    many experiments per idea). DUPLICATE is a defensive merge — the plan
+    re-worded the sibling's manipulation and carries no new causal question;
+    COMPLEMENTARY is a deliberate evidence-chain addition — same factor,
+    different operation (e.g. swap_label vs remove_label). No lookalike idea
+    is created in either case.
     """
-    idea = merge_target["idea"]
+    idea = relation_target["idea"]
     steps = [
         *plan.steps,
         f"Success condition: {plan.success_condition}",
@@ -600,40 +624,57 @@ def _persist_merged_condition_variant(db, task_id, state, contract, gap,
             "controls": plan.controls,
             "success_condition": plan.success_condition,
             "falsification_condition": plan.falsification_condition,
-            "core_manipulation": plan.core_manipulation,
+            "core_factor": plan.core_factor,
+            "core_operation": plan.core_operation,
+            "core_contrast": plan.core_contrast,
             "expected_signature": plan.expected_signature,
             "mechanism_being_tested": plan.mechanism_being_tested,
             "condition_variant": True,
             "condition_variant_of_idea": idea.id,
-            "sibling_merge_similarity": round(similarity, 3),
+            "sibling_relation": relation,
+            "sibling_relation_detail": detail,
         }, ensure_ascii=False),
         "risks": plan.risks,
     })
-    # The main idea's visible record gains the condition variant annotation —
-    # the user sees ONE idea with N manipulations, not N lookalikes.
-    annotation = (
-        "\n\n[Condition variant merged] A sibling experiment collapsed onto "
-        f"this idea (manipulation similarity {similarity:.2f}): its distinct "
-        f"manipulation — {plan.core_manipulation[:200]} — is preserved as an "
-        "additional experiment under this idea rather than a separate idea."
-    )
+    if relation == "DUPLICATE":
+        annotation = (
+            "\n\n[Condition variant merged] A sibling experiment collapsed "
+            "onto this idea (same manipulation re-worded; similarity detail "
+            f"{json.dumps(detail, ensure_ascii=False)}): its design is "
+            "preserved as an additional experiment under this idea rather "
+            "than a separate idea."
+        )
+        reason_codes = ["SIBLING_MANIPULATION_COLLAPSE"]
+        trace_status = "merged_condition_variant"
+    else:
+        annotation = (
+            f"\n\n[Complementary experiment] Same factor "
+            f"({plan.core_factor}), different manipulation "
+            f"({plan.core_operation} vs "
+            f"{relation_target['core_operation']}) — tests a different causal "
+            "question on this factor and is preserved as a separate "
+            "experiment under this idea."
+        )
+        reason_codes = ["SIBLING_COMPLEMENTARY_EXPERIMENT"]
+        trace_status = "complementary_experiment"
     idea.motivation = (idea.motivation or "") + annotation
     db.commit()
     paper_repo.save_trace(db, task_id, "idea_quality_gate", "decision", output_data={
         "gap_id": gap.id,
         "intervention_id": intervention.id,
         "variant_intervention_ids": [v.id for v in variants],
-        "status": "merged_condition_variant",
-        "merged_into_idea_id": idea.id,
-        "sibling_merge_similarity": round(similarity, 3),
-        "core_manipulation": plan.core_manipulation,
-        "sibling_core_manipulation": merge_target["core_manipulation"],
-        "reason_codes": ["SIBLING_MANIPULATION_COLLAPSE"],
+        "status": trace_status,
+        "attached_to_idea_id": idea.id,
+        "sibling_relation": relation,
+        "sibling_relation_detail": detail,
+        "core_factor": plan.core_factor,
+        "core_operation": plan.core_operation,
+        "sibling_core_operation": relation_target["core_operation"],
+        "reason_codes": reason_codes,
         "plan_title": plan.title,
     })
-    logger.info("Task %s: merged sibling plan '%s' into idea %s as condition "
-                "variant (similarity %.2f)",
-                task_id[:8], plan.title[:40], idea.id[:8], similarity)
+    logger.info("Task %s: sibling plan '%s' -> %s on idea %s (detail %s)",
+                task_id[:8], plan.title[:40], relation, idea.id[:8], detail)
     return experiment
 
 async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
@@ -818,11 +859,18 @@ class MinimalExperimentSchema(BaseModel):
     idea_method: str = ""
     idea_contribution: str = ""
     # Identity fields (run7 regression, 2026-08-28): what the experiment
-    # MANIPULATES, at which variable layer — the level at which construct
-    # validity and sibling distinctiveness actually live. A label swap
-    # manipulates displayed attribution, NOT actual provenance; the claim
-    # must not exceed what the manipulation establishes.
-    core_manipulation: str = Field(min_length=10)
+    # MANIPULATES, structured so sibling relations are mechanically decidable —
+    # core_factor (the single factor, e.g. "displayed source attribution"),
+    # core_operation (what is done to it, e.g. swap_label / remove_label),
+    # core_contrast (the compared conditions, e.g. self_vs_external). Same
+    # factor + different operation = COMPLEMENTARY (both belong under one
+    # idea); same factor + same operation + similar signature/mechanism =
+    # DUPLICATE (merge). The claim must not exceed what the manipulation
+    # establishes (a label-swap design measures attribution bias, NOT
+    # self-preference over one's own generations).
+    core_factor: str = Field(min_length=5)
+    core_operation: str = Field(min_length=3)
+    core_contrast: str = Field(min_length=3)
     expected_signature: str = Field(min_length=10)
     mechanism_being_tested: str = Field(min_length=10)
     summary: str = Field(min_length=10)
@@ -1257,7 +1305,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             if funded_siblings:
                 entries = "\n".join(_SIBLING_ENTRY_TEMPLATE.format(
                     hypothesis=s.get("hypothesis") or "(not extracted)",
-                    manipulation=s["core_manipulation"],
+                    factor=s["core_factor"],
+                    operation=s["core_operation"],
+                    contrast=s["core_contrast"],
                     signature=s["expected_signature"],
                 ) for s in funded_siblings)
                 sibling_section = _SIBLING_SECTION_TEMPLATE.format(entries=entries)
@@ -1406,19 +1456,39 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 logger.warning("Task %s: experiment plan rejected by quality gate: %s", task_id[:8], plan_failures)
                 continue
 
-            # Sibling-collapse guard (run7 regression fix): even with the
-            # must-differ prompt constraint, the model may converge onto the
-            # sibling's manipulation again (representation collapse). Detect
-            # it deterministically via embedding similarity over the identity
-            # fields and merge the plan into the sibling's idea as a condition
-            # variant — one idea, N mechanism experiments.
-            merge_hit = _find_sibling_merge(plan, funded_siblings)
-            if merge_hit is not None:
-                merge_target, merge_sim = merge_hit
-                merged_experiment = _persist_merged_condition_variant(
-                    db, task_id, state, contract, gap, intervention, variants,
-                    plan, merge_target, merge_sim, direction_only_idea_ids)
+            # Sibling relation guard (run7 regression fix): even with the
+            # must-differ prompt constraint the model may converge onto the
+            # sibling's manipulation again. Classify deterministically:
+            # DUPLICATE merges into the sibling's idea as a condition variant;
+            # COMPLEMENTARY (same factor, different operation) also lands on
+            # the sibling's idea but as a distinct experiment — one idea, N
+            # mechanism experiments; INDEPENDENT proceeds normally.
+            sibling_relation = "INDEPENDENT"
+            relation_detail: dict = {}
+            relation_target = None
+            for sibling in funded_siblings:
+                relation, detail = _classify_sibling_relation(plan, sibling)
+                if relation != "INDEPENDENT":
+                    sibling_relation = relation
+                    relation_detail = detail
+                    relation_target = sibling
+                    break
+            if sibling_relation in ("DUPLICATE", "COMPLEMENTARY"):
+                merged_experiment = _persist_sibling_experiment(
+                    db, task_id, gap, intervention, variants, plan,
+                    relation_target, sibling_relation, relation_detail)
                 experiment_ids.append(merged_experiment.id)
+                # A complementary experiment registers as a sibling for the
+                # remaining clusters too — its operation is now taken.
+                funded_siblings.append({
+                    "idea": relation_target["idea"],
+                    "hypothesis": cluster["hypothesis"],
+                    "core_factor": plan.core_factor,
+                    "core_operation": plan.core_operation,
+                    "core_contrast": plan.core_contrast,
+                    "expected_signature": plan.expected_signature,
+                    "mechanism": plan.mechanism_being_tested,
+                })
                 continue
 
             # De-duplicate titles: two interventions over the same gap can collapse
@@ -1580,7 +1650,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     "controls": plan.controls,
                     "success_condition": plan.success_condition,
                     "falsification_condition": plan.falsification_condition,
-                    "core_manipulation": plan.core_manipulation,
+                    "core_factor": plan.core_factor,
+                    "core_operation": plan.core_operation,
+                    "core_contrast": plan.core_contrast,
                     "expected_signature": plan.expected_signature,
                     "mechanism_being_tested": plan.mechanism_being_tested,
                 }, ensure_ascii=False),
@@ -1590,12 +1662,14 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 idea_ids.append(idea.id)
             experiment_ids.append(experiment.id)
             # Register this funded experiment as a sibling for the remaining
-            # clusters of the same gap — the next cluster's prompt will demand
-            # a different variable layer, and a converging plan merges here.
+            # clusters of the same gap — the next cluster's prompt carries its
+            # manipulation, and converging plans land back on this idea.
             funded_siblings.append({
                 "idea": idea,
                 "hypothesis": cluster["hypothesis"],
-                "core_manipulation": plan.core_manipulation,
+                "core_factor": plan.core_factor,
+                "core_operation": plan.core_operation,
+                "core_contrast": plan.core_contrast,
                 "expected_signature": plan.expected_signature,
                 "mechanism": plan.mechanism_being_tested,
             })

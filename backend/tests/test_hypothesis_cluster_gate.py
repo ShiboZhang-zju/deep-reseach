@@ -101,9 +101,9 @@ class _ClusterMockLLM:
                 hypothesis="Filtering stylistic-only corrections reduces functional regressions.",
                 idea_method="Classify corrections by type and gate execution on logical-only fixes.",
                 idea_contribution=self.idea_contribution,
-                core_manipulation=(
-                    "Toggles a correction-type filter between logical-only and "
-                    f"apply-all arms (arm set {len(self.plan_prompts)})."),
+                core_factor=f"correction-type filter (arm set {len(self.plan_prompts)})",
+                core_operation="toggle_filter",
+                core_contrast="logical_only_vs_apply_all",
                 expected_signature=(
                     "Regression rate drops in the logical-only arm, unchanged "
                     f"pass@1 (observation {len(self.plan_prompts)})."),
@@ -563,7 +563,7 @@ async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
 
 def test_policy_version_bumped():
     """The experiment policy version encodes the novelty-check rules."""
-    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v10"
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v11"
 
 
 def _plan(**overrides):
@@ -573,7 +573,9 @@ def _plan(**overrides):
         idea_method="We hypothesize that filtering stylistic corrections reduces regressions.",
         summary="Compare filtered vs unfiltered self-correction on HumanEval.",
         hypothesis="Filtering stylistic-only corrections reduces functional regression rate.",
-        core_manipulation="Toggles a correction-type filter between logical-only and apply-all arms.",
+        core_factor="correction-type filter",
+        core_operation="toggle_filter",
+        core_contrast="logical_only_vs_apply_all",
         expected_signature="Regression rate drops in the logical-only arm, unchanged pass@1.",
         mechanism_being_tested="Stylistic corrections carry functional regression risk.",
         dataset="HumanEval with injected stylistic noise",
@@ -819,23 +821,25 @@ async def test_triage_skipped_when_clusters_within_budget(temp_db):
 
 # --- Sibling collapse guard (run7 regression, 2026-08-28) ---
 
-def _identity_plan(title, manipulation, signature):
+def _identity_plan(title, factor, operation, signature=None, contrast="self_vs_external"):
     return MinimalExperimentSchema(
         title=title,
         summary=f"Minimal experiment for {title}.",
         hypothesis="Filtering stylistic-only corrections reduces functional regressions.",
         idea_method="Classify corrections by type and gate execution on logical-only fixes.",
         idea_contribution="Establishes the causal share of stylistic edits in regressions.",
-        core_manipulation=manipulation,
-        expected_signature=signature,
-        mechanism_being_tested="Stylistic corrections carry functional regression risk.",
+        core_factor=factor,
+        core_operation=operation,
+        core_contrast=contrast,
+        expected_signature=signature or "Self-labelled hallucinations receive higher ratings.",
+        mechanism_being_tested="Displayed source attribution overrides fact-checking.",
         dataset="HumanEval with injected stylistic noise",
         dataset_provenance="public dataset plus synthetic stylistic injection",
         baselines="no-correction, apply-all, heuristic skip-stylistic",
         metrics="pass@1 delta and regression rate",
         model_spec="small model",
         oracle="execution engine verifier",
-        statistical_analysis="McNemar paired test",
+        statistical_analysis="McNemar paired test on regression rate deltas",
         resource_budget="CPU only",
         success_condition="regression rate drops significantly",
         falsification_condition="no measurable regression difference",
@@ -862,47 +866,27 @@ class _SequentialPlanLLM(_ClusterMockLLM):
         return await super().chat_json(messages, schema)
 
 
-def _patch_embeddings(monkeypatch, similar: bool):
-    """Patch embedding so identity texts compare similar/dissimilar at will."""
-    import importlib
-
-    gme = importlib.import_module("app.agent.steps.generate_minimal_experiments")
-
-    def fake_embed(texts):
-        base = [1.0] + [0.0] * 15
-        ortho = [0.0, 1.0] + [0.0] * 14
-        return [base if i == 0 or (similar and i > 0) else ortho
-                for i, _ in enumerate(texts)]
-
-    monkeypatch.setattr(gme.embedding_service, "embed_texts", fake_embed)
-
-
 @pytest.mark.asyncio
 async def test_sibling_manipulation_collapse_merges_into_one_idea(temp_db, monkeypatch):
     """run7 regression case: P1 (label swap) and P2 (nominally anonymous
     evaluation) both converged onto near-identical 'Self vs External'
-    experiments 鈥?two lookalike executable ideas. The guard must merge the
-    second plan into the first idea as a condition variant: one idea, two
+    experiments — two lookalike executable ideas. Same factor + same
+    operation + similar signature/mechanism = DUPLICATE: merge the second
+    plan into the first idea as a condition variant — one idea, two
     experiments, collapse recorded in the trace."""
     from app.agent.state import ResearchState
     from app.db.models import AgentTrace, ExperimentPlan, ResearchIdea
 
     db = temp_db()
     task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=2)
-    atoms = _derive_scenario_atoms(gap, None, phenomenon)
-    manipulation = ("Swap the displayed source attribution label "
-                    "(Self vs External) on identical hallucinated content.")
     llm = _SequentialPlanLLM([
         _identity_plan("Attribution swap testing",
-                       manipulation,
-                       "Self-labelled hallucinations receive higher ratings."),
+                       "displayed source attribution", "swap_label"),
         _identity_plan("Blind provenance evaluation",
-                       manipulation,  # collapsed onto the sibling manipulation
-                       "Self-labelled hallucinations receive higher ratings."),
+                       "displayed source attribution", "swap_label"),  # re-worded duplicate
     ], cluster_response=None)
     state = ResearchState(task_id=task.id, contract_id=contract.id,
                           pipeline_version=2, current_round=1)
-    _patch_embeddings(monkeypatch, similar=True)
 
     await generate_minimal_experiments(db, state, llm, task.id)
 
@@ -915,6 +899,7 @@ async def test_sibling_manipulation_collapse_merges_into_one_idea(temp_db, monke
     variant = json.loads(
         [e for e in experiments if json.loads(e.steps_json).get("condition_variant")][0].steps_json)
     assert variant["condition_variant"] is True
+    assert variant["sibling_relation"] == "DUPLICATE"
     assert "Condition variant merged" in ideas[0].motivation
     traces = db.query(AgentTrace).filter(
         AgentTrace.task_id == task.id,
@@ -922,39 +907,149 @@ async def test_sibling_manipulation_collapse_merges_into_one_idea(temp_db, monke
     merge_traces = [json.loads(t.output_json) for t in traces
                     if json.loads(t.output_json).get("status") == "merged_condition_variant"]
     assert merge_traces and "SIBLING_MANIPULATION_COLLAPSE" in merge_traces[0]["reason_codes"]
-    # The second cluster's prompt carried the sibling manipulation constraint.
-    assert any("MUST" in p and "manipulate a DIFFERENT variable layer" in p
-               for p in llm.plan_prompts), llm.plan_prompts
+    # The second cluster's prompt carried the relaxed sibling constraint.
+    assert any("does NOT need to" in p for p in llm.plan_prompts), llm.plan_prompts
     db.close()
 
 
 @pytest.mark.asyncio
-async def test_distinct_manipulations_stay_separate_ideas(temp_db, monkeypatch):
-    """Distinct variable layers (label swap vs removing attribution metadata)
-    must remain two independent ideas 鈥?the guard merges collapse, not
-    legitimate factorial breadth."""
+async def test_same_factor_different_operation_is_complementary(temp_db, monkeypatch):
+    """run7 review round 2: swap_label and remove_label on the SAME factor are
+    complementary causal questions (does the label cause the bias / does
+    removing it eliminate the bias), NOT duplicates — the v10 concatenated
+    similarity would have merged them. They must land as two separate
+    experiments under ONE idea."""
+    from app.agent.state import ResearchState
+    from app.db.models import ExperimentPlan, ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=2)
+    llm = _SequentialPlanLLM([
+        _identity_plan("Attribution swap causal test",
+                       "displayed source attribution", "swap_label"),
+        _identity_plan("Anonymous attribution ablation",
+                       "displayed source attribution", "remove_label"),
+    ], cluster_response=None)
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    ideas = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).all()
+    experiments = db.query(ExperimentPlan).filter(
+        ExperimentPlan.task_id == task.id).all()
+    assert len(ideas) == 1, "complementary designs share one idea"
+    assert len(experiments) == 2
+    assert all(e.idea_id == ideas[0].id for e in experiments)
+    ops = {json.loads(e.steps_json).get("core_operation") for e in experiments}
+    assert ops == {"swap_label", "remove_label"}, "both operations preserved"
+    assert "[Complementary experiment]" in ideas[0].motivation
+    assert "[Condition variant merged]" not in ideas[0].motivation
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_distinct_factors_stay_separate_ideas(temp_db, monkeypatch):
+    """Different factors (displayed attribution vs actual provenance) are
+    genuinely separate studies — the guard merges collapse and folds
+    complementary pairs, not independent factors."""
     from app.agent.state import ResearchState
     from app.db.models import ResearchIdea
 
     db = temp_db()
     task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=2)
-    atoms = _derive_scenario_atoms(gap, None, phenomenon)
     llm = _SequentialPlanLLM([
         _identity_plan("Attribution swap testing",
-                       "Swap the displayed source attribution label (Self vs External).",
-                       "Self-labelled hallucinations receive higher ratings."),
-        _identity_plan("Blind anonymous evaluation",
-                       "Remove all attribution metadata; compare blind vs disclosed ratings.",
-                       "Bias observed under labels shrinks under anonymity."),
+                       "displayed source attribution", "swap_label"),
+        _identity_plan("Actual provenance blind test",
+                       "actual generation provenance", "blind_judge"),
     ], cluster_response=None)
     state = ResearchState(task_id=task.id, contract_id=contract.id,
                           pipeline_version=2, current_round=1)
-    _patch_embeddings(monkeypatch, similar=False)
 
     await generate_minimal_experiments(db, state, llm, task.id)
 
     ideas = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).all()
     assert len(ideas) == 2
     assert not any("[Condition variant merged]" in (i.motivation or "")
+                   or "[Complementary experiment]" in (i.motivation or "")
                    for i in ideas)
     db.close()
+
+
+def test_sibling_relation_threshold_boundaries(monkeypatch):
+    """The relation thresholds themselves, not just the code branches (run7
+    review round 2): factor 0.85 boundary flips INDEPENDENT<->same-factor,
+    and with same factor+operation the signature 0.85 boundary flips
+    COMPLEMENTARY<->DUPLICATE."""
+    import importlib
+
+    gme = importlib.import_module("app.agent.steps.generate_minimal_experiments")
+
+    # Vectors with an exact cosine: [1,0] vs [cos, sin].
+    import math
+
+    def vec_for(cos_target: float):
+        return [cos_target, math.sqrt(max(0.0, 1.0 - cos_target * cos_target))]
+
+    def patch_with(sim_map):
+        """sim_map: pair index (0=factor,1=operation,2=signature,3=mechanism)
+        -> cosine value for (plan vs sibling)."""
+        plan_texts = ["p_factor", "s_factor", "p_op", "s_op",
+                      "p_sig", "s_sig", "p_mech", "s_mech"]
+
+        def fake_embed(texts):
+            out = []
+            for t in texts:
+                if t == "p_factor":
+                    out.append([1.0, 0.0])
+                elif t == "s_factor":
+                    out.append(vec_for(sim_map.get(0, 1.0)))
+                elif t == "p_op":
+                    out.append([1.0, 0.0])
+                elif t == "s_op":
+                    out.append(vec_for(sim_map.get(1, 1.0)))
+                elif t == "p_sig":
+                    out.append([1.0, 0.0])
+                elif t == "s_sig":
+                    out.append(vec_for(sim_map.get(2, 1.0)))
+                elif t == "p_mech":
+                    out.append([1.0, 0.0])
+                elif t == "s_mech":
+                    out.append(vec_for(sim_map.get(3, 1.0)))
+                else:  # one-hot fallback for unrelated texts
+                    out.append([0.0] * 64)
+            return out
+
+        monkeypatch.setattr(gme.embedding_service, "embed_texts", fake_embed)
+
+    from types import SimpleNamespace
+
+    plan = SimpleNamespace(core_factor="p_factor", core_operation="p_op",
+                           expected_signature="p_sig",
+                           mechanism_being_tested="p_mech")
+    sibling = {
+        "core_factor": "s_factor", "core_operation": "s_op",
+        "core_contrast": "c", "expected_signature": "s_sig",
+        "mechanism": "s_mech", "hypothesis": "h", "idea": None,
+    }
+
+    # Factor 0.86 + operation 1.0 + signature 0.86 + mechanism 0.81 -> DUPLICATE
+    patch_with({0: 0.86, 1: 1.0, 2: 0.86, 3: 0.81})
+    relation, detail = gme._classify_sibling_relation(plan, sibling)
+    assert relation == "DUPLICATE", detail
+
+    # Same as above but signature 0.84 (< 0.85) -> COMPLEMENTARY (not a duplicate)
+    patch_with({0: 0.86, 1: 1.0, 2: 0.84, 3: 0.81})
+    relation, _ = gme._classify_sibling_relation(plan, sibling)
+    assert relation == "COMPLEMENTARY"
+
+    # Same factor 0.86 but operation dissimilar -> COMPLEMENTARY
+    patch_with({0: 0.86, 1: 0.30, 2: 0.5, 3: 0.5})
+    relation, _ = gme._classify_sibling_relation(plan, sibling)
+    assert relation == "COMPLEMENTARY"
+
+    # Factor 0.84 (< 0.85) -> INDEPENDENT even with everything else identical
+    patch_with({0: 0.84, 1: 1.0, 2: 0.99, 3: 0.99})
+    relation, _ = gme._classify_sibling_relation(plan, sibling)
+    assert relation == "INDEPENDENT"
