@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
 from app.agent.evidence_relations import (
@@ -41,7 +42,23 @@ _MAX_PROMPT_EVIDENCE = 40
 # threshold tightened 0.85 -> 0.78. Task 9e56a131: 9 candidates collapsed into
 # 3-4 semantic clusters; remediation rounds re-mined reworded duplicates while
 # the undetermined originals were never re-audited.
-GAP_MINING_POLICY_VERSION = "evidence-admission-v5"
+# v6 (2026-08-28, task d6f64087): placeholder-hypothesis guard — a
+# testable_hypothesis or claimed_delta containing literal placeholder operands
+# (">X%", "<Y parameters") is rejected at mining time. The observed surviving
+# gap carried ">X% label noise or <Y parameters" verbatim through narrowing
+# into the experiment prompts; only the intervention LLM's own initiative
+# prevented the placeholders from reaching the final plan.
+GAP_MINING_POLICY_VERSION = "evidence-admission-v6"
+
+# Placeholder operands: comparisons or quantifiers whose operand is a bare
+# letter (X/Y/N) instead of a number. Real hypotheses quantify ("noise above
+# 10%"); a letter operand means the mining LLM deferred a decision it was
+# asked to make, and the placeholder propagates downstream verbatim.
+_PLACEHOLDER_OPERAND_RE = re.compile(
+    r"[><=≤≥]\s*[XYN]\b"
+    r"|\b[XYN]\s*%"
+    r"|\b[XYN]\s+(?:samples?|papers?|parameters?|examples?|labels?|units?)\b",
+)
 
 # Semantic-dedup threshold: two gap candidates whose fingerprint (observed
 # problem + missing capability + claimed delta) embeds to a cosine similarity at
@@ -215,6 +232,10 @@ For every gap:
   "negative_result": a gap needs a documented shortcoming, not only comparisons;
 - state what existing work already covers and the smallest missing capability;
 - write a falsifiable condition that would close the gap;
+- quantifiers in testable_hypothesis and claimed_delta must be concrete numbers
+  (">10% label noise", "<3B parameters"). NEVER emit placeholder operands like
+  ">X%", "<Y parameters" or "N samples" — a hypothesis with an unquantified
+  letter operand is rejected outright;
 - do not propose a solution or invent paper findings;
 - write every gap field in English (target setting, observed problem, existing
   coverage, missing capability, claimed delta, falsification condition). The
@@ -539,6 +560,13 @@ async def mine_gap_candidates(
         elif candidate.contradicting_evidence_ids: reason = "UNEXPECTED_CONTRADICTING_EVIDENCE"
         elif len({item.paper_id for item in support}) < 2: reason = "INSUFFICIENT_CANDIDATE_PAPER_SUPPORT"
         elif not any(item.evidence_type in _LIMITATION_SIGNAL_TYPES for item in support): reason = "CANDIDATE_LACKS_LIMITATION_SIGNAL"
+        elif (_PLACEHOLDER_OPERAND_RE.search(candidate.testable_hypothesis or "")
+                or _PLACEHOLDER_OPERAND_RE.search(candidate.claimed_delta or "")):
+            # P1-1 (task d6f64087): ">X% label noise or <Y parameters" is a
+            # hypothesis the mining LLM never finished quantifying. Accepting it
+            # lets the placeholder flow through narrowing into intervention and
+            # experiment prompts (observed verbatim on the surviving gap).
+            reason = "PLACEHOLDER_OPERAND_IN_HYPOTHESIS"
         if reason:
             rejected_candidates.append({
                 "reason": reason,

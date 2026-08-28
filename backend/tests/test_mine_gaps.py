@@ -382,3 +382,20 @@ def test_prompt_evidence_selection_is_deterministic():
     second = [item.id for item in select_prompt_evidence(admissions, evidence_by_id, total=5)[0]]
 
     assert first == second
+
+
+def test_placeholder_operands_are_rejected_at_mining():
+    """P1-1 (task d6f64087): ">X% label noise or <Y parameters" is a hypothesis
+    the mining LLM never finished quantifying; it must be rejected at mining
+    time instead of flowing through narrowing into experiment prompts."""
+    from app.agent.steps.mine_gaps import _PLACEHOLDER_OPERAND_RE
+
+    assert _PLACEHOLDER_OPERAND_RE.search(">X% label noise")
+    assert _PLACEHOLDER_OPERAND_RE.search("models with <Y parameters")
+    assert _PLACEHOLDER_OPERAND_RE.search("N samples per setting")
+    assert _PLACEHOLDER_OPERAND_RE.search("noise above =N percent")
+    # Real quantified hypotheses must pass.
+    assert not _PLACEHOLDER_OPERAND_RE.search(
+        "reward models trained on >10% label noise exhibit instability")
+    assert not _PLACEHOLDER_OPERAND_RE.search(
+        "models with <3B parameters underperform in online detection")
