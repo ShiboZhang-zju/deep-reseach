@@ -166,3 +166,55 @@ async def test_intervention_prompt_separates_evidence_ids_from_paper_ids(temp_db
         "the prompt must name the only list dependency_paper_ids may come from"
     )
     db.close()
+
+
+# --- P0-1a (task d6f64087): novelty_confidence must reach the gate decision ---
+
+def _confirmed_audit(novelty_confidence):
+    return SimpleNamespace(
+        audit_result="confirmed", remaining_delta="untested state changes",
+        novelty_confidence=novelty_confidence, neighbor_paper_ids_json="[]")
+
+
+def test_novelty_gate_fails_confirmed_audit_with_very_low_confidence():
+    """confirmed + very low novelty_confidence used to PASS — the number was
+    printed in the rationale but never used in the decision, so three
+    interventions reached tier A on an audit that itself reported 30%
+    confidence in the gap's novelty. (Exactly-0.3 audits are caught earlier:
+    the audit-side guard downgrades confirmed+<=0.4 before surviving, so the
+    intervention-side FAIL band mainly protects legacy/resumed gaps.)"""
+    gap = SimpleNamespace(provenance_status="complete")
+    contract = SimpleNamespace(allow_model_training=False, allow_large_benchmark=False, gpu_available=False)
+    result = _evaluate_hard_gates(gap, _confirmed_audit(0.2), ["e1", "e2"],
+                                  _candidate("Add evaluation protocol", "low cost"), contract)
+    assert result["gate_statuses"]["novelty"] == "FAIL"
+
+
+def test_novelty_gate_warns_confirmed_audit_with_low_confidence():
+    gap = SimpleNamespace(provenance_status="complete")
+    contract = SimpleNamespace(allow_model_training=False, allow_large_benchmark=False, gpu_available=False)
+    result = _evaluate_hard_gates(gap, _confirmed_audit(0.45), ["e1", "e2"],
+                                  _candidate("Add evaluation protocol", "low cost"), contract)
+    assert result["gate_statuses"]["novelty"] == "WARN"
+    # WARN alone caps the tier at B (needs confirmation), never A.
+    from app.agent.steps.generate_interventions import _compute_confidence_tier
+    assert _compute_confidence_tier(gap, result["gate_statuses"]) == "B"
+
+
+def test_novelty_gate_passes_confirmed_audit_with_solid_confidence():
+    gap = SimpleNamespace(provenance_status="complete")
+    contract = SimpleNamespace(allow_model_training=False, allow_large_benchmark=False, gpu_available=False)
+    result = _evaluate_hard_gates(gap, _confirmed_audit(0.7), ["e1", "e2"],
+                                  _candidate("Add evaluation protocol", "low cost"), contract)
+    assert result["gate_statuses"]["novelty"] == "PASS"
+
+
+def test_novelty_gate_keeps_legacy_audit_without_confidence_passing():
+    """Legacy audits without a novelty_confidence value must not retro-fail."""
+    gap = SimpleNamespace(provenance_status="complete")
+    contract = SimpleNamespace(allow_model_training=False, allow_large_benchmark=False, gpu_available=False)
+    result = _evaluate_hard_gates(gap, SimpleNamespace(
+        audit_result="confirmed", remaining_delta="untested state changes",
+        novelty_confidence=None, neighbor_paper_ids_json="[]"), ["e1", "e2"],
+        _candidate("Add evaluation protocol", "low cost"), contract)
+    assert result["gate_statuses"]["novelty"] == "PASS"

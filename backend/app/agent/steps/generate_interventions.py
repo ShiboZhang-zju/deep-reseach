@@ -13,6 +13,23 @@ from app.db.repositories import intervention_repo
 
 logger = logging.getLogger(__name__)
 
+# v1 (2026-08-28, task d6f64087): the novelty gate now consumes the audit's
+# novelty_confidence instead of only the verdict string. Previously
+# confirmed + novelty_confidence=0.3 sailed through as PASS (the number was
+# even printed in the rationale but never used in the decision), so all three
+# interventions of the run reached tier A on an audit that itself reported
+# only 30% confidence in the gap's novelty. Changing this rule must
+# invalidate previously stamped intervention phases on resumed tasks — this
+# constant is hashed into the phase input_version for exactly that purpose.
+INTERVENTION_GENERATION_POLICY_VERSION = "intervention-novelty-confidence-v1"
+# Novelty gate thresholds on audit.novelty_confidence (only when the audit
+# verdict itself is "confirmed"): below the WARN bound the confirmed verdict
+# still flows downstream but only as tier B (needs confirmation); below the
+# FAIL bound the gap is treated as not credibly novel. None (legacy audits
+# without the field) keeps PASS so historical tasks are not retro-failed.
+_NOVELTY_CONFIDENCE_WARN_BELOW = 0.5
+_NOVELTY_CONFIDENCE_FAIL_BELOW = 0.3
+
 _INTERVENTION_SYSTEM = """You design bounded research interventions for an audited research gap.
 Generate 1-3 interventions, not full paper ideas. Each intervention must explicitly connect:
 Observed problem -> failure mechanism -> intervention -> intermediate effect -> measurable outcome.
@@ -204,10 +221,29 @@ def _evaluate_hard_gates(gap, audit, evidence_ids, candidate, contract) -> dict:
     novelty_reason = "缺少完成的近邻审计"
     if audit:
         if audit.audit_result == "confirmed" and audit.remaining_delta:
-            novelty_status = "PASS"
-            novelty_reason = (
-                f"近邻审计 confirmed（{neighbor_count} 篇近邻，"
-                f"novelty_confidence={novelty_confidence}，存在 remaining delta）")
+            # P0-1a (task d6f64087): a "confirmed" verdict only means no
+            # neighbor covered the claim — absence of a hit, not presence of
+            # novelty. The auditor's own novelty_confidence quantifies how
+            # much it trusts its search; the gate must consume it instead of
+            # printing it. confirmed+0.3 previously produced tier-A
+            # interventions and would have produced an executable_candidate.
+            if novelty_confidence is not None and novelty_confidence < _NOVELTY_CONFIDENCE_FAIL_BELOW:
+                novelty_status = "FAIL"
+                novelty_reason = (
+                    f"近邻审计判 confirmed 但 novelty_confidence={novelty_confidence:.2f}"
+                    f"（<{_NOVELTY_CONFIDENCE_FAIL_BELOW}）：审计自身不确信新颖性主张，"
+                    f"视为不可信新颖性")
+            elif novelty_confidence is not None and novelty_confidence < _NOVELTY_CONFIDENCE_WARN_BELOW:
+                novelty_status = "WARN"
+                novelty_reason = (
+                    f"近邻审计判 confirmed（{neighbor_count} 篇近邻），但 "
+                    f"novelty_confidence={novelty_confidence:.2f}"
+                    f"（<{_NOVELTY_CONFIDENCE_WARN_BELOW}）偏低，新颖性主张需复审确认")
+            else:
+                novelty_status = "PASS"
+                novelty_reason = (
+                    f"近邻审计 confirmed（{neighbor_count} 篇近邻，"
+                    f"novelty_confidence={novelty_confidence}，存在 remaining delta）")
         elif audit.audit_result == "closed":
             novelty_status = "FAIL"
             novelty_reason = f"近邻审计显示核心 claim 已被覆盖（{neighbor_count} 篇近邻）"

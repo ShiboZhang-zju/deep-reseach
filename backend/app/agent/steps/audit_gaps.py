@@ -31,6 +31,16 @@ _MIN_NEIGHBOR_SIMILARITY = 0.3
 # contradictory signal that flags retrieval failure (observed: 5 application-
 # domain neighbors at max similarity 0.15 yet novelty_confidence 0.95).
 _HIGH_NOVELTY = 0.8
+# P0-1b (2026-08-28, task d6f64087): symmetric guard at the LOW end. The v4
+# guard above distrusts high-confidence confirms with distant neighbors; the
+# mirror image — a confirmed verdict whose own novelty_confidence is very low —
+# is the auditor admitting its search was too weak to rule prior work out
+# ("no neighbor covers the claim" by absence, not by evidence). Observed:
+# surviving gap 475c8acd confirmed with novelty_confidence=0.3, which then
+# produced three tier-A interventions. Downgrade to uncertain/more_search so a
+# later round retrries with better retrieval instead of stamping a hollow
+# "novel".
+_LOW_NOVELTY_CONFIRMED = 0.4
 # E2E 2026-08-26: the surviving gap's audit output had structured fields
 # confirmed/continue while its own remaining_delta concluded verbatim
 # "Therefore, the decision is uncertain." Match only unambiguous
@@ -62,7 +72,12 @@ _AUDIT_TEXT_CONFLICT_RE = re.compile(
 # whose structured intent is complete gets variants synthesized from its
 # structured fields (task 23ec8f20 re-audit: default_factory=list bypasses
 # min_length, 4/5 families empty, admission failed twice on family count).
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v10"
+# v11 (2026-08-28, task d6f64087): low-novelty confirmed guard — a confirmed
+# verdict whose own novelty_confidence <= 0.4 is downgraded to uncertain/
+# more_search (search-absence novelty, observed: surviving gap at 0.3 feeding
+# three tier-A interventions). Verdict rules changed, so previously stamped
+# audits must be invalidated on resume.
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v11"
 
 
 # --- Canonical atomic claims (Phase 3H) ---
@@ -1559,6 +1574,35 @@ async def audit_gap_candidate(
                                   "decision", output_data={"gap_id": gap.id})
             logger.warning("Gap %s: downgrading confirmed->uncertain (remaining_delta "
                            "text contradicts the structured verdict)", gap.id[:8])
+        elif (decision.novelty_confidence is not None
+              and decision.novelty_confidence <= _LOW_NOVELTY_CONFIRMED):
+            # P0-1b (task d6f64087): confirmed but the auditor itself reports
+            # novelty_confidence <= 0.4 — "no neighbor covered the claim" by
+            # search absence, not by evidence. Promoting this to surviving
+            # lets a hollow-novelty gap reach tier-A interventions (observed:
+            # surviving gap confirmed at 0.3 → 3 tier-A interventions →
+            # experiment plans built on an unconfirmed premise). Send it back
+            # for retrieval instead.
+            original_novelty = decision.novelty_confidence
+            decision.audit_result = "uncertain"
+            decision.recommended_action = "more_search"
+            action = "more_search"
+            gap.status = "auditing"
+            decision.rejection_reason = (
+                f"confirmed verdict carries novelty_confidence={original_novelty:.2f} "
+                f"(<= {_LOW_NOVELTY_CONFIRMED}): the audit's own search was too weak "
+                f"to establish novelty; retry with better retrieval"
+            )
+            failure_codes.append("LOW_NOVELTY_CONFIDENCE_CONFIRMED")
+            paper_repo.save_trace(db, task_id, "gap_audit_low_novelty_downgrade",
+                                  "decision", output_data={
+                                      "gap_id": gap.id,
+                                      "novelty_confidence": original_novelty,
+                                      "downgraded_to": "uncertain",
+                                  })
+            logger.warning("Gap %s: downgrading confirmed->uncertain "
+                           "(novelty_confidence %.2f <= %.2f)",
+                           gap.id[:8], original_novelty, _LOW_NOVELTY_CONFIRMED)
         else:
             gap.status = "surviving"
             _record_nearest_prior_art(db, gap, decision)

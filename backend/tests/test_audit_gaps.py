@@ -709,6 +709,45 @@ async def test_confirmed_verdict_with_uncertain_text_is_not_promoted(temp_db, mo
     db.close()
 
 
+class LowNoveltyConfirmedLLM(ConfirmingAuditLLM):
+    """Structured fields say confirmed/continue, but novelty_confidence=0.3.
+
+    Production case (task d6f64087, 2026-08-28): the surviving gap 475c8acd was
+    confirmed with novelty_confidence=0.3 — "no neighbor covered the claim" by
+    search absence, not by evidence — then fed three tier-A interventions whose
+    novelty gate also ignored the number.
+    """
+
+    async def chat_json(self, messages, schema):
+        decision = await super().chat_json(messages, schema)
+        decision.novelty_confidence = 0.3
+        return decision
+
+
+@pytest.mark.asyncio
+async def test_confirmed_verdict_with_low_novelty_confidence_is_downgraded(temp_db, monkeypatch):
+    """P0-1b: confirmed + novelty_confidence <= 0.4 is search-absence novelty —
+    downgrade to uncertain/more_search instead of promoting to surviving."""
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
+    from app.agent.state import ResearchState
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.repositories import gap_repo
+
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+    results = await audit_gap_candidates(db, state, LowNoveltyConfirmedLLM(), task.id,
+                                         perform_search=False)
+
+    assert results[0].audit_result == "uncertain"
+    assert results[0].recommended_action == "more_search"
+    assert state.surviving_gap_ids == []
+    assert gap_repo.get_gap(db, gap.id).status != "surviving"
+    audit = gap_repo.list_gap_audits(db, gap.id)[-1]
+    assert "LOW_NOVELTY_CONFIDENCE_CONFIRMED" in json.loads(audit.failure_reason_codes_json)
+    db.close()
+
+
 @pytest.mark.asyncio
 async def test_unmeasured_npa_convergence_downgrades_confirmed(temp_db, monkeypatch):
     """E2E 2026-08-26: convergence=None (fewer than two completed queries) used
