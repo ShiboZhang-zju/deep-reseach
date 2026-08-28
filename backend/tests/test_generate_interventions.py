@@ -55,13 +55,23 @@ def temp_db():
 
 
 class _InterventionLLM:
+    """Lens-era mock: serves the first lens call and returns empty lists for
+    the remaining lenses ("this lens does not fit") — keeping the single-gap
+    single-intervention shape the older tests assert on."""
+
     def __init__(self, dependency_paper_ids):
         self.dependency_paper_ids = dependency_paper_ids
+        self.calls = 0
+        self.user_prompts = []
 
     async def chat_json(self, messages, schema):
         from app.agent.steps.generate_interventions import InterventionList
 
+        self.calls += 1
         self.system_prompt = messages[0]["content"]
+        self.user_prompts.append(messages[-1]["content"])
+        if self.calls > 1:
+            return InterventionList(interventions=[])
         return InterventionList(interventions=[InterventionSchema(
             intervention_type="evaluation_protocol",
             failure_mechanism="Generic QA hides state changes.",
@@ -218,3 +228,141 @@ def test_novelty_gate_keeps_legacy_audit_without_confidence_passing():
         novelty_confidence=None, neighbor_paper_ids_json="[]"), ["e1", "e2"],
         _candidate("Add evaluation protocol", "low cost"), contract)
     assert result["gate_statuses"]["novelty"] == "PASS"
+
+
+# --- Lens fan-out (2026-08-28, ARIS-inspired breadth stage) ---
+
+class _PerLensLLM:
+    """One intervention per lens call; records which lens each call served."""
+
+    def __init__(self):
+        self.user_prompts = []
+
+    async def chat_json(self, messages, schema):
+        from app.agent.steps.generate_interventions import InterventionList
+
+        self.user_prompts.append(messages[-1]["content"])
+        import re
+        m = re.search(r"Lens: ([a-z_]+)", messages[-1]["content"])
+        lens = m.group(1) if m else "unknown"
+        return InterventionList(interventions=[InterventionSchema(
+            intervention_type="method",
+            failure_mechanism=f"{lens} targets a distinct failure surface.",
+            proposed_intervention=f"Intervention generated from the {lens} lens.",
+            intermediate_effect="separates state changes",
+            measurable_outcome="state-change accuracy",
+            implementation_cost="low cost",
+            dependency_paper_ids=[],
+            mechanism_confidence=0.8,
+        )])
+
+
+@pytest.mark.asyncio
+async def test_lens_fanout_calls_every_lens_once(temp_db):
+    """One LLM call per (gap, lens): six lenses, six independent candidate
+    sources 鈥?the structural fix for single-call local convergence (task
+    d6f64087: 2 of 3 single-call interventions tested the same hypothesis)."""
+    import re
+    from app.agent.state import ResearchState
+    from app.agent.steps.generate_interventions import (
+        _INTERVENTION_LENSES, generate_interventions)
+    from app.db.models import AgentTrace, InterventionCandidate
+
+    db = temp_db()
+    task, contract, gap, neighbour = _seed_surviving_gap(db)
+    state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=2)
+    llm = _PerLensLLM()
+
+    result = await generate_interventions(db, state, llm, task.id)
+
+    lens_names = [re.search(r"Lens: ([a-z_]+)", p).group(1) for p in llm.user_prompts]
+    assert lens_names == [name for name, _ in _INTERVENTION_LENSES], (
+        "every lens must get exactly one independent call, in order")
+    # Each lens contributed one distinct candidate.
+    assert len(result.intervention_ids) == len(_INTERVENTION_LENSES)
+    mechanisms = [db.get(InterventionCandidate, iid).failure_mechanism
+                  for iid in result.intervention_ids]
+    assert len(set(mechanisms)) == len(mechanisms), (
+        "lens-sourced candidates must stay distinguishable")
+    trace = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "generate_interventions").one()
+    fanout = json.loads(trace.output_json)["lens_fanout"]
+    assert [f["lens"] for f in fanout] == [name for name, _ in _INTERVENTION_LENSES]
+    assert all(f["candidate_count"] == 1 for f in fanout)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_lens_that_does_not_fit_returns_empty(temp_db):
+    """A lens with no sound intervention must return an empty list 鈥?padding
+    would reintroduce the single-call convergence the fan-out exists to break."""
+    from app.agent.state import ResearchState
+    from app.agent.steps.generate_interventions import generate_interventions
+    from app.db.models import AgentTrace
+
+    class _EmptyLensLLM(_PerLensLLM):
+        async def chat_json(self, messages, schema):
+            from app.agent.steps.generate_interventions import InterventionList
+            self.user_prompts.append(messages[-1]["content"])
+            return InterventionList(interventions=[])
+
+    db = temp_db()
+    task, contract, gap, neighbour = _seed_surviving_gap(db)
+    state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=2)
+    llm = _EmptyLensLLM()
+
+    result = await generate_interventions(db, state, llm, task.id)
+
+    assert result.intervention_ids == []
+    trace = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "generate_interventions").one()
+    fanout = json.loads(trace.output_json)["lens_fanout"]
+    assert len(fanout) == 6
+    assert all(f["candidate_count"] == 0 for f in fanout)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_lens_candidates_are_capped_per_lens(temp_db):
+    """A lens that ignores the 1-2 instruction cannot flood the pool: at most
+    _MAX_CANDIDATES_PER_LENS candidates survive from any single lens."""
+    from app.agent.state import ResearchState
+    from app.agent.steps.generate_interventions import (
+        _MAX_CANDIDATES_PER_LENS, generate_interventions)
+    from app.db.models import AgentTrace
+
+    class _GreedyLensLLM(_PerLensLLM):
+        async def chat_json(self, messages, schema):
+            from app.agent.steps.generate_interventions import InterventionList
+            self.user_prompts.append(messages[-1]["content"])
+            import re
+            m = re.search(r"Lens: ([a-z_]+)", messages[-1]["content"])
+            lens = m.group(1) if m else "unknown"
+            return InterventionList(interventions=[
+                InterventionSchema(
+                    intervention_type="method",
+                    failure_mechanism=f"{lens} surface {i}",
+                    proposed_intervention=f"{lens} intervention {i}",
+                    intermediate_effect="separates state changes",
+                    measurable_outcome="state-change accuracy",
+                    implementation_cost="low cost",
+                    dependency_paper_ids=[],
+                    mechanism_confidence=0.8,
+                ) for i in range(3)])
+
+    db = temp_db()
+    task, contract, gap, neighbour = _seed_surviving_gap(db)
+    state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=2)
+    llm = _GreedyLensLLM()
+
+    result = await generate_interventions(db, state, llm, task.id)
+
+    assert len(result.intervention_ids) == 6 * _MAX_CANDIDATES_PER_LENS
+    trace = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "generate_interventions").one()
+    fanout = json.loads(trace.output_json)["lens_fanout"]
+    assert all(f["candidate_count"] == _MAX_CANDIDATES_PER_LENS for f in fanout)
+    db.close()

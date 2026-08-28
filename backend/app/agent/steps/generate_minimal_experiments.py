@@ -98,7 +98,13 @@ For dataset and baselines, be concrete enough to actually run:
 # copy of intervention.measurable_outcome in expected_contribution. P2-b:
 # related_paper_ids are re-selected from the novelty check's mechanism-relevant
 # papers instead of inheriting the gap audit's full neighbour set.
-EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v8"
+# v9 (2026-08-28, ARIS-inspired): independent scientific triage between the
+# hypothesis cluster gate and experiment generation — when lens fan-out leaves
+# more clusters than _TRIAGE_TOP_K, one reviewer call ranks them; funded
+# ideas carry the reviewer's best-case/objection note, parked clusters persist
+# as research_direction_only ideas (DEFERRED_BY_SCIENTIFIC_TRIAGE) instead of
+# silently losing the experiment budget race.
+EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v9"
 
 # P0-3: rejection-aware rewrite attempts per cluster. Two was too few once the
 # feedback became specific — one attempt burns on absorbing the feedback, the
@@ -109,6 +115,14 @@ _PLAN_GENERATION_ATTEMPTS = 3
 # related work metadata stays readable instead of inheriting the full audit
 # neighbour set.
 _IDEA_RELATED_PAPER_CAP = 8
+
+# Independent scientific triage (ARIS-inspired, 2026-08-28): with lens fan-out
+# a gap can yield more hypothesis clusters than the experiment budget should
+# fund. One LLM call ranks ALL of a gap's clusters; the top-K get experiment
+# generation, the rest persist as research_direction_only with the reviewer's
+# annotations. Rank; do not rewrite — triage allocates budget, it can never
+# override the evidence/novelty/feasibility gates (those already passed).
+_TRIAGE_TOP_K = 2
 
 # Initial calibration point; revisit against historical task annotations (P3)
 # before changing — cluster merges REDUCE idea counts, so false merges are the
@@ -309,6 +323,159 @@ Additionally, set mechanism_relevant_paper_ids to the ids (exactly as listed) of
 to the idea's mechanism — prior art a reader must know, or related work the experiment should compare against.
 Exclude papers that only share the broad topic without touching the mechanism. Leave it empty when none qualify."""
 
+_TRIAGE_SYSTEM = """You are an independent scientific reviewer ranking candidate research directions for one
+audited research gap. Each candidate cluster already passed the evidence, novelty and feasibility gates —
+you cannot veto that; your ONLY job is to decide which of them most deserves the scarce experiment budget.
+For each cluster judge:
+- information_value: how much a decisive result in EITHER direction teaches us (a hypothesis whose
+  failure is just as informative as its success ranks high; a hypothesis whose failure teaches nothing
+  ranks low)
+- simplicity: fewest moving parts that still tests the hypothesis (methods that pile on modules to look
+  novel rank low)
+- best_case / strongest_objection / alternative_explanation: the reviewer-stance reasoning a proposal's
+  author cannot see from inside.
+Set priority to a unique integer across all clusters, 1 = most deserving. RANK; do NOT rewrite, merge or
+propose interventions. Do not invent facts about the candidates."""
+
+_TRIAGE_USER = """Gap context:
+- Observed problem: {observed_problem}
+- Remaining delta: {remaining_delta}
+- Audit novelty confidence: {novelty_confidence}
+- Phenomenon under test: {phenomenon}
+
+Candidate clusters ({count}):
+{cluster_summaries}
+
+Return exactly one triage entry per cluster; cluster_primary_intervention_id must match the listed
+"Candidate {{id}}" exactly."""
+
+
+def _triage_cluster_summary(cluster) -> str:
+    primary = cluster["primary"]
+    variants = cluster.get("variants") or []
+    variant_notes = "; ".join(
+        f"{v.failure_mechanism[:80]}" for v in variants) or "(none)"
+    return (
+        f"Candidate {primary.id} (tier {getattr(primary, 'confidence_tier', 'B')}):\n"
+        f"- hypothesis: {cluster.get('hypothesis') or '(not extracted)'}\n"
+        f"- mechanism: {primary.failure_mechanism}\n"
+        f"- intervention: {primary.proposed_intervention}\n"
+        f"- measurable outcome: {primary.measurable_outcome}\n"
+        f"- variant mechanisms riding as ablations: {variant_notes}"
+    )
+
+
+async def _triage_clusters_by_scientific_value(
+        db, llm, task_id, gap, phenomenon, audit, clusters) -> dict[str, dict] | None:
+    """Rank a gap's clusters by scientific value; None means "no verdict".
+
+    None is returned on any infrastructure/ID-discipline failure — the caller
+    then funds ALL clusters (fail-open), which is exactly the pre-triage
+    behaviour: an outage of the reviewer is not evidence against a cluster.
+    """
+    if llm is None or not hasattr(llm, "chat_json") or len(clusters) <= _TRIAGE_TOP_K:
+        return None
+    summaries = "\n\n".join(_triage_cluster_summary(c) for c in clusters)
+    try:
+        result = await llm.chat_json([
+            {"role": "system", "content": _TRIAGE_SYSTEM},
+            {"role": "user", "content": _TRIAGE_USER.format(
+                observed_problem=(gap.observed_problem or "(not specified)")[:400],
+                remaining_delta=((audit.remaining_delta if audit else gap.claimed_delta) or "(not specified)")[:400],
+                novelty_confidence=(getattr(audit, "novelty_confidence", None) if audit else None),
+                phenomenon=(getattr(phenomenon, "phenomenon", "") or "(not specified)")[:400],
+                count=len(clusters),
+                cluster_summaries=summaries,
+            )},
+        ], InterventionTriageListSchema)
+    except Exception as exc:
+        logger.warning("Task %s: intervention triage degraded: %s", task_id[:8], exc)
+        paper_repo.save_trace(db, task_id, "intervention_triage", "decision", output_data={
+            "gap_id": gap.id, "verdict": "degraded", "error": str(exc)[:200],
+        })
+        return None
+    expected_ids = {c["primary"].id for c in clusters}
+    by_id: dict[str, InterventionTriageItemSchema] = {}
+    for item in result.triage:
+        if item.cluster_primary_intervention_id in expected_ids:
+            by_id[item.cluster_primary_intervention_id] = item
+    if set(by_id) != expected_ids:
+        paper_repo.save_trace(db, task_id, "intervention_triage", "decision", output_data={
+            "gap_id": gap.id, "verdict": "degraded",
+            "error": "triage IDs do not match cluster IDs exactly",
+            "expected": sorted(expected_ids), "returned": sorted(by_id),
+        })
+        return None
+    entries = {
+        pid: {
+            "best_case": item.best_case,
+            "strongest_objection": item.strongest_objection,
+            "alternative_explanation": item.alternative_explanation,
+            "simplicity": item.simplicity,
+            "information_value": item.information_value,
+            "priority": item.priority,
+        }
+        for pid, item in by_id.items()
+    }
+    paper_repo.save_trace(db, task_id, "intervention_triage", "decision", output_data={
+        "gap_id": gap.id,
+        "verdict": "ranked",
+        "top_k": _TRIAGE_TOP_K,
+        "rankings": entries,
+    })
+    return entries
+
+
+def _persist_parked_cluster_idea(db, task_id, state, contract, gap, cluster,
+                                 entry, rank, total, paper_ids, seen_titles,
+                                 direction_only_idea_ids):
+    """Persist a triage-parked cluster as a research_direction_only idea.
+
+    The cluster passed every hard gate; only the experiment budget withheld
+    it. The reviewer's best-case/objection annotations are the user-visible
+    record of WHY it was parked — without this, a triage decision would be a
+    silent drop, recreating the P0-3 "evaporated plan" defect one level up.
+    """
+    primary = cluster["primary"]
+    title = _normalize_idea_title(
+        (primary.proposed_intervention or primary.failure_mechanism or "")[:80])
+    if title in seen_titles:
+        mech = (primary.failure_mechanism or "").strip()
+        title = f"{title} — {mech[:40]}" if mech else f"{title} (2)"
+    seen_titles.add(title)
+    motivation = _build_idea_motivation(
+        gap, primary, evidence_claims=_load_gap_evidence_claims(db, gap.id))
+    annotation = (
+        "\n\n[research_direction_only] Deferred by independent scientific "
+        f"triage (priority {rank} of {total}; the experiment budget funds the "
+        f"top {_TRIAGE_TOP_K}). Best case: {entry['best_case']} Strongest "
+        f"objection: {entry['strongest_objection']}"
+    )
+    if entry.get("alternative_explanation"):
+        annotation += f" Alternative explanation: {entry['alternative_explanation']}"
+    motivation += annotation
+    idea = paper_repo.save_idea(db, task_id, {
+        "title": title,
+        "description": (cluster.get("hypothesis") or primary.proposed_intervention or "")[:500],
+        "motivation": motivation,
+        "method_sketch": primary.proposed_intervention,
+        "expected_contribution": primary.measurable_outcome,
+        "related_paper_ids_json": json.dumps(paper_ids, ensure_ascii=False),
+        "contract_id": contract.id,
+        "gap_id": gap.id,
+        "intervention_id": primary.id,
+        "pipeline_version": state.pipeline_version,
+        "decision": "research_direction_only",
+        "score_status": "unscored",
+        "quality_reason_codes_json": json.dumps(
+            ["DEFERRED_BY_SCIENTIFIC_TRIAGE", f"TRIAGE_PRIORITY_{rank}"],
+            ensure_ascii=False),
+        "confidence_tier": getattr(primary, "confidence_tier", "B") or "B",
+    })
+    direction_only_idea_ids.append(idea.id)
+    logger.info("Task %s: parked cluster at triage priority %d as "
+                "research_direction_only idea %s",
+                task_id[:8], rank, idea.id[:8])
 
 async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
                                intervention, existing_paper_ids):
@@ -460,6 +627,26 @@ async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
         "mechanism_relevant_paper_ids": relevant_ids,
     })
     return final_verdict, matched, relevant_ids
+
+
+class InterventionTriageItemSchema(BaseModel):
+    """One cluster's independent scientific review.
+
+    priority is a RELATIVE rank across all clusters in the same call
+    (1 = most deserving of the experiment budget); simplicity and
+    information_value are annotations for the user, not gate signals.
+    """
+    cluster_primary_intervention_id: str
+    best_case: str = Field(min_length=5)
+    strongest_objection: str = Field(min_length=5)
+    alternative_explanation: str = ""
+    simplicity: float = Field(ge=0, le=1)
+    information_value: float = Field(ge=0, le=1)
+    priority: int = Field(ge=1)
+
+
+class InterventionTriageListSchema(BaseModel):
+    triage: list[InterventionTriageItemSchema] = Field(default_factory=list)
 
 
 class MinimalExperimentSchema(BaseModel):
@@ -866,6 +1053,29 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             clusters = [{"primary": iv, "variants": [], "hypothesis": "",
                          "rationale": "", "confidence": 1.0} for iv in gap_interventions]
 
+        # Independent scientific triage (ARIS-inspired): when the gap yields
+        # more clusters than the experiment budget funds, rank them all in one
+        # call (relative priority needs a single reviewer context) and fund the
+        # top-K. Parked clusters persist as research_direction_only ideas with
+        # the reviewer's best-case/objection annotations — triage allocates
+        # budget, it never vetoes the hard gates. No verdict (degraded /
+        # ID mismatch / <=K clusters) funds everything, exactly the pre-triage
+        # behaviour.
+        triage_entries = await _triage_clusters_by_scientific_value(
+            db, llm, task_id, gap, phenomenon, audit, clusters)
+        if triage_entries is not None:
+            ranked = sorted(
+                clusters,
+                key=lambda c: triage_entries[c["primary"].id]["priority"])
+            clusters = ranked[:_TRIAGE_TOP_K]
+            for park_rank, parked_cluster in enumerate(ranked[_TRIAGE_TOP_K:],
+                                                       start=_TRIAGE_TOP_K + 1):
+                entry = triage_entries[parked_cluster["primary"].id]
+                _persist_parked_cluster_idea(
+                    db, task_id, state, contract, gap, parked_cluster, entry,
+                    park_rank, len(ranked), paper_ids, seen_titles,
+                    direction_only_idea_ids)
+
         for cluster in clusters:
             intervention = cluster["primary"]
             variants = cluster["variants"]
@@ -1046,6 +1256,17 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     "\n\nIncludes " + str(len(variants)) + " mechanism variant(s) folded into the same"
                     " experiment as ablation arms (same hypothesis, different mechanism): "
                     + "; ".join(((v.failure_mechanism or "")[:80]) for v in variants)
+                )
+            funded_triage = (triage_entries or {}).get(intervention.id)
+            if funded_triage:
+                # The reviewer's reasoning rides along on the funded idea —
+                # best_case/objection are exactly what a user needs before
+                # investing in the experiment.
+                motivation += (
+                    "\n\n[Triage note — funded at priority "
+                    f"{funded_triage['priority']}] Best case: "
+                    f"{funded_triage['best_case']} Strongest objection: "
+                    f"{funded_triage['strongest_objection']}"
                 )
             idea = paper_repo.save_idea(db, task_id, {
                 "title": final_title,

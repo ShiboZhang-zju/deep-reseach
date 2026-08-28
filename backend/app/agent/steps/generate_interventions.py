@@ -21,7 +21,14 @@ logger = logging.getLogger(__name__)
 # only 30% confidence in the gap's novelty. Changing this rule must
 # invalidate previously stamped intervention phases on resumed tasks — this
 # constant is hashed into the phase input_version for exactly that purpose.
-INTERVENTION_GENERATION_POLICY_VERSION = "intervention-novelty-confidence-v1"
+# v2 (2026-08-28, ARIS-inspired breadth stage): lens fan-out — one LLM call
+# per (gap, lens) instead of one call per gap. A single call's 1-3 candidates
+# are correlated: they all think along the first mechanism that came to mind
+# (task d6f64087: 2 of 3 interventions tested the same hypothesis and merged
+# in the cluster gate). Each lens attacks the gap from one named perspective;
+# the downstream hard gates + hypothesis clustering remain the arbiter
+# (breadth, not verdict).
+INTERVENTION_GENERATION_POLICY_VERSION = "intervention-lens-fanout-v2"
 # Novelty gate thresholds on audit.novelty_confidence (only when the audit
 # verdict itself is "confirmed"): below the WARN bound the confirmed verdict
 # still flows downstream but only as tier B (needs confirmation); below the
@@ -30,8 +37,43 @@ INTERVENTION_GENERATION_POLICY_VERSION = "intervention-novelty-confidence-v1"
 _NOVELTY_CONFIDENCE_WARN_BELOW = 0.5
 _NOVELTY_CONFIDENCE_FAIL_BELOW = 0.3
 
+# Max candidates accepted from a single lens — the fan-out's total breadth
+# stays bounded (6 lenses x 2 = 12 per gap before gates).
+_MAX_CANDIDATES_PER_LENS = 2
+
+_INTERVENTION_LENSES: tuple[tuple[str, str], ...] = (
+    ("mechanism_correction",
+     "Directly counteract the failure mechanism the gap documents. The "
+     "intervention changes the component where the mechanism operates so the "
+     "failure can no longer produce the observed problem."),
+    ("assumption_inversion",
+     "Invert a default assumption shared by current approaches. Identify one "
+     "assumption everyone inherits (e.g. 'rank what matters'), flip it (e.g. "
+     "'detect what is stale instead'), and design the intervention around the "
+     "inverted assumption."),
+    ("diagnostic_first",
+     "Build a measurement instrument, not a method: an observable score, "
+     "probe, or test that quantifies the failure mechanism itself. Do NOT "
+     "restate the phenomenon plan's oracle experiment — extend it into a "
+     "reusable diagnostic that later work can adopt as a standard measure."),
+    ("boundary_scaling",
+     "Characterize WHEN the failure starts and stops: which regime boundary "
+     "(scale, frequency, density, budget) governs it. The intervention maps "
+     "the boundary, not just improves the average."),
+    ("cross_domain_transfer",
+     "Import a mechanism proven in a neighbouring field (databases, systems, "
+     "signal processing, control theory, statistics, ...) that solves an "
+     "isomorphic problem. Name the source field and the mapping explicitly."),
+    ("contradiction_resolver",
+     "Resolve a documented tension: two results or claims that both hold but "
+     "conflict, or one quantity improving while another degrades. The "
+     "intervention tests or reconciles the contradiction."),
+)
+
 _INTERVENTION_SYSTEM = """You design bounded research interventions for an audited research gap.
-Generate 1-3 interventions, not full paper ideas. Each intervention must explicitly connect:
+Each user message names ONE research lens; generate only interventions for that lens
+(respecting the lens's candidate cap), not full paper ideas. Each intervention must
+explicitly connect:
 Observed problem -> failure mechanism -> intervention -> intermediate effect -> measurable outcome.
 Do not invent papers, datasets, or evidence IDs.
 dependency_paper_ids may only contain IDs taken verbatim from the "Neighbor paper IDs"
@@ -41,10 +83,8 @@ appear there. Leave dependency_paper_ids empty when no neighbor paper is require
 CRITICAL — diversify the failure mechanisms: when you produce more than one
 intervention, each one MUST target a DISTINCT failure mechanism. Do not emit
 multiple variants of the same mechanism (e.g. three flavours of "early stopping").
-Pull distinct mechanisms from the observed problem and the evidence (for example:
-a saturation-boundary gap, a missing-information problem, and a feedback-quality
-problem are three separate mechanisms). If the surviving gap only supports one
-genuinely distinct mechanism, generate one intervention rather than padding."""
+If the lens only supports one genuinely distinct mechanism, generate one
+intervention rather than padding — and if it supports none, return an empty list."""
 
 _INTERVENTION_USER = """Surviving gap:
 - ID: {gap_id}
@@ -65,6 +105,16 @@ Resource constraints:
 - Allow large benchmark: {allow_large_benchmark}
 
 Return only interventions whose mechanism directly addresses the observed failure."""
+
+_LENS_USER_SECTION = """
+
+Research lens — every candidate MUST attack the gap from this one angle:
+- Lens: {lens_name}
+- Directive: {lens_directive}
+
+Generate 1-2 interventions for THIS lens only. If this lens genuinely does
+not fit the gap (no sound, evidence-respecting intervention exists from this
+angle), return an empty interventions list rather than padding."""
 
 
 class InterventionSchema(BaseModel):
@@ -109,6 +159,7 @@ async def generate_interventions(
     created_ids = []
     passed_ids = []
     dropped_dependencies = []
+    lens_fanout = []
     gaps = db.query(GapCandidate).filter(
         GapCandidate.task_id == task_id,
         GapCandidate.contract_id == contract.id,
@@ -119,67 +170,78 @@ async def generate_interventions(
         audits = gap_repo.list_gap_audits(db, gap.id)
         latest_audit = audits[-1] if audits else None
         neighbor_ids = json.loads(latest_audit.neighbor_paper_ids_json or "[]") if latest_audit else []
-        result = await llm.chat_json([
-            {"role": "system", "content": _INTERVENTION_SYSTEM},
-            {"role": "user", "content": _INTERVENTION_USER.format(
-                gap_id=gap.id,
-                target_setting=gap.target_setting or "(not specified)",
-                observed_problem=gap.observed_problem or "(not specified)",
-                missing_capability=gap.missing_capability or "(not specified)",
-                remaining_delta=(latest_audit.remaining_delta if latest_audit else gap.claimed_delta) or "(not specified)",
-                hypothesis=gap.testable_hypothesis or "(not specified)",
-                evidence_ids=evidence_ids,
-                neighbor_ids=neighbor_ids,
-                gpu_available=contract.gpu_available,
-                max_gpu_hours=contract.max_gpu_hours,
-                max_api_budget=contract.max_api_budget,
-                max_runtime_minutes=contract.max_runtime_minutes,
-                allow_model_training=contract.allow_model_training,
-                allow_large_benchmark=contract.allow_large_benchmark,
-            )},
-        ], InterventionList)
-        for candidate in result.interventions:
-            # dependency_paper_ids is supporting context, not the basis of the
-            # intervention's validity (the three hard gates below decide that).
-            # Discarding the whole intervention over one unoffered ID threw away
-            # otherwise sound proposals — observed in production, where every
-            # intervention for a surviving gap was dropped this way and the run
-            # ended with no idea at all. Drop the unoffered IDs and record them.
-            unoffered = [item for item in candidate.dependency_paper_ids
-                         if item not in set(neighbor_ids)]
-            if unoffered:
-                candidate.dependency_paper_ids = [
-                    item for item in candidate.dependency_paper_ids
-                    if item in set(neighbor_ids)]
-                dropped_dependencies.append({"gap_id": gap.id, "dropped_paper_ids": unoffered})
-                logger.warning(
-                    "Task %s: dropped %d unoffered dependency paper ID(s) from an "
-                    "intervention for gap %s: %s",
-                    task_id[:8], len(unoffered), gap.id[:8], unoffered)
-            gates = _evaluate_hard_gates(gap, latest_audit, evidence_ids, candidate, contract)
-            tier = _compute_confidence_tier(gap, gates["gate_statuses"])
-            item = intervention_repo.create_intervention_candidate(db, task_id, gap.id, {
-                **candidate.model_dump(),
-                "contract_id": contract.id,
-                **gates,
-                # O1: graded output. A/B tiers flow downstream (idea synthesis);
-                # C is kept as a speculative direction but does not pass the gate.
-                "status": "passed" if tier in ("A", "B") else "rejected",
-                "confidence_tier": tier,
-                "evidence_gate": gates["gate_statuses"]["evidence"],
-                "novelty_gate": gates["gate_statuses"]["novelty"],
-                "feasibility_gate": gates["gate_statuses"]["feasibility"],
-                "gate_rationale": gates["gate_rationale"],
+        base_user = _INTERVENTION_USER.format(
+            gap_id=gap.id,
+            target_setting=gap.target_setting or "(not specified)",
+            observed_problem=gap.observed_problem or "(not specified)",
+            missing_capability=gap.missing_capability or "(not specified)",
+            remaining_delta=(latest_audit.remaining_delta if latest_audit else gap.claimed_delta) or "(not specified)",
+            hypothesis=gap.testable_hypothesis or "(not specified)",
+            evidence_ids=evidence_ids,
+            neighbor_ids=neighbor_ids,
+            gpu_available=contract.gpu_available,
+            max_gpu_hours=contract.max_gpu_hours,
+            max_api_budget=contract.max_api_budget,
+            max_runtime_minutes=contract.max_runtime_minutes,
+            allow_model_training=contract.allow_model_training,
+            allow_large_benchmark=contract.allow_large_benchmark,
+        )
+        for lens_name, lens_directive in _INTERVENTION_LENSES:
+            result = await llm.chat_json([
+                {"role": "system", "content": _INTERVENTION_SYSTEM},
+                {"role": "user", "content": base_user + _LENS_USER_SECTION.format(
+                    lens_name=lens_name, lens_directive=lens_directive)},
+            ], InterventionList)
+            # Bounded breadth: a lens that ignores the 1-2 instruction still
+            # cannot flood the candidate pool.
+            candidates = result.interventions[:_MAX_CANDIDATES_PER_LENS]
+            lens_fanout.append({
+                "gap_id": gap.id, "lens": lens_name,
+                "candidate_count": len(candidates),
             })
-            created_ids.append(item.id)
-            if item.status == "passed":
-                passed_ids.append(item.id)
+            for candidate in candidates:
+                # dependency_paper_ids is supporting context, not the basis of the
+                # intervention's validity (the three hard gates below decide that).
+                # Discarding the whole intervention over one unoffered ID threw away
+                # otherwise sound proposals — observed in production, where every
+                # intervention for a surviving gap was dropped this way and the run
+                # ended with no idea at all. Drop the unoffered IDs and record them.
+                unoffered = [item for item in candidate.dependency_paper_ids
+                             if item not in set(neighbor_ids)]
+                if unoffered:
+                    candidate.dependency_paper_ids = [
+                        item for item in candidate.dependency_paper_ids
+                        if item in set(neighbor_ids)]
+                    dropped_dependencies.append({"gap_id": gap.id, "dropped_paper_ids": unoffered})
+                    logger.warning(
+                        "Task %s: dropped %d unoffered dependency paper ID(s) from an "
+                        "intervention for gap %s: %s",
+                        task_id[:8], len(unoffered), gap.id[:8], unoffered)
+                gates = _evaluate_hard_gates(gap, latest_audit, evidence_ids, candidate, contract)
+                tier = _compute_confidence_tier(gap, gates["gate_statuses"])
+                item = intervention_repo.create_intervention_candidate(db, task_id, gap.id, {
+                    **candidate.model_dump(),
+                    "contract_id": contract.id,
+                    **gates,
+                    # O1: graded output. A/B tiers flow downstream (idea synthesis);
+                    # C is kept as a speculative direction but does not pass the gate.
+                    "status": "passed" if tier in ("A", "B") else "rejected",
+                    "confidence_tier": tier,
+                    "evidence_gate": gates["gate_statuses"]["evidence"],
+                    "novelty_gate": gates["gate_statuses"]["novelty"],
+                    "feasibility_gate": gates["gate_statuses"]["feasibility"],
+                    "gate_rationale": gates["gate_rationale"],
+                })
+                created_ids.append(item.id)
+                if item.status == "passed":
+                    passed_ids.append(item.id)
 
     paper_repo.save_trace(db, task_id, "generate_interventions", "decision", output_data={
         "surviving_gap_count": len(gaps),
         "intervention_count": len(created_ids),
         "passed_gate_count": len(passed_ids),
         "dropped_dependency_paper_ids": dropped_dependencies,
+        "lens_fanout": lens_fanout,
     })
     db.commit()
     return InterventionGenerationResult(created_ids, passed_ids)

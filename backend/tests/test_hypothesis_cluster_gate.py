@@ -19,6 +19,8 @@ from app.agent.steps.generate_minimal_experiments import (
     EXPERIMENT_GENERATION_POLICY_VERSION,
     IdeaNoveltyQueriesSchema,
     IdeaNoveltyVerdictSchema,
+    InterventionTriageItemSchema,
+    InterventionTriageListSchema,
     MinimalExperimentSchema,
     _cluster_interventions_by_hypothesis,
     _derive_scenario_atoms,
@@ -143,6 +145,7 @@ def _seed(db, n_interventions=2):
     mechanisms = [
         ("diff risk classification", "Classify diffs by regression risk and gate execution."),
         ("two-phase feedback segregation", "Segregate feedback into logical-first, style-later phases."),
+        ("execution trace verification", "Verify executed edits against runtime traces before commit."),
     ]
     interventions = []
     for i in range(n_interventions):
@@ -527,7 +530,7 @@ async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
 
 def test_policy_version_bumped():
     """The experiment policy version encodes the novelty-check rules."""
-    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v8"
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v9"
 
 
 def _plan(**overrides):
@@ -646,3 +649,133 @@ def test_normalize_idea_title_strips_prefix():
     assert _normalize_idea_title("Minimal Experiment: Foo Bar") == "Foo Bar"
     assert _normalize_idea_title("  Diff-Risk Classification  ") == "Diff-Risk Classification"
     assert _normalize_idea_title("") == "Untitled experiment"
+
+
+class _TriageMockLLM(_NoveltyMockLLM):
+    """Extends the novelty mock with the independent-triage LLM branch."""
+
+    def __init__(self, cluster_response, plan_texts, triage_items=None, **kwargs):
+        super().__init__(cluster_response=cluster_response, plan_texts=plan_texts, **kwargs)
+        self.triage_items = triage_items
+        self.triage_calls = 0
+
+    async def chat_json(self, messages, schema):
+        name = schema.__name__
+        if name == "InterventionTriageListSchema":
+            self.triage_calls += 1
+            if isinstance(self.triage_items, Exception):
+                raise self.triage_items
+            if self.triage_items is None:
+                return None
+            return InterventionTriageListSchema(triage=self.triage_items)
+        return await super().chat_json(messages, schema)
+
+
+def _triage_item(cluster_primary_intervention_id, priority):
+    return InterventionTriageItemSchema(
+        cluster_primary_intervention_id=cluster_primary_intervention_id,
+        best_case="A clean causal answer on which mechanism explains the regression.",
+        strongest_objection="The synthetic noise may not reflect real stylistic drift.",
+        alternative_explanation="Verifier flakiness alone could produce the delta.",
+        simplicity=0.7, information_value=0.8, priority=priority,
+    )
+
+
+@pytest.mark.asyncio
+async def test_triage_funds_top_k_and_parks_rest(temp_db):
+    """Independent scientific triage (ARIS-inspired): with 3 clusters and
+    _TRIAGE_TOP_K=2, the top-2 by priority get experiments; the third persists
+    as research_direction_only with the reviewer's annotations 鈥?never a
+    silent drop."""
+    from app.agent.state import ResearchState
+    from app.db.models import AgentTrace, ExperimentPlan, ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=3)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _TriageMockLLM(
+        cluster_response=None, plan_texts=atoms,
+        triage_items=[
+            _triage_item(interventions[0].id, 2),
+            _triage_item(interventions[1].id, 3),   # parked
+            _triage_item(interventions[2].id, 1),
+        ],
+    )
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    result = await generate_minimal_experiments(db, state, llm, task.id)
+
+    ideas = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).all()
+    executable = [i for i in ideas if i.decision == "executable_candidate"]
+    parked = [i for i in ideas if i.decision == "research_direction_only"]
+    assert len(executable) == 2
+    assert len(parked) == 1
+    assert parked[0].intervention_id == interventions[1].id
+    codes = json.loads(parked[0].quality_reason_codes_json or "[]")
+    assert "DEFERRED_BY_SCIENTIFIC_TRIAGE" in codes
+    assert "TRIAGE_PRIORITY_3" in codes
+    assert "Deferred by independent scientific triage" in parked[0].motivation
+    assert "Strongest objection" in parked[0].motivation
+    # Funded ideas carry the reviewer's note.
+    assert all("[Triage note" in i.motivation for i in executable)
+    # Only the funded clusters generated experiments.
+    experiments = db.query(ExperimentPlan).filter(
+        ExperimentPlan.task_id == task.id).all()
+    assert len(experiments) == 2
+    assert result.direction_only_idea_ids == [parked[0].id]
+    assert llm.triage_calls == 1
+    traces = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id, AgentTrace.step_name == "intervention_triage").all()
+    assert any(json.loads(t.output_json).get("verdict") == "ranked" for t in traces)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_triage_failure_funds_all_clusters(temp_db):
+    """Reviewer outage is not evidence against a cluster: triage failure keeps
+    the pre-triage behaviour (every cluster proceeds)."""
+    from app.agent.state import ResearchState
+    from app.db.models import AgentTrace, ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=3)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _TriageMockLLM(
+        cluster_response=None, plan_texts=atoms,
+        triage_items=RuntimeError("reviewer gateway down"),
+    )
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    ideas = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).all()
+    assert len(ideas) == 3
+    assert all(i.decision == "executable_candidate" for i in ideas)
+    traces = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id, AgentTrace.step_name == "intervention_triage").all()
+    assert any(json.loads(t.output_json).get("verdict") == "degraded" for t in traces)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_triage_skipped_when_clusters_within_budget(temp_db):
+    """<= _TRIAGE_TOP_K clusters: no reviewer call is spent 鈥?triage only
+    arbitrates when there is an actual budget contest."""
+    from app.agent.state import ResearchState
+    from app.db.models import ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=2)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _TriageMockLLM(cluster_response=None, plan_texts=atoms)
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    assert llm.triage_calls == 0
+    ideas = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).all()
+    assert len(ideas) == 2
+    db.close()

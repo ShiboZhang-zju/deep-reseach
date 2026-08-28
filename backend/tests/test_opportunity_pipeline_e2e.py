@@ -63,6 +63,11 @@ class ScriptedLLM:
             )
         if schema.__name__ == "InterventionList":
             from app.agent.steps.generate_interventions import InterventionList, InterventionSchema
+            # Lens fan-out issues one call per (gap, lens); this script serves
+            # the first lens and reports every other lens as "does not fit",
+            # keeping the single-intervention shape the test asserts on.
+            if any(c == "InterventionList" for c in self.calls[:-1]):
+                return InterventionList(interventions=[])
             return InterventionList(interventions=[InterventionSchema(
                 intervention_type="evaluation_protocol", failure_mechanism="Generic QA hides state changes.",
                 proposed_intervention="Add a fixed-budget state-change evaluation.", intermediate_effect="Separates stable and changing states.",
