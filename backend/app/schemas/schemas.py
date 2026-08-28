@@ -773,6 +773,15 @@ class GapAuditOut(BaseModel):
     evidence_delta: dict = Field(default_factory=dict)
     audit_round: int = 0
     created_at: str
+    # P1.2 (run7 review): epistemic contract made explicit in the API. The
+    # verdict reads as "survived the current audit" (never "novelty proven"),
+    # novelty_confidence is surfaced as search_confidence (a workflow ranking
+    # heuristic), and the killer/coverage records state what the verdict
+    # rests on and what would falsify it.
+    audit_verdict: str = "pending"
+    search_confidence: float | None = None
+    closest_killer_work: dict = Field(default_factory=dict)
+    search_coverage: dict = Field(default_factory=dict)
 
 
 class NeighborComparisonOut(BaseModel):

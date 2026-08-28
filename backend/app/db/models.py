@@ -1091,6 +1091,12 @@ class GapAudit(Base):
     # a rejection and may have several independent retrieval causes.
     failure_reason_codes_json = Column(Text, default="[]")
     evidence_delta_json = Column(Text, default="{}")
+    # P1.2 (run7 review): the verdict's epistemic basis — what paper would
+    # kill this gap (and whether the final adversarial search found it), plus
+    # the mechanical search-coverage snapshot. The verdict itself means
+    # "survived the current audit", never "novel with probability X".
+    killer_work_json = Column(Text, default="{}")
+    search_coverage_json = Column(Text, default="{}")
 
     # Audit metadata
     audit_round = Column(Integer, nullable=False, default=0)

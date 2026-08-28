@@ -54,6 +54,10 @@ def _gap_to_out(gap) -> GapCandidateOut:
 
 
 def _audit_to_out(audit) -> GapAuditOut:
+    # P1.2: the epistemic contract — "confirmed" in storage reads as
+    # "survived the current audit" in the API, and novelty_confidence is
+    # surfaced under its true meaning (search-coverage ranking heuristic).
+    verdict_map = {"confirmed": "survived_current_audit"}
     return GapAuditOut(
         id=audit.id,
         gap_id=audit.gap_id,
@@ -73,6 +77,10 @@ def _audit_to_out(audit) -> GapAuditOut:
         evidence_delta=json.loads(audit.evidence_delta_json or "{}"),
         audit_round=audit.audit_round,
         created_at=audit.created_at.isoformat() + "+00:00" if audit.created_at else "",
+        audit_verdict=verdict_map.get(audit.audit_result, audit.audit_result),
+        search_confidence=audit.novelty_confidence,
+        closest_killer_work=json.loads(getattr(audit, "killer_work_json", None) or "{}"),
+        search_coverage=json.loads(getattr(audit, "search_coverage_json", None) or "{}"),
     )
 
 

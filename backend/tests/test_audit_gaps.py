@@ -819,3 +819,105 @@ async def test_unmeasured_npa_convergence_downgrades_confirmed(temp_db, monkeypa
     assert "NPA_UNMEASURED" in json.loads(audit.failure_reason_codes_json)
     assert gap_repo.get_gap(db, gap.id).status != "surviving"
     db.close()
+
+
+class KillerSearchLLM(ConfirmingAuditLLM):
+    """Confirmed verdict that names its own killer and asks for the final
+    adversarial search (run7 review P1.2)."""
+
+    async def chat_json(self, messages, schema):
+        decision = await super().chat_json(messages, schema)
+        if schema.__name__ == "GapAuditDecisionSchema":
+            decision.closest_killer_work = (
+                "A benchmark study directly comparing a judge's tolerance of "
+                "its own vs another model's factually identical hallucinations")
+            decision.killer_query_terms = ["judge self hallucination tolerance"]
+            decision.killer_found = False
+            decision.residual_uncertainty = "abstract-only neighbors left unread"
+        return decision
+
+
+@pytest.mark.asyncio
+async def test_killer_search_hit_degrades_confirmed_verdict(temp_db, monkeypatch):
+    """P1.2 (run7 review): the audit names the paper that would kill it; when
+    the final adversarial search recalls a strongly matching paper, the
+    confirmed verdict degrades to uncertain/KILLER_WORK_FOUND instead of
+    surviving on a retrieval blind spot."""
+    from types import SimpleNamespace
+
+    from app.agent.state import ResearchState
+    from app.agent.steps import audit_gaps as module
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.models import Paper
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
+
+    killer_paper = Paper(
+        title="Judges tolerate their own identical hallucinations",
+        abstract="A benchmark comparing a judge's tolerance of its own vs "
+                 "another model's factually identical hallucinations.",
+        citation_count=5)
+    db.add(killer_paper)
+    db.commit()
+
+    async def fake_search(db_, state_, executions, task_id_, round_):
+        return 1, 1, [killer_paper.id]
+
+    monkeypatch.setattr(module, "search_and_save_papers", fake_search)
+    monkeypatch.setattr(module.settings, "audit_score_retrieved_papers", False)
+    # Killer description and the recalled paper embed identically.
+    import app.services.embedding_service as emb
+    monkeypatch.setattr(emb, "embed_texts", lambda texts: [[1.0, 0.0]] * len(texts))
+    monkeypatch.setattr(emb, "cosine_similarity", lambda a, b: 1.0)
+
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+    results = await audit_gap_candidates(db, state, KillerSearchLLM(), task.id,
+                                         perform_search=True)
+
+    assert results[0].audit_result == "uncertain"
+    assert results[0].recommended_action == "more_search"
+    assert gap_repo.get_gap(db, gap.id).status != "surviving"
+    audit = gap_repo.list_gap_audits(db, gap.id)[-1]
+    codes = json.loads(audit.failure_reason_codes_json)
+    assert "KILLER_WORK_FOUND" in codes
+    killer = json.loads(audit.killer_work_json)
+    assert killer["query_terms"] == ["judge self hallucination tolerance"]
+    assert killer["killer_hits"] and killer["killer_hits"][0]["paper_id"] == killer_paper.id
+    coverage = json.loads(audit.search_coverage_json)
+    assert coverage["closest_neighbors_reviewed"] >= 1
+    assert "queries_executed" in coverage
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_killer_search_without_hits_keeps_verdict(temp_db, monkeypatch):
+    """No match for the killer description: the verdict survives, and the
+    killer record still lands (the falsifier is now explicit and searchable)."""
+    from app.agent.state import ResearchState
+    from app.agent.steps import audit_gaps as module
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
+
+    async def fake_search(db_, state_, executions, task_id_, round_):
+        return 0, 0, []
+
+    monkeypatch.setattr(module, "search_and_save_papers", fake_search)
+    monkeypatch.setattr(module.settings, "audit_score_retrieved_papers", False)
+
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+    results = await audit_gap_candidates(db, state, KillerSearchLLM(), task.id,
+                                         perform_search=True)
+
+    assert results[0].audit_result == "confirmed"
+    audit = gap_repo.list_gap_audits(db, gap.id)[-1]
+    killer = json.loads(audit.killer_work_json)
+    assert killer["retrieved_new_paper_count"] == 0
+    assert "KILLER_WORK_FOUND" not in json.loads(audit.failure_reason_codes_json)
+    db.close()

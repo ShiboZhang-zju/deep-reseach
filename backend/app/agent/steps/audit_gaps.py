@@ -27,6 +27,11 @@ _MAX_NEIGHBORS = 5
 # meaningfully cover the gap's domain, so a "confirmed" verdict resting on such
 # neighbors is a retrieval miss rather than a novelty signal.
 _MIN_NEIGHBOR_SIMILARITY = 0.3
+# P1.2 killer search: embedding cosine between the audit's killer description
+# and a freshly recalled paper's title+abstract above which the paper counts
+# as a hit. Workflow heuristic, not a calibrated truth (calibration rule
+# applies).
+_KILLER_HIT_SIMILARITY = 0.82
 # A high novelty_confidence combined with a low-similarity neighbor set is the
 # contradictory signal that flags retrieval failure (observed: 5 application-
 # domain neighbors at max similarity 0.15 yet novelty_confidence 0.95).
@@ -77,7 +82,7 @@ _AUDIT_TEXT_CONFLICT_RE = re.compile(
 # more_search (search-absence novelty, observed: surviving gap at 0.3 feeding
 # three tier-A interventions). Verdict rules changed, so previously stamped
 # audits must be invalidated on resume.
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v11"
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v12"
 
 
 # --- Canonical atomic claims (Phase 3H) ---
@@ -243,7 +248,19 @@ claim_index), judge whether that neighbor covers it — FULL (covers the capabil
 completely), PARTIAL (covers part of it), NONE (clearly does not cover it), or UNCERTAIN
 (cannot tell from the supplied content). Give a short rationale. Do not skip any claim.
 A claim that no effective neighbor judges is treated as insufficient evidence, NOT as
-uncovered — return UNCERTAIN for it rather than NONE when you genuinely cannot tell."""
+uncovered — return UNCERTAIN for it rather than NONE when you genuinely cannot tell.
+
+EPISTEMIC CONTRACT (what your numbers mean): novelty_confidence is a WORKFLOW RANKING
+HEURISTIC — how confident you are that the CURRENT SEARCH COVERAGE has not missed a
+direct hit — NOT a probability that the gap is novel. audit_result "confirmed" means
+"survived the current audit", never "novelty proven". To make that basis explicit:
+- closest_killer_work: describe the study that, if it existed, would DIRECTLY close
+  this gap's claimed delta (concrete method + setting + comparison). This is the
+  audit's own falsifier — name it honestly, even when you believe it does not exist.
+- killer_query_terms: 2-4 search terms that would find that killer work.
+- killer_found: true only if one of the supplied neighbors IS that killer.
+- residual_uncertainty: what this audit could not rule out given the retrieval
+  coverage you actually saw (e.g. "one abstract-only near neighbor left unread")."""
 
 _AUDIT_USER = """Candidate gap:
 - ID: {gap_id}
@@ -299,6 +316,20 @@ class GapAuditDecisionSchema(BaseModel):
     audit_confidence: float = Field(ge=0, le=1)
     rejection_reason: str = ""
     comparisons: list[NeighborAuditSchema] = Field(default_factory=list)
+    # P1.2 (run7 review): the killer question — "what paper, if found, would
+    # directly close this gap?" A good novelty audit names its own falsifier;
+    # the pipeline then runs one final adversarial search for exactly that.
+    closest_killer_work: str = Field(
+        default="",
+        description="The study that, if found, would directly kill this gap's "
+                    "claimed delta (describe it concretely; empty if nothing "
+                    "short of a full implementation would).")
+    killer_query_terms: list[str] = Field(default_factory=list)
+    killer_found: bool = False
+    residual_uncertainty: str = Field(
+        default="",
+        description="What the audit could NOT rule out with the current "
+                    "retrieval coverage.")
 
 
 @dataclass
@@ -1452,6 +1483,34 @@ async def audit_gap_candidate(
         logger.warning("Gap %s: downgrading confirmed->uncertain (max neighbor "
                        "similarity %.2f below %.2f)", gap.id[:8], max_sim,
                        _MIN_NEIGHBOR_SIMILARITY)
+    # P1.2 killer search (run7 review): a confirmed verdict is a
+    # SURVIVED_CURRENT_AUDIT statement — the audit names the paper that would
+    # kill it, and the pipeline spends one final adversarial search looking
+    # for exactly that. A strong match degrades the verdict instead of letting
+    # it survive on a retrieval blind spot.
+    killer_work = await _run_killer_search(
+        db, state, task_id, gap, decision, neighbors, audit_round,
+        perform_search=perform_search)
+    if killer_work.get("killer_hits"):
+        failure_codes.append("KILLER_WORK_FOUND")
+        decision.audit_result = "uncertain"
+        decision.recommended_action = "more_search"
+        decision.novelty_confidence = min(decision.novelty_confidence, 0.5)
+        decision.rejection_reason = (
+            "final killer search recalled a strongly matching paper for the "
+            "audit's own killer description: "
+            + "; ".join(h["paper_id"] for h in killer_work["killer_hits"][:3])
+        )
+        paper_repo.save_trace(db, task_id, "gap_audit_killer_found", "decision",
+                              output_data={
+                                  "gap_id": gap.id,
+                                  "hits": killer_work["killer_hits"],
+                                  "original_verdict": "confirmed",
+                                  "downgraded_to": "uncertain",
+                              })
+        logger.warning("Gap %s: killer search hit %d paper(s); downgrading "
+                       "confirmed->uncertain", gap.id[:8],
+                       len(killer_work["killer_hits"]))
     for comparison in decision.comparisons:
         gap_repo.create_neighbor_comparison(
             db,
@@ -1616,6 +1675,20 @@ async def audit_gap_candidate(
         gap.status = "auditing"
         action = "more_search"
 
+    # P1.2 search coverage: the mechanical facts the verdict rests on. The
+    # verdict is a SURVIVED_CURRENT_AUDIT statement — this snapshot makes its
+    # retrieval basis explicit instead of letting a bare 0.85 read as
+    # "probability of novelty".
+    search_coverage = {
+        "queries_executed": len(queries),
+        "query_families": sorted({spec.family for spec in query_specs}),
+        "closest_neighbors_reviewed": len(neighbors),
+        "fulltext_neighbors_reviewed": (
+            min(len(neighbors), settings.audit_neighbor_evidence_max_papers)
+            if settings.audit_neighbor_evidence_extraction else 0),
+        "candidate_pool_size": int(original_candidate_count or 0),
+        "search_admission_status": admission.status,
+    }
     gap_repo.create_gap_audit(
         db,
         gap_id=gap.id,
@@ -1640,6 +1713,8 @@ async def audit_gap_candidate(
         audited_claimed_delta=gap.claimed_delta or "",
         failure_reason_codes=failure_codes,
         evidence_delta=evidence_delta,
+        killer_work=killer_work,
+        search_coverage=search_coverage,
     )
     paper_repo.save_trace(db, task_id, "audit_gap_candidate", "decision", output_data={
         "gap_id": gap.id,
@@ -1647,6 +1722,8 @@ async def audit_gap_candidate(
         "recommended_action": action,
         "neighbor_count": len(neighbors),
         "query_count": len(queries),
+        "search_coverage": search_coverage,
+        "killer_work": killer_work,
     })
     db.commit()
     return GapAuditResult(gap.id, decision.audit_result, action, decision.remaining_delta)
@@ -1680,6 +1757,76 @@ def _neighbor_verified_evidence(db, paper_id: str, limit: int = 2) -> list[Evide
     ).limit(12).all()
     units.sort(key=lambda u: _EVIDENCE_TYPE_AUDIT_ORDER.get(u.evidence_type or "", 9))
     return units[:limit]
+
+
+async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
+                             audit_round, perform_search: bool = True) -> dict:
+    """One final adversarial search for the audit's own named killer (P1.2).
+
+    The verdict names the paper that would kill the gap; searching for exactly
+    that is the cheapest novelty guard there is. Freshly recalled papers that
+    embed close to the killer description count as hits (the caller degrades
+    the verdict). Degraded infrastructure returns the record without hits —
+    an outage is not evidence that the killer exists.
+    """
+    terms = [t.strip() for t in (decision.killer_query_terms or []) if t.strip()]
+    record = {
+        "description": decision.closest_killer_work or "",
+        "query_terms": terms,
+        "found": bool(decision.killer_found),
+        "residual_uncertainty": decision.residual_uncertainty or "",
+    }
+    if (decision.killer_found or not terms
+            or not (decision.closest_killer_work or "").strip()
+            or decision.audit_result != "confirmed"):
+        return record
+    if not perform_search:
+        record["skipped"] = "perform_search_disabled"
+        return record
+    executions = []
+    for term in terms[:4]:
+        query_record = save_search_query(
+            db, task_id, term, "gap_killer", None, None, audit_round,
+            target_gap_id=gap.id, query_family="killer",
+            search_policy_version=GAP_SEARCH_POLICY_VERSION,
+        )
+        executions.append(SearchQueryExecution(
+            query_id=query_record.id, query_text=term, intent="gap_killer",
+            target_question_id=None, expected_evidence_type=None,
+            target_gap_id=gap.id,
+        ))
+    db.commit()
+    try:
+        _, _, new_paper_ids = await search_and_save_papers(
+            db, state, executions, task_id, audit_round)
+    except Exception as exc:
+        logger.warning("Gap %s: killer search degraded: %s", gap.id[:8], exc)
+        record["search_degraded"] = True
+        return record
+    record["retrieved_new_paper_count"] = len(new_paper_ids)
+    neighbor_ids = {p.id for p in neighbors}
+    fresh_ids = [pid for pid in new_paper_ids if pid not in neighbor_ids][:20]
+    record["retrieved_paper_ids"] = fresh_ids
+    if not fresh_ids:
+        return record
+    try:
+        from app.services import embedding_service
+
+        papers = db.query(Paper).filter(Paper.id.in_(fresh_ids)).all()
+        texts = [f"{(p.title or '')} {(p.abstract or '')[:400]}" for p in papers]
+        vectors = embedding_service.embed_texts(
+            [decision.closest_killer_work] + texts)
+        hits = []
+        for idx, paper in enumerate(papers):
+            sim = embedding_service.cosine_similarity(vectors[0], vectors[idx + 1])
+            if sim >= _KILLER_HIT_SIMILARITY:
+                hits.append({"paper_id": paper.id, "similarity": round(sim, 3)})
+        record["killer_hits"] = hits
+    except Exception as exc:
+        logger.warning("Gap %s: killer relevance check degraded: %s",
+                       gap.id[:8], exc)
+        record["killer_hits"] = []
+    return record
 
 
 async def _ensure_neighbor_evidence(db, state, llm, task_id: str, gap: GapCandidate,

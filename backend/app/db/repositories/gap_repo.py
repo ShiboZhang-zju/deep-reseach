@@ -256,6 +256,8 @@ def create_gap_audit(
     audited_claimed_delta: str | None = None,
     failure_reason_codes: list[str] | None = None,
     evidence_delta: dict | None = None,
+    killer_work: dict | None = None,
+    search_coverage: dict | None = None,
 ) -> GapAudit:
     """Create a gap audit record. Validates task consistency."""
     gap = db.get(GapCandidate, gap_id)
@@ -289,6 +291,8 @@ def create_gap_audit(
         audited_claimed_delta=audited_claimed_delta,
         failure_reason_codes_json=json.dumps(failure_reason_codes or []),
         evidence_delta_json=json.dumps(evidence_delta or {}, ensure_ascii=False),
+        killer_work_json=json.dumps(killer_work or {}, ensure_ascii=False),
+        search_coverage_json=json.dumps(search_coverage or {}, ensure_ascii=False),
     )
     db.add(audit)
     db.flush()
