@@ -18,6 +18,7 @@ against the neighbours and must earn `confirmed` on its own.
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from app.agent.state import ResearchState
@@ -36,6 +37,61 @@ def _utcnow():
 MAX_NARROW_ATTEMPTS = 2
 
 _MIN_REMAINING_DELTA_CHARS = 20
+
+# P0-2 (2026-08-28, task d6f64087): a partially_closed audit's remaining_delta
+# is sometimes a HEDGE — "The audit cannot confirm novelty because... The
+# evidence is insufficient to rule out prior work" — an explanation of why
+# novelty could not be confirmed, not a positive delta claim. Copying it
+# verbatim as the narrowed gap's claimed_delta inverts the semantics: the
+# audit's DOUBT became the gap's CLAIM (observed: surviving gap 475c8acd's
+# claimed_delta was the audit's uncertainty text verbatim). This pattern
+# mirrors the _AUDIT_TEXT_CONFLICT_RE family in audit_gaps.py (kept local:
+# importing audit_gaps here would pull the whole audit stack into module load).
+_NARROW_HEDGE_RE = re.compile(
+    r"\bdecision is (?:uncertain|inconclusive)\b"
+    r"|\b(?:cannot|unable to) (?:confirm|conclude)\b"
+    r"|\binsufficient evidence to (?:confirm|rule out)\b"
+    r"|\bnovelty (?:cannot|can not) be (?:confirmed|established)\b"
+    r"|\bthe audit cannot\b",
+    re.IGNORECASE,
+)
+
+_DISTILL_SYSTEM = """You rewrite an audit conclusion into a positive research delta claim.
+The input text is an auditor explaining WHY it could not confirm a research gap's novelty.
+Extract the concrete unverified research territory the text implies and state it as a
+positive claim of what remains unaddressed (e.g. "The intersection of X and Y in setting Z
+remains unverified in prior work"). Output ONE sentence of at most 60 words, in the same
+language as the input. Never use hedging words like "cannot confirm", "unable to" or
+"insufficient evidence"."""
+
+_DISTILL_USER = """Audit conclusion to distill:
+{text}
+
+Positive delta claim (one sentence):"""
+
+
+async def _distill_positive_delta(llm, hedge_text: str) -> str:
+    """One bounded LLM call to turn a hedged audit conclusion into a positive
+    delta claim. Returns "" on any failure so the caller can degrade to the
+    raw hedge text (a polluted claim beats a dropped gap)."""
+    if llm is None or not hasattr(llm, "chat"):
+        return ""
+    try:
+        answer = await llm.chat(
+            [{"role": "system", "content": _DISTILL_SYSTEM},
+             {"role": "user", "content": _DISTILL_USER.format(text=hedge_text)}],
+            temperature=0.2,
+        )
+        claim = (answer or "").strip().strip('"')
+        # The distillation itself must not be a hedge — if the model echoed
+        # the doubt, we gained nothing and fall back to the raw text.
+        if not claim or _NARROW_HEDGE_RE.search(claim):
+            return ""
+        return claim
+    except Exception as distill_err:
+        logger.warning("Hedge distillation failed (falling back to raw "
+                       "remaining_delta): %s", distill_err)
+        return ""
 
 
 def _latest_audit(db, gap_id: str) -> GapAudit | None:
@@ -64,10 +120,13 @@ def _narrow_attempts(db, gap_id: str) -> int:
     return total
 
 
-def narrow_audited_gaps(db, state: ResearchState, task_id: str) -> list[str]:
+async def narrow_audited_gaps(db, state: ResearchState, task_id: str, llm=None) -> list[str]:
     """Rewrite partially closed gaps around their remaining delta.
 
     Returns the IDs of the gaps that were narrowed and are ready for re-audit.
+    P0-2: `llm` is optional and only used for hedge distillation — a missing or
+    failing LLM degrades to the pre-P0-2 verbatim behaviour, never blocks
+    narrowing.
     """
     gaps = db.query(GapCandidate).filter(
         GapCandidate.task_id == task_id,
@@ -77,6 +136,7 @@ def narrow_audited_gaps(db, state: ResearchState, task_id: str) -> list[str]:
 
     narrowed = []
     skipped = []
+    hedge_traces = []
     for gap in gaps:
         audit = _latest_audit(db, gap.id)
         if audit is None or audit.audit_result != "partially_closed":
@@ -89,6 +149,21 @@ def narrow_audited_gaps(db, state: ResearchState, task_id: str) -> list[str]:
             # is meant to prevent.
             skipped.append({"gap_id": gap.id, "reason": "NO_CONCRETE_REMAINING_DELTA"})
             continue
+        # P0-2: a hedged remaining_delta ("The audit cannot confirm novelty
+        # because...") is the auditor's doubt, not a delta claim. Distill it
+        # into a positive claim before it becomes the narrowed gap's
+        # claimed_delta; keep the raw text only when distillation is
+        # unavailable (degradation > dropped gap) and trace the fallback.
+        distillation = {"hedged": False}
+        if _NARROW_HEDGE_RE.search(remaining):
+            distilled = await _distill_positive_delta(llm, remaining)
+            if distilled:
+                remaining = distilled
+                distillation = {"hedged": True, "distilled": True,
+                                "original_hedge": (audit.remaining_delta or "")[:300]}
+            else:
+                distillation = {"hedged": True, "distilled": False,
+                                "fallback": "raw_hedge_kept"}
         attempts = _narrow_attempts(db, gap.id)
         if attempts >= MAX_NARROW_ATTEMPTS:
             skipped.append({"gap_id": gap.id, "reason": "NARROW_ATTEMPTS_EXHAUSTED",
@@ -148,12 +223,17 @@ def narrow_audited_gaps(db, state: ResearchState, task_id: str) -> list[str]:
         gap.status = "superseded"
         gap.superseded_at = _utcnow()
         narrowed.append(child.id)
+        if distillation.get("hedged"):
+            distillation["gap_id"] = gap.id
+            distillation["child_gap_id"] = child.id
+            hedge_traces.append(distillation)
         logger.info("Gap %s: narrowed to v%d (child %s, attempt %d)",
                     gap.id[:8], child.version, child.id[:8], attempts)
 
     if narrowed or skipped:
         paper_repo.save_trace(db, task_id, "narrow_gaps", "decision", output_data={
             "narrowed_gap_ids": narrowed, "skipped": skipped,
+            "hedge_distillations": hedge_traces,
         })
     db.commit()
     return narrowed
