@@ -745,20 +745,34 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             db, task_id, state.contract_id)
             if g.mining_policy_version == GAP_MINING_POLICY_VERSION
             and g.status in ("auditing", "audited", "inconclusive")]
-        if (undetermined_gaps
+        # Top-2 competition follow-up: candidates deferred by an earlier
+        # competition round re-enter the audit pool BEFORE fresh mining —
+        # they are already evidence-backed, and mining again would mostly
+        # produce near-duplicates of them.
+        deferred_gaps: list = []
+        if (int(state.remediation_round or 0) > 0
+                and pending_audit_gap_ids is None):
+            deferred_gaps = [g for g in gap_repo.list_gaps_for_contract(
+                db, task_id, state.contract_id)
+                if g.mining_policy_version == GAP_MINING_POLICY_VERSION
+                and g.status == "candidate"]
+        if ((undetermined_gaps or deferred_gaps)
                 and int(state.remediation_round or 0) > 0
                 and pending_audit_gap_ids is None):
             for _g in undetermined_gaps:
                 _g.status = "candidate"
             db.commit()
-            logger.info("Task %s: re-auditing %d undetermined gap(s) on the "
-                        "richer pool instead of re-mining (remediation round %d)",
-                        task_id[:8], len(undetermined_gaps), state.remediation_round)
+            reaudit_pool = undetermined_gaps + deferred_gaps
+            logger.info("Task %s: re-auditing %d gap(s) on the richer pool "
+                        "instead of re-mining (%d undetermined, %d deferred; "
+                        "remediation round %d)",
+                        task_id[:8], len(reaudit_pool), len(undetermined_gaps),
+                        len(deferred_gaps), state.remediation_round)
             emit_event(task_id, "status", {
-                "status": "auditing_gaps", "gap_count": len(undetermined_gaps),
+                "status": "auditing_gaps", "gap_count": len(reaudit_pool),
                 "reaudit": True,
             })
-            gaps = undetermined_gaps
+            gaps = reaudit_pool
         else:
             # --- Gap mining ---
             logger.info("Task %s: mining evidence-backed gap candidates...", task_id[:8])
@@ -849,7 +863,13 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         if pending_audit_gap_ids is not None:
             narrowed_ids = set(pending_audit_gap_ids)
             audit_gap_ids = [gap_id for gap_id in current_gap_ids if gap_id in narrowed_ids]
+        pending_narrowed = pending_audit_gap_ids is not None
         pending_audit_gap_ids = None
+        # Top-2 competition: trim the audit set to the top-K cheap-ranked
+        # candidates; the rest stay "candidate" and re-enter on the next
+        # remediation round (deferred, not re-mined as duplicates).
+        audit_gap_ids = _apply_gap_competition_selection(
+            db, task_id, gaps, audit_gap_ids, pending_narrowed)
 
         async def _audit_gaps_op(db):
             return await audit_gap_candidates(db, state, llm, task_id, gap_ids=audit_gap_ids)
@@ -887,6 +907,14 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
             GapCandidate.status == "surviving",
         ).all()]
+        # Top-2 competition: both funded candidates finished their audits —
+        # the winner is chosen AFTER both verdicts, never "first survivor
+        # wins". Runner-ups keep their confirmed verdict as
+        # confirmed_runner_up; only the winner flows to the opportunity
+        # pipeline.
+        if len(state.surviving_gap_ids) > 1:
+            state.surviving_gap_ids = _resolve_gap_competition_winner(
+                db, task_id, state.surviving_gap_ids)
         # NOTE (P0-2 follow-up, task 23ec8f20): the survivor lookup is
         # deliberately NOT restricted to current_gap_ids. "surviving" is a
         # contract-level terminal state — a gap confirmed in an earlier loop
@@ -1079,6 +1107,112 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
     state = task_repo.get_state(db, task_id)
     await _terminate_more_research(db, state, task_id,
                                    "more_research_required", "remediation_budget_exhausted")
+
+
+# Top-2 gap competition (run7 review, 2026-08-28): auditing every candidate
+# costs ~10 minutes of adversarial search per gap, and the FIRST survivor is
+# not necessarily the best gap. Cheap-rank the candidates (mechanical, no LLM
+# call), fully audit only the top-2 — BOTH complete their audits before the
+# winner is chosen, no "first through the gate wins" — and deferred candidates
+# re-enter the next competition round instead of being re-mined as duplicates.
+_GAP_COMPETITION_TOP_K = 2
+
+
+def _cheap_gap_rank_score(db, gap) -> float:
+    """Mechanical 4-dimension cheap rank: Importance 0.30 / Evidence support
+    0.25 / Testability 0.25 / Potential differentiation 0.20.
+
+    Uses mining-time LLM scores plus a mechanical verified-evidence count —
+    deliberately no new LLM call. 'Potential differentiation' here means
+    "looks worth the audit spend", NOT "proven novel": novelty is decided
+    only by the full audit that follows (run7 review: D is a gate-keeper
+    heuristic, never a verdict)."""
+    from app.db.repositories import gap_repo
+
+    sig = float(getattr(gap, "significance_score", None) or 0.5)
+    feas = float(getattr(gap, "feasibility_score", None) or 0.5)
+    nov = float(getattr(gap, "novelty_score", None) or 0.5)
+    evidence_count = len(gap_repo.list_gap_evidence(db, gap.id))
+    ev = min(1.0, evidence_count / 8.0)
+    return 0.30 * sig + 0.25 * ev + 0.25 * feas + 0.20 * nov
+
+
+def _apply_gap_competition_selection(db, task_id: str, gaps, audit_gap_ids: list[str],
+                                     pending_narrowed: bool) -> list[str]:
+    """Trim the audit set to the top-K ranked candidates (defer the rest).
+
+    Skipped on narrowed re-audit rounds (that set is already the precise
+    rewritten subset) and when the set fits within the budget."""
+    from app.db.repositories import paper_repo
+
+    if pending_narrowed or len(audit_gap_ids) <= _GAP_COMPETITION_TOP_K:
+        return audit_gap_ids
+    gap_by_id = {g.id: g for g in gaps}
+    ranked = sorted(
+        (g for g in gaps if g.id in set(audit_gap_ids)),
+        key=lambda g: _cheap_gap_rank_score(db, g), reverse=True)
+    selected = ranked[:_GAP_COMPETITION_TOP_K]
+    selected_ids = {g.id for g in selected}
+    deferred = [g for g in ranked[_GAP_COMPETITION_TOP_K:]]
+    trimmed = [gid for gid in audit_gap_ids if gid in selected_ids]
+    paper_repo.save_trace(db, task_id, "gap_competition", "decision", output_data={
+        "stage": "select_audit_candidates",
+        "top_k": _GAP_COMPETITION_TOP_K,
+        "candidates": [{"gap_id": g.id,
+                        "score": round(_cheap_gap_rank_score(db, g), 4)}
+                       for g in ranked],
+        "selected_gap_ids": [g.id for g in selected],
+        "deferred_gap_ids": [g.id for g in deferred],
+    })
+    logger.info("Task %s: gap competition — auditing top-%d of %d candidates "
+                "(%d deferred for later rounds)",
+                task_id[:8], _GAP_COMPETITION_TOP_K, len(audit_gap_ids), len(deferred))
+    return trimmed
+
+
+def _resolve_gap_competition_winner(db, task_id: str, survivor_ids: list[str]) -> list[str]:
+    """When several gaps survive their audits, fund only the winner.
+
+    Both top-2 audits completed before this point; the winner is chosen by
+    cheap-rank score with the audit's novelty_confidence as tie-break.
+    Runner-ups become confirmed_runner_up: their confirmed verdict is kept
+    (visible for review, reviveable by later rounds) but the opportunity
+    pipeline funds only the winner."""
+    from app.db.models import GapCandidate
+    from app.db.repositories import gap_repo, paper_repo
+
+    if len(survivor_ids) <= 1:
+        return survivor_ids
+    survivors = db.query(GapCandidate).filter(
+        GapCandidate.id.in_(survivor_ids)).all()
+
+    def _sort_key(g):
+        audits = gap_repo.list_gap_audits(db, g.id)
+        nc = 0.0
+        if audits:
+            try:
+                nc = float(audits[-1].novelty_confidence or 0.0)
+            except (TypeError, ValueError):
+                nc = 0.0
+        return (_cheap_gap_rank_score(db, g), nc)
+
+    ranked = sorted(survivors, key=_sort_key, reverse=True)
+    winner = ranked[0]
+    runner_ups = ranked[1:]
+    for ru in runner_ups:
+        ru.status = "confirmed_runner_up"
+    db.commit()
+    paper_repo.save_trace(db, task_id, "gap_competition", "decision", output_data={
+        "stage": "winner_selection",
+        "winner_gap_id": winner.id,
+        "runner_up_gap_ids": [ru.id for ru in runner_ups],
+        "ranking": [{"gap_id": g.id,
+                     "score": round(_cheap_gap_rank_score(db, g), 4)}
+                    for g in ranked],
+    })
+    logger.info("Task %s: gap competition winner %s (%d runner-up(s) kept as "
+                "confirmed_runner_up)", task_id[:8], winner.id[:8], len(runner_ups))
+    return [winner.id]
 
 
 async def _try_remediate(db, state: ResearchState, llm, task_id: str, reason: str,
