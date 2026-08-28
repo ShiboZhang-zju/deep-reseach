@@ -11,6 +11,7 @@ from app.agent.state import ResearchState
 from app.config import settings
 from app.db.models import GapCandidate, GapPhenomenonPlan, InterventionCandidate
 from app.db.repositories import paper_repo
+from app.services import embedding_service
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,17 @@ For dataset and baselines, be concrete enough to actually run:
   mechanism (what we would know afterwards that we do not know now). Do NOT
   restate the intervention's measurable outcome; that only names the metric,
   not the knowledge gain.
+- IDENTITY FIELDS (required, construct validity): core_manipulation names THE
+  variable the experiment manipulates and at which LAYER — e.g. displayed
+  source attribution ("Self/External label on identical content") vs actual
+  generation provenance (judge's own output vs another model's output) vs
+  content factuality. The title and claims must not exceed what the
+  manipulation establishes: a label-swap-only design measures attribution
+  bias, NOT self-preference over one's own generations. expected_signature
+  states the observable pattern if the mechanism works. mechanism_being_tested
+  names the mechanism. If sibling experiments are listed in the user message,
+  your core_manipulation MUST differ from theirs at the variable layer —
+  duplicating a sibling's manipulation collapses the study.
 - STATISTICS: ratio-style paired metrics (pass rate, regression rate, accuracy,
   success rate, proportions) must be analyzed with McNemar's test, Wilcoxon
   signed-rank, a permutation test, or bootstrap confidence intervals — NEVER a
@@ -104,7 +116,22 @@ For dataset and baselines, be concrete enough to actually run:
 # ideas carry the reviewer's best-case/objection note, parked clusters persist
 # as research_direction_only ideas (DEFERRED_BY_SCIENTIFIC_TRIAGE) instead of
 # silently losing the experiment budget race.
-EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v9"
+# v10 (2026-08-28, run7 review): identity fields + sibling-collapse guard —
+# every plan declares core_manipulation / expected_signature /
+# mechanism_being_tested (the layer at which construct validity lives); later
+# clusters in the same gap see the funded siblings' manipulations in their
+# prompt and must differ at the variable layer; plans that still converge
+# (embedding similarity over manipulation+signature+mechanism >= 0.82) are
+# merged as condition variants of the sibling's idea instead of spawning
+# lookalike ideas (run7: P1 label-swap and P2 anonymous-evaluation both
+# collapsed into near-identical "Self vs External" experiments).
+EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v10"
+
+# Sibling merge: embedding similarity threshold over the concatenated
+# manipulation/signature/mechanism identity text. Aligned with the gap-dedup
+# family of thresholds; embedding failures fail-open (no merge — an outage is
+# not evidence of collapse).
+_SIBLING_MERGE_SIMILARITY = 0.82
 
 # P0-3: rejection-aware rewrite attempts per cluster. Two was too few once the
 # feedback became specific — one attempt burns on absorbing the feedback, the
@@ -151,7 +178,20 @@ Intervention (primary mechanism of this idea):
 {variant_section}
 Related paper IDs: {paper_ids}
 Resource constraints: GPU={gpu_available}; max GPU hours={max_gpu_hours}; runtime minutes={max_runtime_minutes}
-"""
+{sibling_section}"""
+
+_SIBLING_SECTION_TEMPLATE = """
+Sibling experiment(s) already funded for this gap — your experiment MUST
+manipulate a DIFFERENT variable layer (construct validity):
+{entries}
+If this cluster's mechanism genuinely cannot support a manipulation distinct
+from the sibling(s) above, prefer leaving the design clearly marked as a
+condition variant of the sibling manipulation rather than rebranding the
+same design with new wording."""
+
+_SIBLING_ENTRY_TEMPLATE = """- Sibling hypothesis: {hypothesis}
+  core_manipulation: {manipulation}
+  expected_signature: {signature}"""
 
 
 class HypothesisClusterSchema(BaseModel):
@@ -477,6 +517,125 @@ def _persist_parked_cluster_idea(db, task_id, state, contract, gap, cluster,
                 "research_direction_only idea %s",
                 task_id[:8], rank, idea.id[:8])
 
+
+def _sibling_identity_text(manipulation: str, signature: str, mechanism: str) -> str:
+    return " ".join(filter(None, [
+        (manipulation or "").strip(),
+        (signature or "").strip(),
+        (mechanism or "").strip(),
+    ]))
+
+
+def _find_sibling_merge(plan, funded_siblings: list[dict]) -> tuple[dict, float] | None:
+    """Deterministic sibling-collapse detection (run7 regression fix).
+
+    Compares the plan's identity text (core_manipulation + expected_signature
+    + mechanism_being_tested) against every funded sibling of the same gap via
+    embedding cosine similarity. Returns (sibling, similarity) when the best
+    match clears _SIBLING_MERGE_SIMILARITY — the caller merges this plan into
+    that sibling's idea as a condition variant instead of spawning a lookalike
+    idea. Embedding failure returns None (fail-open: an outage is not evidence
+    of collapse) — deterministic comparison, never an LLM judgement call.
+    """
+    if not funded_siblings:
+        return None
+    new_text = _sibling_identity_text(
+        plan.core_manipulation, plan.expected_signature, plan.mechanism_being_tested)
+    if not new_text:
+        return None
+    try:
+        sibling_texts = [
+            _sibling_identity_text(s["core_manipulation"], s["expected_signature"],
+                                   s["mechanism"])
+            for s in funded_siblings
+        ]
+        vectors = embedding_service.embed_texts([new_text] + sibling_texts)
+        if not vectors or any(not v for v in vectors):
+            return None
+        best, best_sim = None, 0.0
+        for idx, sibling in enumerate(funded_siblings):
+            sim = embedding_service.cosine_similarity(vectors[0], vectors[idx + 1])
+            if sim > best_sim:
+                best, best_sim = sibling, sim
+        if best is not None and best_sim >= _SIBLING_MERGE_SIMILARITY:
+            return best, best_sim
+        return None
+    except Exception as exc:
+        logger.warning("Sibling merge similarity check degraded (fail-open, "
+                       "keeping ideas separate): %s", exc)
+        return None
+
+
+def _persist_merged_condition_variant(db, task_id, state, contract, gap,
+                                      intervention, variants, plan, merge_target,
+                                      similarity, direction_only_idea_ids):
+    """Persist a collapsed sibling plan as a condition variant of the main idea.
+
+    One idea, N mechanism experiments: the plan is saved as an experiment
+    hanging off the merge-target idea (the data model already supports many
+    experiments per idea), tagged with its manipulation and the sibling it
+    collapsed into. No lookalike idea is created.
+    """
+    idea = merge_target["idea"]
+    steps = [
+        *plan.steps,
+        f"Success condition: {plan.success_condition}",
+        f"Falsification condition: {plan.falsification_condition}",
+        *[f"Control: {control}" for control in plan.controls],
+    ]
+    experiment = paper_repo.save_experiment(db, task_id, idea.id, {
+        "hypothesis": plan.hypothesis,
+        "dataset": plan.dataset,
+        "baselines": plan.baselines,
+        "metrics": plan.metrics,
+        "model_spec": plan.model_spec,
+        "dataset_provenance": plan.dataset_provenance,
+        "oracle": plan.oracle,
+        "statistical_analysis": plan.statistical_analysis,
+        "resource_budget": plan.resource_budget,
+        "scenario_atoms_json": json.dumps(plan.scenario_atoms, ensure_ascii=False),
+        "steps_markdown": "\n".join(f"{index + 1}. {step}" for index, step in enumerate(steps)),
+        "steps_json": json.dumps({
+            "steps": plan.steps,
+            "controls": plan.controls,
+            "success_condition": plan.success_condition,
+            "falsification_condition": plan.falsification_condition,
+            "core_manipulation": plan.core_manipulation,
+            "expected_signature": plan.expected_signature,
+            "mechanism_being_tested": plan.mechanism_being_tested,
+            "condition_variant": True,
+            "condition_variant_of_idea": idea.id,
+            "sibling_merge_similarity": round(similarity, 3),
+        }, ensure_ascii=False),
+        "risks": plan.risks,
+    })
+    # The main idea's visible record gains the condition variant annotation —
+    # the user sees ONE idea with N manipulations, not N lookalikes.
+    annotation = (
+        "\n\n[Condition variant merged] A sibling experiment collapsed onto "
+        f"this idea (manipulation similarity {similarity:.2f}): its distinct "
+        f"manipulation — {plan.core_manipulation[:200]} — is preserved as an "
+        "additional experiment under this idea rather than a separate idea."
+    )
+    idea.motivation = (idea.motivation or "") + annotation
+    db.commit()
+    paper_repo.save_trace(db, task_id, "idea_quality_gate", "decision", output_data={
+        "gap_id": gap.id,
+        "intervention_id": intervention.id,
+        "variant_intervention_ids": [v.id for v in variants],
+        "status": "merged_condition_variant",
+        "merged_into_idea_id": idea.id,
+        "sibling_merge_similarity": round(similarity, 3),
+        "core_manipulation": plan.core_manipulation,
+        "sibling_core_manipulation": merge_target["core_manipulation"],
+        "reason_codes": ["SIBLING_MANIPULATION_COLLAPSE"],
+        "plan_title": plan.title,
+    })
+    logger.info("Task %s: merged sibling plan '%s' into idea %s as condition "
+                "variant (similarity %.2f)",
+                task_id[:8], plan.title[:40], idea.id[:8], similarity)
+    return experiment
+
 async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
                                intervention, existing_paper_ids):
     """P2-C idea-level novelty quick-check.
@@ -658,6 +817,14 @@ class MinimalExperimentSchema(BaseModel):
     title: str = Field(min_length=5)
     idea_method: str = ""
     idea_contribution: str = ""
+    # Identity fields (run7 regression, 2026-08-28): what the experiment
+    # MANIPULATES, at which variable layer — the level at which construct
+    # validity and sibling distinctiveness actually live. A label swap
+    # manipulates displayed attribution, NOT actual provenance; the claim
+    # must not exceed what the manipulation establishes.
+    core_manipulation: str = Field(min_length=10)
+    expected_signature: str = Field(min_length=10)
+    mechanism_being_tested: str = Field(min_length=10)
     summary: str = Field(min_length=10)
     hypothesis: str = Field(min_length=10)
     dataset: str
@@ -1076,10 +1243,24 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     park_rank, len(ranked), paper_ids, seen_titles,
                     direction_only_idea_ids)
 
+        # Funded siblings of THIS gap (run7 sibling-collapse guard): each entry
+        # carries the funded idea object plus its manipulation identity, so
+        # later clusters see them in the prompt and merged plans hang off the
+        # right idea.
+        funded_siblings: list[dict] = []
+
         for cluster in clusters:
             intervention = cluster["primary"]
             variants = cluster["variants"]
             variant_section = _format_variant_section(variants)
+            sibling_section = ""
+            if funded_siblings:
+                entries = "\n".join(_SIBLING_ENTRY_TEMPLATE.format(
+                    hypothesis=s.get("hypothesis") or "(not extracted)",
+                    manipulation=s["core_manipulation"],
+                    signature=s["expected_signature"],
+                ) for s in funded_siblings)
+                sibling_section = _SIBLING_SECTION_TEMPLATE.format(entries=entries)
 
             # Feedback retry (task 23ec8f20, 2026-08-27): both tier-A interventions were
             # rejected with SCENARIO_MISMATCH:verifier and NO retry — the gate is right to
@@ -1111,6 +1292,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     gpu_available=contract.gpu_available,
                     max_gpu_hours=contract.max_gpu_hours,
                     max_runtime_minutes=contract.max_runtime_minutes,
+                    sibling_section=sibling_section,
                 )
                 if feedback:
                     user_content += feedback
@@ -1222,6 +1404,21 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                                 "research_direction_only idea %s",
                                 task_id[:8], direction_idea.id[:8])
                 logger.warning("Task %s: experiment plan rejected by quality gate: %s", task_id[:8], plan_failures)
+                continue
+
+            # Sibling-collapse guard (run7 regression fix): even with the
+            # must-differ prompt constraint, the model may converge onto the
+            # sibling's manipulation again (representation collapse). Detect
+            # it deterministically via embedding similarity over the identity
+            # fields and merge the plan into the sibling's idea as a condition
+            # variant — one idea, N mechanism experiments.
+            merge_hit = _find_sibling_merge(plan, funded_siblings)
+            if merge_hit is not None:
+                merge_target, merge_sim = merge_hit
+                merged_experiment = _persist_merged_condition_variant(
+                    db, task_id, state, contract, gap, intervention, variants,
+                    plan, merge_target, merge_sim, direction_only_idea_ids)
+                experiment_ids.append(merged_experiment.id)
                 continue
 
             # De-duplicate titles: two interventions over the same gap can collapse
@@ -1383,12 +1580,25 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     "controls": plan.controls,
                     "success_condition": plan.success_condition,
                     "falsification_condition": plan.falsification_condition,
+                    "core_manipulation": plan.core_manipulation,
+                    "expected_signature": plan.expected_signature,
+                    "mechanism_being_tested": plan.mechanism_being_tested,
                 }, ensure_ascii=False),
                 "risks": plan.risks,
             })
             if decision == "executable_candidate":
                 idea_ids.append(idea.id)
             experiment_ids.append(experiment.id)
+            # Register this funded experiment as a sibling for the remaining
+            # clusters of the same gap — the next cluster's prompt will demand
+            # a different variable layer, and a converging plan merges here.
+            funded_siblings.append({
+                "idea": idea,
+                "hypothesis": cluster["hypothesis"],
+                "core_manipulation": plan.core_manipulation,
+                "expected_signature": plan.expected_signature,
+                "mechanism": plan.mechanism_being_tested,
+            })
 
     paper_repo.save_trace(db, task_id, "generate_minimal_experiments", "action", output_data={
         "idea_count": len(idea_ids),

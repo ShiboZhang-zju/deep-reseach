@@ -51,6 +51,30 @@ def temp_db():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_embeddings(monkeypatch):
+    """Deterministic embeddings for the whole file: identical texts map to the
+    same one-hot vector (similarity 1.0), different texts to orthogonal ones
+    (0.0). Keeps the sibling-merge guard exact and offline."""
+    import importlib
+
+    gme = importlib.import_module("app.agent.steps.generate_minimal_experiments")
+
+    def fake_embed(texts):
+        seen = {}
+
+        def vec_of(t):
+            if t not in seen:
+                seen[t] = len(seen)
+            v = [0.0] * 64
+            v[seen[t] % 64] = 1.0
+            return v
+
+        return [vec_of(t) for t in texts]
+
+    monkeypatch.setattr(gme.embedding_service, "embed_texts", fake_embed)
+
+
 class _ClusterMockLLM:
     """chat_json dispatch by schema name with a configurable cluster response."""
 
@@ -77,6 +101,15 @@ class _ClusterMockLLM:
                 hypothesis="Filtering stylistic-only corrections reduces functional regressions.",
                 idea_method="Classify corrections by type and gate execution on logical-only fixes.",
                 idea_contribution=self.idea_contribution,
+                core_manipulation=(
+                    "Toggles a correction-type filter between logical-only and "
+                    f"apply-all arms (arm set {len(self.plan_prompts)})."),
+                expected_signature=(
+                    "Regression rate drops in the logical-only arm, unchanged "
+                    f"pass@1 (observation {len(self.plan_prompts)})."),
+                mechanism_being_tested=(
+                    "Stylistic corrections carry functional regression risk "
+                    "the filter removes."),
                 dataset=f"HumanEval with injected stylistic noise covering: {text}",
                 baselines="no-correction, apply-all, heuristic skip-stylistic",
                 metrics="pass@1 delta, regression rate",
@@ -530,7 +563,7 @@ async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
 
 def test_policy_version_bumped():
     """The experiment policy version encodes the novelty-check rules."""
-    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v9"
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v10"
 
 
 def _plan(**overrides):
@@ -540,6 +573,9 @@ def _plan(**overrides):
         idea_method="We hypothesize that filtering stylistic corrections reduces regressions.",
         summary="Compare filtered vs unfiltered self-correction on HumanEval.",
         hypothesis="Filtering stylistic-only corrections reduces functional regression rate.",
+        core_manipulation="Toggles a correction-type filter between logical-only and apply-all arms.",
+        expected_signature="Regression rate drops in the logical-only arm, unchanged pass@1.",
+        mechanism_being_tested="Stylistic corrections carry functional regression risk.",
         dataset="HumanEval with injected stylistic noise",
         baselines="apply-all corrections; heuristic filter",
         metrics="pass@1 delta and regression rate across 164 problems",
@@ -778,4 +814,147 @@ async def test_triage_skipped_when_clusters_within_budget(temp_db):
     assert llm.triage_calls == 0
     ideas = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).all()
     assert len(ideas) == 2
+    db.close()
+
+
+# --- Sibling collapse guard (run7 regression, 2026-08-28) ---
+
+def _identity_plan(title, manipulation, signature):
+    return MinimalExperimentSchema(
+        title=title,
+        summary=f"Minimal experiment for {title}.",
+        hypothesis="Filtering stylistic-only corrections reduces functional regressions.",
+        idea_method="Classify corrections by type and gate execution on logical-only fixes.",
+        idea_contribution="Establishes the causal share of stylistic edits in regressions.",
+        core_manipulation=manipulation,
+        expected_signature=signature,
+        mechanism_being_tested="Stylistic corrections carry functional regression risk.",
+        dataset="HumanEval with injected stylistic noise",
+        dataset_provenance="public dataset plus synthetic stylistic injection",
+        baselines="no-correction, apply-all, heuristic skip-stylistic",
+        metrics="pass@1 delta and regression rate",
+        model_spec="small model",
+        oracle="execution engine verifier",
+        statistical_analysis="McNemar paired test",
+        resource_budget="CPU only",
+        success_condition="regression rate drops significantly",
+        falsification_condition="no measurable regression difference",
+        scenario_atoms=["stylistic", "logical"],
+        controls=["same decoding budget"],
+        steps=["inject stylistic noise", "run filtering arms"],
+        risks="verifier flakiness",
+    )
+
+
+class _SequentialPlanLLM(_ClusterMockLLM):
+    """Serves a queue of plans (one per funded cluster call)."""
+
+    def __init__(self, plans, cluster_response=None):
+        super().__init__(cluster_response=cluster_response,
+                         idea_contribution="Knowledge gain statement.")
+        self.plans = list(plans)
+
+    async def chat_json(self, messages, schema):
+        name = schema.__name__
+        if name == "MinimalExperimentSchema" and self.plans:
+            self.plan_prompts.append(messages[-1]["content"])
+            return self.plans.pop(0)
+        return await super().chat_json(messages, schema)
+
+
+def _patch_embeddings(monkeypatch, similar: bool):
+    """Patch embedding so identity texts compare similar/dissimilar at will."""
+    import importlib
+
+    gme = importlib.import_module("app.agent.steps.generate_minimal_experiments")
+
+    def fake_embed(texts):
+        base = [1.0] + [0.0] * 15
+        ortho = [0.0, 1.0] + [0.0] * 14
+        return [base if i == 0 or (similar and i > 0) else ortho
+                for i, _ in enumerate(texts)]
+
+    monkeypatch.setattr(gme.embedding_service, "embed_texts", fake_embed)
+
+
+@pytest.mark.asyncio
+async def test_sibling_manipulation_collapse_merges_into_one_idea(temp_db, monkeypatch):
+    """run7 regression case: P1 (label swap) and P2 (nominally anonymous
+    evaluation) both converged onto near-identical 'Self vs External'
+    experiments 鈥?two lookalike executable ideas. The guard must merge the
+    second plan into the first idea as a condition variant: one idea, two
+    experiments, collapse recorded in the trace."""
+    from app.agent.state import ResearchState
+    from app.db.models import AgentTrace, ExperimentPlan, ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=2)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    manipulation = ("Swap the displayed source attribution label "
+                    "(Self vs External) on identical hallucinated content.")
+    llm = _SequentialPlanLLM([
+        _identity_plan("Attribution swap testing",
+                       manipulation,
+                       "Self-labelled hallucinations receive higher ratings."),
+        _identity_plan("Blind provenance evaluation",
+                       manipulation,  # collapsed onto the sibling manipulation
+                       "Self-labelled hallucinations receive higher ratings."),
+    ], cluster_response=None)
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+    _patch_embeddings(monkeypatch, similar=True)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    ideas = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).all()
+    experiments = db.query(ExperimentPlan).filter(
+        ExperimentPlan.task_id == task.id).all()
+    assert len(ideas) == 1, "a collapsed sibling must not spawn a lookalike idea"
+    assert len(experiments) == 2, "both mechanism experiments survive, on ONE idea"
+    assert all(e.idea_id == ideas[0].id for e in experiments)
+    variant = json.loads(
+        [e for e in experiments if json.loads(e.steps_json).get("condition_variant")][0].steps_json)
+    assert variant["condition_variant"] is True
+    assert "Condition variant merged" in ideas[0].motivation
+    traces = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "idea_quality_gate").all()
+    merge_traces = [json.loads(t.output_json) for t in traces
+                    if json.loads(t.output_json).get("status") == "merged_condition_variant"]
+    assert merge_traces and "SIBLING_MANIPULATION_COLLAPSE" in merge_traces[0]["reason_codes"]
+    # The second cluster's prompt carried the sibling manipulation constraint.
+    assert any("MUST" in p and "manipulate a DIFFERENT variable layer" in p
+               for p in llm.plan_prompts), llm.plan_prompts
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_distinct_manipulations_stay_separate_ideas(temp_db, monkeypatch):
+    """Distinct variable layers (label swap vs removing attribution metadata)
+    must remain two independent ideas 鈥?the guard merges collapse, not
+    legitimate factorial breadth."""
+    from app.agent.state import ResearchState
+    from app.db.models import ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=2)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _SequentialPlanLLM([
+        _identity_plan("Attribution swap testing",
+                       "Swap the displayed source attribution label (Self vs External).",
+                       "Self-labelled hallucinations receive higher ratings."),
+        _identity_plan("Blind anonymous evaluation",
+                       "Remove all attribution metadata; compare blind vs disclosed ratings.",
+                       "Bias observed under labels shrinks under anonymity."),
+    ], cluster_response=None)
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+    _patch_embeddings(monkeypatch, similar=False)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    ideas = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).all()
+    assert len(ideas) == 2
+    assert not any("[Condition variant merged]" in (i.motivation or "")
+                   for i in ideas)
     db.close()
