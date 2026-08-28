@@ -100,3 +100,34 @@ def test_model_scope_check_is_role_aware():
     # No role anywhere: global cap applies to every number (legacy behaviour).
     assert any(f.startswith("MODEL_SCOPE_CONFLICT") for f in _check_model_scope(
         "strict <7B model budget", "Llama-3-8B inference model"))
+
+
+def test_model_scope_check_exempts_boundary_study_gaps():
+    """Boundary-study exemption (task db7e1adc): a gap whose delta IS the
+    capacity boundary — "Extends robustness evaluation from <10B parameter
+    models to >70B parameter models" — must compare models on both sides.
+    The "<10B" there is a range bound, not a compute cap; in that run the
+    misread cap forced the boundary-comparison cluster into
+    research_direction_only."""
+    from app.agent.steps.generate_minimal_experiments import _check_model_scope
+
+    gap = ("Extends robustness evaluation from <10B parameter models to "
+           ">70B parameter models and identifies the capacity boundary "
+           "beyond which reward hacking defenses fail")
+    spec = ("Policy models: Mistral-7B-Instruct and "
+            "Meta-Llama-3-70B-Instruct (both sides of the studied boundary)")
+    assert _check_model_scope(gap, spec) == []
+
+    # Boundary phrasing disables the SLM keyword fallback too — the "small
+    # model" wording belongs to the boundary's small end.
+    gap_slm = ("Extends hacking mitigation from small language models under 7B "
+               "to over 70B parameter models")
+    assert _check_model_scope(gap_slm, "Llama-3-70B policy model") == []
+
+    # A REAL cap next to a boundary phrase is still enforced: the boundary
+    # covers the studied range, but the RM it names stays capped.
+    gap_mixed = ("Reward models (<3B) guide training; extends evaluation "
+                 "from <10B to >70B policy models")
+    spec_mixed = "Reward model Llama-3-8B."
+    failures = _check_model_scope(gap_mixed, spec_mixed)
+    assert any(f.startswith("MODEL_SCOPE_CONFLICT") for f in failures)

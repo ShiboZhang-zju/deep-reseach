@@ -41,6 +41,11 @@ For dataset and baselines, be concrete enough to actually run:
   hypothesis -> method -> expected outcome. Do NOT restate the intervention's
   engineering description; drop implementation details a reader of the idea does
   not need to judge the contribution.
+- IDEA_CONTRIBUTION: 1-2 sentences stating what THIS experiment would establish
+  as a novel contribution if it succeeds — a claim about the phenomenon or
+  mechanism (what we would know afterwards that we do not know now). Do NOT
+  restate the intervention's measurable outcome; that only names the metric,
+  not the knowledge gain.
 - STATISTICS: ratio-style paired metrics (pass rate, regression rate, accuracy,
   success rate, proportions) must be analyzed with McNemar's test, Wilcoxon
   signed-rank, a permutation test, or bootstrap confidence intervals — NEVER a
@@ -86,12 +91,24 @@ For dataset and baselines, be concrete enough to actually run:
 # persisted as research_direction_only ideas (full rejected plan in the
 # trace) instead of vanishing — a 90-minute run previously ended with the
 # user seeing only "abstained" while two near-complete plans evaporated.
-EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v7"
+# v8 (2026-08-28, task db7e1adc): boundary-study exemption — gaps whose delta
+# is itself a capacity range ("from <10B ... to >70B") may compare models on
+# both sides; range bounds are no longer extracted as compute caps. P2-a:
+# idea_contribution (LLM-authored knowledge-gain claim) replaces the verbatim
+# copy of intervention.measurable_outcome in expected_contribution. P2-b:
+# related_paper_ids are re-selected from the novelty check's mechanism-relevant
+# papers instead of inheriting the gap audit's full neighbour set.
+EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v8"
 
 # P0-3: rejection-aware rewrite attempts per cluster. Two was too few once the
 # feedback became specific — one attempt burns on absorbing the feedback, the
 # model earns a second real rewrite. Bounded to keep the phase cheap.
 _PLAN_GENERATION_ATTEMPTS = 3
+
+# P2-b: upper bound on mechanism-relevant papers re-selected onto an idea —
+# related work metadata stays readable instead of inheriting the full audit
+# neighbour set.
+_IDEA_RELATED_PAPER_CAP = 8
 
 # Initial calibration point; revisit against historical task annotations (P3)
 # before changing — cluster merges REDUCE idea counts, so false merges are the
@@ -148,9 +165,16 @@ class IdeaNoveltyVerdictSchema(BaseModel):
     SAME core mechanism (same technique for the same purpose); related-but-
     different methods (different technique, different purpose, or only a
     component of the proposal) must yield false.
+
+    P2-b (2026-08-28): mechanism_relevant_paper_ids lists the examined papers
+    genuinely relevant to the idea's mechanism — prior art worth citing or
+    related work the experiment must compare against. These re-select the
+    idea's related_paper_ids, which previously inherited the gap audit's full
+    neighbor set (gap-relevant, not necessarily mechanism-relevant).
     """
     already_implemented: bool
     evidence_paper_id: str | None = None
+    mechanism_relevant_paper_ids: list[str] = Field(default_factory=list)
     rationale: str = Field(min_length=5)
 
 
@@ -280,7 +304,10 @@ _IDEA_NOVELTY_VERDICT_SYSTEM = """You judge whether a proposed research method h
 already_implemented=true ONLY when one listed paper directly implements the SAME core mechanism — same technique
 used for the same purpose. Related-but-different work (different technique, different purpose, only one component of
 the proposal, or a survey) must yield false. If true, set evidence_paper_id to the implementing paper's id exactly
-as listed. Be conservative: uncertainty means false."""
+as listed. Be conservative: uncertainty means false.
+Additionally, set mechanism_relevant_paper_ids to the ids (exactly as listed) of papers that are genuinely relevant
+to the idea's mechanism — prior art a reader must know, or related work the experiment should compare against.
+Exclude papers that only share the broad topic without touching the mechanism. Leave it empty when none qualify."""
 
 
 async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
@@ -292,7 +319,8 @@ async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
     exact technique). This check retrieves against the cluster's hypothesis +
     primary mechanism and asks whether prior art directly implements it.
 
-    Returns (verdict, matched_paper_id) where verdict is one of:
+    Returns (verdict, matched_paper_id, mechanism_relevant_paper_ids) where
+    verdict is one of:
     - "disabled":           check turned off by configuration
     - "already_implemented": demote the idea (METHOD_ALREADY_PUBLISHED) — the
                             LLM identified a listed paper implementing the method
@@ -303,9 +331,15 @@ async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
                             an external-source outage is not evidence about the
                             idea (distinct from a successful search that found
                             prior art).
+
+    P2-b: mechanism_relevant_paper_ids is non-empty only on a successful
+    verdict — the examined papers the verdict LLM judged genuinely relevant to
+    the idea's mechanism. The caller re-selects the idea's related_paper_ids
+    from them; every degraded path returns [] so the idea keeps its
+    gap-audit-neighbour fallback instead of losing related work entirely.
     """
     if not settings.idea_novelty_check_enabled:
-        return "disabled", None
+        return "disabled", None, []
     from app.agent.steps.generate_queries import SearchQueryExecution
     from app.agent.steps.search_papers import search_and_save_papers
     from app.db.models import Paper, SearchQueryPaper
@@ -328,13 +362,13 @@ async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
             "gap_id": gap.id, "intervention_id": intervention.id,
             "verdict": "degraded", "stage": "query_generation", "error": str(exc)[:200],
         })
-        return "degraded", None
+        return "degraded", None, []
     if not queries:
         paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
             "gap_id": gap.id, "intervention_id": intervention.id,
             "verdict": "degraded", "stage": "query_generation", "error": "no queries returned",
         })
-        return "degraded", None
+        return "degraded", None, []
 
     round_num = state.current_round
     executions = []
@@ -357,7 +391,7 @@ async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
             "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
             "verdict": "degraded", "stage": "retrieval", "error": str(exc)[:200],
         })
-        return "degraded", None
+        return "degraded", None, []
 
     # Top-k papers by rank across the novelty queries (dedup across queries).
     top_rows = (
@@ -382,7 +416,7 @@ async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
             "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
             "verdict": "passed_no_results",
         })
-        return "passed_no_results", None
+        return "passed_no_results", None, []
 
     paper_list = [{
         "id": p.id, "title": (p.title or "")[:150], "abstract": (p.abstract or "")[:500],
@@ -402,25 +436,30 @@ async def _check_idea_novelty(db, state, llm, task_id, gap, cluster_hypothesis,
             "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
             "verdict": "degraded", "stage": "verdict", "error": str(exc)[:200],
         })
-        return "degraded", None
+        return "degraded", None, []
     if verdict is None:
         paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
             "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
             "verdict": "degraded", "stage": "verdict", "error": "no verdict returned",
         })
-        return "degraded", None
+        return "degraded", None, []
 
     matched = None
     if verdict.already_implemented and verdict.evidence_paper_id and verdict.evidence_paper_id in seen_ids:
         matched = verdict.evidence_paper_id
     final_verdict = "already_implemented" if matched else "passed"
+    # P2-b: papers the verdict LLM judged genuinely mechanism-relevant. Invalid
+    # IDs (hallucinated) are dropped; a bounded cap keeps idea metadata small.
+    relevant_ids = [pid for pid in verdict.mechanism_relevant_paper_ids
+                    if pid in seen_ids][:_IDEA_RELATED_PAPER_CAP]
     paper_repo.save_trace(db, task_id, "idea_novelty_check", "decision", output_data={
         "gap_id": gap.id, "intervention_id": intervention.id, "queries": queries,
         "verdict": final_verdict, "matched_paper_id": matched,
         "rationale": (verdict.rationale or "")[:400],
         "checked_paper_ids": [p.id for p in top_papers],
+        "mechanism_relevant_paper_ids": relevant_ids,
     })
-    return final_verdict, matched
+    return final_verdict, matched, relevant_ids
 
 
 class MinimalExperimentSchema(BaseModel):
@@ -431,6 +470,7 @@ class MinimalExperimentSchema(BaseModel):
     # description which used to be copied verbatim into method_sketch.
     title: str = Field(min_length=5)
     idea_method: str = ""
+    idea_contribution: str = ""
     summary: str = Field(min_length=10)
     hypothesis: str = Field(min_length=10)
     dataset: str
@@ -618,26 +658,45 @@ def _check_model_scope(gap_text: str, model_spec: str) -> list[str]:
     names a role ("reward models (<3B)"), only parameter counts bound to that
     same role in model_spec are checked; numbers attached to a DIFFERENT role
     (e.g. an 8B policy LLM in an RLHF setup) are exempt. No role anywhere
-    keeps the old global behaviour (conservative)."""
+    keeps the old global behaviour (conservative).
+    Boundary-study exemption (task db7e1adc): a gap whose delta IS a capacity
+    boundary — "Extends robustness evaluation from <10B parameter models to
+    >70B parameter models" — legitimately compares models on both sides of
+    that boundary; the "<10B" there is a range bound, not a compute cap. Such
+    from→to constructions are skipped during cap extraction (and disable the
+    SLM keyword fallback, which would otherwise re-impose a 7B cap from the
+    boundary's "small model" phrasing)."""
     text = (gap_text or "").lower()
     spec = (model_spec or "").lower()
     if not spec:
         return []
     cap: float | None = None
     cap_role: str | None = None
-    m = re.search(
-        r"(?:<|<=|≤|under|below|smaller than|less than|up to)\s*(\d+(?:\.\d+)?)\s*b\b",
-        text,
+    boundary_study = False
+    cap_re = re.compile(
+        r"(?:<|<=|≤|under|below|smaller than|less than|up to)\s*(\d+(?:\.\d+)?)\s*b\b"
     )
-    if m:
+    for m in cap_re.finditer(text):
+        # A "<NB ... to >NB" continuation marks the match as one side of a
+        # studied range, not a cap: "from <10B ... to >70B". The "to NB" must
+        # directly continue the match — another size number in between means
+        # the match is a real cap and the range belongs to later text.
+        tail = text[m.end():m.end() + 70]
+        r = re.search(
+            r"\bto\s*(?:over|more than|above|at least|>+\s*)?\s*\d+(?:\.\d+)?\s*b\b",
+            tail,
+        )
+        if r and not re.search(r"\b\d+(?:\.\d+)?\s*b\b", tail[:r.start()]):
+            boundary_study = True
+            continue
         cap = float(m.group(1))
         cap_role = _role_in_window(text, m.start())
-    elif re.search(r"\b(?:small language models?|small models?|slms?)\b", text):
-        cap = 7.0
-        cap_role = _role_in_window(
-            text,
-            re.search(r"\b(?:small language models?|small models?|slms?)\b", text).start(),
-        )
+        break
+    if cap is None and not boundary_study:
+        slm = re.search(r"\b(?:small language models?|small models?|slms?)\b", text)
+        if slm:
+            cap = 7.0
+            cap_role = _role_in_window(text, slm.start())
     if cap is None:
         return []
     for num_m in re.finditer(r"\b(\d+(?:\.\d+)?)\s*b\b", spec):
@@ -935,7 +994,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                         "description": plan.summary or "(draft plan rejected by consistency gate)",
                         "motivation": motivation,
                         "method_sketch": (plan.idea_method or "").strip() or intervention.proposed_intervention,
-                        "expected_contribution": intervention.measurable_outcome,
+                        "expected_contribution": (plan.idea_contribution or "").strip() or intervention.measurable_outcome,
                         "related_paper_ids_json": json.dumps(paper_ids, ensure_ascii=False),
                         "contract_id": contract.id,
                         "gap_id": gap.id,
@@ -995,7 +1054,11 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 # P2-B: prefer the LLM's idea-level method sketch; fall back to
                 # the intervention text only when the model omitted the field.
                 "method_sketch": (plan.idea_method or "").strip() or intervention.proposed_intervention,
-                "expected_contribution": intervention.measurable_outcome,
+                # P2-a (2026-08-28): the contribution states what the experiment
+                # would establish (knowledge gain), distinct from the
+                # intervention's measurable outcome (metric name) which used to
+                # be copied here verbatim.
+                "expected_contribution": (plan.idea_contribution or "").strip() or intervention.measurable_outcome,
                 "related_paper_ids_json": json.dumps(paper_ids, ensure_ascii=False),
                 "contract_id": contract.id,
                 "gap_id": gap.id,
@@ -1029,15 +1092,25 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 # the cluster's hypothesis + primary mechanism; a direct prior-
                 # art implementation demotes the idea to conditional_review.
                 # Infrastructure failures degrade to a trace and never demote.
-                novelty_verdict, matched_paper_id = await _check_idea_novelty(
+                novelty_verdict, matched_paper_id, mechanism_relevant_ids = await _check_idea_novelty(
                     db, state, llm, task_id, gap,
                     cluster["hypothesis"], intervention, paper_ids)
                 if novelty_verdict == "already_implemented":
                     decision = "conditional_review"
                     quality_reason_codes.append("METHOD_ALREADY_PUBLISHED")
+                # P2-b: re-select related work by mechanism relevance — the
+                # novelty check retrieved papers against the IDEA's mechanism,
+                # so its relevance-filtered ids beat the gap-audit neighbour set
+                # (gap-relevant, not necessarily mechanism-relevant). Degraded
+                # paths return [] and keep the fallback neighbours.
+                if mechanism_relevant_ids:
+                    paper_ids = list(mechanism_relevant_ids)
                     if matched_paper_id and matched_paper_id not in paper_ids:
                         paper_ids.append(matched_paper_id)
-                        idea.related_paper_ids_json = json.dumps(paper_ids, ensure_ascii=False)
+                    idea.related_paper_ids_json = json.dumps(paper_ids, ensure_ascii=False)
+                elif matched_paper_id and matched_paper_id not in paper_ids:
+                    paper_ids.append(matched_paper_id)
+                    idea.related_paper_ids_json = json.dumps(paper_ids, ensure_ascii=False)
                 idea.quality_reason_codes_json = json.dumps(quality_reason_codes, ensure_ascii=False)
                 paper_repo.update_idea_scores(db, idea.id, score.model_dump(), final_score, decision)
                 paper_repo.save_trace(db, task_id, "idea_quality_gate", "decision", output_data={

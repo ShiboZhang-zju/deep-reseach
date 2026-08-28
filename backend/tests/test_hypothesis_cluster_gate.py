@@ -52,9 +52,10 @@ def temp_db():
 class _ClusterMockLLM:
     """chat_json dispatch by schema name with a configurable cluster response."""
 
-    def __init__(self, cluster_response=None, plan_texts=None):
+    def __init__(self, cluster_response=None, plan_texts=None, idea_contribution=""):
         self.cluster_response = cluster_response
         self.plan_texts = plan_texts or []
+        self.idea_contribution = idea_contribution
         self.cluster_calls = 0
         self.plan_prompts = []
 
@@ -72,6 +73,8 @@ class _ClusterMockLLM:
                 title="Filtering stylistic fixes in self-correction",
                 summary="A minimal experiment filtering stylistic-only corrections.",
                 hypothesis="Filtering stylistic-only corrections reduces functional regressions.",
+                idea_method="Classify corrections by type and gate execution on logical-only fixes.",
+                idea_contribution=self.idea_contribution,
                 dataset=f"HumanEval with injected stylistic noise covering: {text}",
                 baselines="no-correction, apply-all, heuristic skip-stylistic",
                 metrics="pass@1 delta, regression rate",
@@ -412,6 +415,90 @@ async def test_novelty_check_passed_keeps_executable(temp_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_idea_contribution_differentiated_from_measurable_outcome(temp_db):
+    """P2-a (2026-08-28): expected_contribution states what the experiment
+    would establish (knowledge gain); it used to be the intervention's
+    measurable_outcome copied verbatim, which only names the metric."""
+    from app.agent.state import ResearchState
+    from app.db.models import ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=1)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    contribution = ("Establishes that separating stylistic from logical edits "
+                    "causally reduces functional regressions — a boundary "
+                    "condition for any correction-filtering method.")
+    llm = _ClusterMockLLM(cluster_response=None, plan_texts=atoms,
+                          idea_contribution=contribution)
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    idea = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).one()
+    assert idea.expected_contribution == contribution
+    assert idea.expected_contribution != interventions[0].measurable_outcome
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_idea_contribution_falls_back_when_plan_omits_it(temp_db):
+    """An empty idea_contribution field degrades to the intervention's
+    measurable_outcome — differentiation is preferred, never mandatory."""
+    from app.agent.state import ResearchState
+    from app.db.models import ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=1)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _ClusterMockLLM(cluster_response=None, plan_texts=atoms,
+                          idea_contribution="")
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    idea = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).one()
+    assert idea.expected_contribution == interventions[0].measurable_outcome
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_related_papers_reselected_by_mechanism_relevance(temp_db, monkeypatch):
+    """P2-b (2026-08-28): related_paper_ids come from the novelty check's
+    mechanism-relevant selection instead of the gap audit's neighbour set —
+    the neighbours are gap-relevant, not necessarily mechanism-relevant."""
+    from app.agent.state import ResearchState
+    from app.db.models import ResearchIdea
+
+    db = temp_db()
+    task, contract, gap, interventions, phenomenon = _seed(db, n_interventions=1)
+    prior_art = _seed_prior_art(db, title="Prior art touching the same mechanism")
+    _patch_retrieval(monkeypatch, prior_art.id)
+    atoms = _derive_scenario_atoms(gap, None, phenomenon)
+    llm = _NoveltyMockLLM(
+        cluster_response=None, plan_texts=atoms,
+        novelty_queries=["diff risk classifier correction filtering"],
+        novelty_verdict=IdeaNoveltyVerdictSchema(
+            already_implemented=False, evidence_paper_id=None,
+            mechanism_relevant_paper_ids=[prior_art.id],
+            rationale="Same mechanism family; not a direct implementation.",
+        ),
+    )
+    state = ResearchState(task_id=task.id, contract_id=contract.id,
+                          pipeline_version=2, current_round=1)
+
+    await generate_minimal_experiments(db, state, llm, task.id)
+
+    idea = db.query(ResearchIdea).filter(ResearchIdea.task_id == task.id).one()
+    related = json.loads(idea.related_paper_ids_json or "[]")
+    assert related == [prior_art.id], (
+        "the mechanism-relevant paper replaces the audit-neighbour inheritance"
+    )
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
     """Infrastructure failure (query generation raises) degrades to a trace and
     keeps the executable decision — an outage is not evidence about the idea."""
@@ -440,7 +527,7 @@ async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
 
 def test_policy_version_bumped():
     """The experiment policy version encodes the novelty-check rules."""
-    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v7"
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v8"
 
 
 def _plan(**overrides):
