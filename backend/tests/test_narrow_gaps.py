@@ -186,8 +186,13 @@ def test_re_auditing_a_gap_updates_the_neighbour_comparison_in_place(temp_db):
 
 
 def test_narrowing_is_capped(temp_db):
+    """A gap whose narrowing budget is exhausted is finalized as rejected — it
+    can never be confirmed and its "audited" status would otherwise keep it in
+    the runner's re-audit loop forever (task 94caca35: three consecutive
+    full audits, verdict unchanged, ~25 minutes wasted)."""
     from app.agent.state import ResearchState
     from app.agent.steps.narrow_gaps import MAX_NARROW_ATTEMPTS, narrow_audited_gaps
+    from app.db.models import AgentTrace
 
     db = temp_db()
     task, contract, gap = _seed_audited_gap(db, narrow_history=MAX_NARROW_ATTEMPTS)
@@ -195,7 +200,36 @@ def test_narrowing_is_capped(temp_db):
 
     assert _run(narrow_audited_gaps(db, state, task.id)) == []
     db.refresh(gap)
-    assert gap.status == "audited"
+    assert gap.status == "rejected"
+    trace = db.query(AgentTrace).filter(
+        AgentTrace.task_id == task.id,
+        AgentTrace.step_name == "narrow_gaps").one()
+    payload = json.loads(trace.output_json)
+    entry = payload["skipped"][0]
+    assert entry["reason"] == "NARROW_ATTEMPTS_EXHAUSTED"
+    assert entry["finalized_as"] == "rejected"
+    assert entry["final_reason"] == "narrow_budget_exhausted"
+    db.close()
+
+
+def test_delta_unchanged_gap_is_finalized(temp_db):
+    """A gap already narrowed to exactly the audit's remaining delta cannot be
+    narrowed again with the same input — finalize it instead of leaving it in
+    the re-audit pool."""
+    from app.agent.state import ResearchState
+    from app.agent.steps.narrow_gaps import narrow_audited_gaps
+
+    db = temp_db()
+    # The audit's remaining delta IS the gap's current claimed_delta.
+    delta = "固定预算下状态变化边界的量化评估仍未被任何近邻覆盖。"
+    task, contract, gap = _seed_audited_gap(db, remaining_delta=delta)
+    gap.claimed_delta = delta
+    db.commit()
+    state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=2)
+
+    assert _run(narrow_audited_gaps(db, state, task.id)) == []
+    db.refresh(gap)
+    assert gap.status == "rejected"
     db.close()
 
 

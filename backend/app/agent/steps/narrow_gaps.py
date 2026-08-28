@@ -127,6 +127,11 @@ async def narrow_audited_gaps(db, state: ResearchState, task_id: str, llm=None) 
     P0-2: `llm` is optional and only used for hedge distillation — a missing or
     failing LLM degrades to the pre-P0-2 verbatim behaviour, never blocks
     narrowing.
+    Spun-gap finalization (2026-08-28): a gap whose narrowing budget is
+    exhausted (or whose claim already equals the audit's remaining delta) can
+    neither be confirmed nor narrowed further, but its "audited" status keeps
+    it in the runner's re-audit loop forever. Such gaps are finalized as
+    rejected here, redirecting the remediation budget to fresh candidates.
     """
     gaps = db.query(GapCandidate).filter(
         GapCandidate.task_id == task_id,
@@ -166,13 +171,31 @@ async def narrow_audited_gaps(db, state: ResearchState, task_id: str, llm=None) 
                                 "fallback": "raw_hedge_kept"}
         attempts = _narrow_attempts(db, gap.id)
         if attempts >= MAX_NARROW_ATTEMPTS:
+            # 空转修复（2026-08-28，任务 94caca35）：额度耗尽而判决仍是
+            # partially_closed 时，该 gap 既无法确认也无法进一步收窄，但
+            # 留在 "audited" 状态会被 runner 的复审通道反复捞起重审——实测
+            # 同一 gap 连续三轮完整审计（每轮 ~11 分钟对抗检索），判决
+            # 0.9/0.85/0.85 零变化，25 分钟纯浪费。终态化为 rejected
+            # （复用 novelty_undecidable 的"无法定论"先例状态），复审通道
+            # 与 survivor 查询都不再捞它，remediation 预算转向挖掘新候选。
+            gap.status = "rejected"
+            gap.updated_at = _utcnow()
+            db.commit()
             skipped.append({"gap_id": gap.id, "reason": "NARROW_ATTEMPTS_EXHAUSTED",
-                            "attempts": attempts})
+                            "attempts": attempts, "finalized_as": "rejected",
+                            "final_reason": "narrow_budget_exhausted"})
             continue
         if (gap.claimed_delta or "").strip() == remaining:
             # Already narrowed to this delta and the audit still says partially
-            # closed: narrowing again would not change the input.
-            skipped.append({"gap_id": gap.id, "reason": "DELTA_UNCHANGED"})
+            # closed: narrowing again would not change the input. The claim is
+            # self-covered at this granularity — same spin risk as an exhausted
+            # budget, so finalize instead of leaving it in the re-audit pool.
+            gap.status = "rejected"
+            gap.updated_at = _utcnow()
+            db.commit()
+            skipped.append({"gap_id": gap.id, "reason": "DELTA_UNCHANGED",
+                            "finalized_as": "rejected",
+                            "final_reason": "claim_self_covered"})
             continue
 
         covered = (audit.nearest_neighbor_summary or "").strip()
