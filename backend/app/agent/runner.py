@@ -52,6 +52,7 @@ from app.agent.steps import (
 from app.agent.steps.analyze_papers import analyze_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION, compute_evidence_fingerprint
 from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION
+from app.agent.steps.generate_interventions import INTERVENTION_GENERATION_POLICY_VERSION
 from app.agent.steps.generate_minimal_experiments import EXPERIMENT_GENERATION_POLICY_VERSION
 from app.agent.steps.narrow_gaps import narrow_audited_gaps
 from app.llm.factory import get_llm
@@ -902,7 +903,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             # shrink the claim to it and re-audit before paying for another
             # remediation round of paper collection.
             if narrow_iterations < max_narrow_iterations:
-                narrowed = narrow_audited_gaps(db, state, task_id)
+                narrowed = await narrow_audited_gaps(db, state, task_id, llm=llm)
                 if narrowed:
                     narrow_iterations += 1
                     state.narrowing_passes = narrow_iterations
@@ -970,6 +971,10 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             "contract_id": state.contract_id,
             "pipeline_version": state.pipeline_version,
             "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+            # P0-1a (task d6f64087): intervention gate rules (novelty_confidence
+            # thresholds) now carry their own version — without it a rule change
+            # replayed cached tier-A interventions on resumed tasks forever.
+            "intervention_generation_policy_version": INTERVENTION_GENERATION_POLICY_VERSION,
         }, sort_keys=True).encode()).hexdigest()
         interventions = await phase_service.execute_phase(
             db, task_id, "generate_interventions", _generate_interventions_op,
@@ -1026,6 +1031,26 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         else:
             idea_ids = experiment_result.idea_ids
         if not idea_ids:
+            # P0-3 layer 3 (task d6f64087): a zero-idea outcome at this gate is
+            # usually a plan-generation consistency failure (scope/oracle gates
+            # rejecting uninformative rewrites), not proof the evidence is
+            # exhausted. Rejected clusters already surfaced
+            # research_direction_only ideas (generate_minimal_experiments), so
+            # the user keeps visibility either way. Before abstaining, spend a
+            # remediation round fetching experiment anchors (datasets /
+            # baselines / protocols) for the surviving gaps and retry the whole
+            # pipeline on the richer pool — the experiment policy version bump
+            # makes the plan phase actually re-run. Abstain only when the
+            # remediation budget is exhausted or retrieval makes no progress.
+            surviving_rows = [db.get(GapCandidate, gid) for gid in (state.surviving_gap_ids or [])]
+            gap_claims = [(g.claimed_delta or g.observed_problem or "")[:400]
+                          for g in surviving_rows if g]
+            service_families = [(g.observed_problem or g.claimed_delta or "")[:200]
+                                for g in surviving_rows if g]
+            if gap_claims and await _try_remediate(
+                    db, state, llm, task_id, "no_minimal_experiment_generated",
+                    context=gap_claims, service_families=service_families):
+                continue
             await _terminate_more_research(db, state, task_id,
                                            "abstained", "no_minimal_experiment_generated")
             return

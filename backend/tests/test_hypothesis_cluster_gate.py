@@ -440,7 +440,7 @@ async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
 
 def test_policy_version_bumped():
     """The experiment policy version encodes the novelty-check rules."""
-    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v6"
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v7"
 
 
 def _plan(**overrides):
@@ -497,18 +497,18 @@ def test_model_scope_conflict_generalized():
     plan = _plan(model_spec="Llama-3-8B-Instruct")
     failures = _validate_experiment_plan(plan, phenomenon=None, expected_atoms=[],
                                          gap_text="study small models under 7B parameters in code generation")
-    assert "MODEL_SCOPE_CONFLICT" in failures
+    assert any(f.startswith("MODEL_SCOPE_CONFLICT") for f in failures)
     # SLM keyword scope: defaults to a 7B cap.
     plan2 = _plan(model_spec="Llama-3-13B-Instruct")
     failures2 = _validate_experiment_plan(plan2, phenomenon=None, expected_atoms=[],
                                           gap_text="applies to small language models generating code")
-    assert "MODEL_SCOPE_CONFLICT" in failures2
+    assert any(f.startswith("MODEL_SCOPE_CONFLICT") for f in failures2)
     # Plural "SLMs" counts too (task 23ec8f20: gap target_setting said "SLMs or
     # static analyzers" while plans used Llama-3-8B).
     plan2b = _plan(model_spec="Llama-3-8B-Instruct")
     failures2b = _validate_experiment_plan(plan2b, phenomenon=None, expected_atoms=[],
                                            gap_text="Test-time self-correction using SLMs under compute budgets")
-    assert "MODEL_SCOPE_CONFLICT" in failures2b
+    assert any(f.startswith("MODEL_SCOPE_CONFLICT") for f in failures2b)
     # Within scope: 7B under a <7B cap is fine, and no scope wording means no check.
     plan3 = _plan()
     failures3 = _validate_experiment_plan(plan3, phenomenon=None, expected_atoms=[],

@@ -76,6 +76,20 @@ _REASON_PLAYBOOK: dict[str, tuple[str, list[str]]] = {
             "reproducible {topic}",
         ],
     ),
+    # P0-3 (task d6f64087): every experiment plan was rejected by the
+    # consistency gates (scope/oracle/scenario). The gap and interventions
+    # may be sound — the plan generator just needs concrete experimental
+    # anchors (datasets, baselines, protocols for the gap's setting) so the
+    # retry has real material to compose from instead of naming checkpoints
+    # that violate the scope cap.
+    "no_minimal_experiment_generated": (
+        "experiment_anchor",
+        [
+            "{topic} benchmark dataset",
+            "{topic} evaluation protocol",
+            "{topic} baseline comparison",
+        ],
+    ),
 }
 
 # Reasons that are eligible for remediation. Others (e.g. hard failures,

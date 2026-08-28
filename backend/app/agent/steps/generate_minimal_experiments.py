@@ -3,7 +3,7 @@
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
 
@@ -78,7 +78,20 @@ For dataset and baselines, be concrete enough to actually run:
 # statistics rule (McNemar/Wilcoxon/permutation/bootstrap for ratio metrics)
 # and model-scope rule up front so the feedback retry is not the model's
 # first exposure to them (v5 run: both retries rewrote t-test as t-test).
-EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v6"
+# v7 (2026-08-28, task d6f64087): rejection feedback is now actionable — the
+# failure strings carry the violating parameter count vs. the gap's cap and
+# the offending oracle text (a bare "MODEL_SCOPE_CONFLICT" code name left the
+# retry rewriting blind and failing twice on the same example); the retry
+# budget is 3 attempts; and clusters that still fail every attempt are
+# persisted as research_direction_only ideas (full rejected plan in the
+# trace) instead of vanishing — a 90-minute run previously ended with the
+# user seeing only "abstained" while two near-complete plans evaporated.
+EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v7"
+
+# P0-3: rejection-aware rewrite attempts per cluster. Two was too few once the
+# feedback became specific — one attempt burns on absorbing the feedback, the
+# model earns a second real rewrite. Bounded to keep the phase cheap.
+_PLAN_GENERATION_ATTEMPTS = 3
 
 # Initial calibration point; revisit against historical task annotations (P3)
 # before changing — cluster merges REDUCE idea counts, so false merges are the
@@ -440,9 +453,14 @@ class MinimalExperimentSchema(BaseModel):
 class MinimalExperimentResult:
     idea_ids: list[str]
     experiment_ids: list[str]
+    direction_only_idea_ids: list[str] = field(default_factory=list)
 
     def to_phase_payload(self) -> dict:
-        return {"idea_ids": self.idea_ids, "experiment_ids": self.experiment_ids}
+        return {
+            "idea_ids": self.idea_ids,
+            "experiment_ids": self.experiment_ids,
+            "direction_only_idea_ids": self.direction_only_idea_ids,
+        }
 
 
 def _derive_scenario_atoms(gap: GapCandidate, audit, phenomenon: GapPhenomenonPlan | None) -> list[str]:
@@ -521,7 +539,11 @@ def _validate_experiment_plan(
     failures.extend(_check_statistical_method(plan))
     oracle_text = plan.oracle.lower()
     if "llm" in oracle_text and not any(term in oracle_text for term in ("execution", "test", "static", "formal", "human", "hidden")):
-        failures.append("LLM_ONLY_ORACLE")
+        failures.append(
+            "LLM_ONLY_ORACLE: the oracle relies on an LLM's own judgement "
+            f"(oracle = \"{(plan.oracle or '')[:120]}\") — ground it in "
+            "execution outcomes, hidden test cases, formal verification or "
+            "human labels instead")
     return list(dict.fromkeys(failures))
 
 
@@ -552,31 +574,86 @@ def _check_statistical_method(plan: MinimalExperimentSchema) -> list[str]:
     return []
 
 
+# P1-2 (task d6f64087): role nouns that can carry a size cap. A gap like
+# "reward models (<3B)" bounds the RM, not the RLHF policy LLM — an RLHF
+# experiment legitimately pairs a <=3B RM with a larger policy model. The
+# scope check must bind each numeric parameter count in model_spec to the
+# role it belongs to instead of flagging every large number in the text.
+_SCOPE_ROLES = (
+    "reward model", "reward models", "policy model", "policy models",
+    "verifier", "judge", "critic", "ranker", "scorer", "detector",
+    "generator", "student", "teacher", "agent", "assistant",
+)
+_SCOPE_ROLE_RES = tuple(
+    (role, re.compile(rf"\b{re.escape(role)}s?\b"))
+    for role in _SCOPE_ROLES
+)
+
+
+def _role_in_window(text: str, start: int, roles: tuple | None = None) -> str | None:
+    """Return the closest role keyword appearing in the window [start-70, start)."""
+    window = text[max(0, start - 70):start]
+    best: str | None = None
+    best_pos = -1
+    for role, role_re in (roles or _SCOPE_ROLE_RES):
+        m = role_re.search(window)
+        if m and m.end() > best_pos:
+            best = role
+            best_pos = m.end()
+    return best
+
+
 def _check_model_scope(gap_text: str, model_spec: str) -> list[str]:
     """MODEL_SCOPE_CONFLICT (generalized): the gap bounds the model size — an
     explicit '<N b' style cap, or a 'small language model / SLM' scope — but the
     plan's model_spec names a strictly larger checkpoint. E2E 2026-08-26 review:
     scope '<7B' with experiments on Llama-3-8B. Conservative by design: only a
     numeric parameter count above the extracted cap (or the SLM default of 7B)
-    triggers; vague wording never does."""
+    triggers; vague wording never does.
+    P0-3 (task d6f64087): the failure string now names the violating parameter
+    count AND the cap so the rejection-aware retry can tell the model exactly
+    what to fix — a bare code name left it rewriting blind and failing twice
+    on the same "Llama-3-8B distilled" example.
+    P1-2 (task d6f64087): role-aware binding. When the cap's surrounding text
+    names a role ("reward models (<3B)"), only parameter counts bound to that
+    same role in model_spec are checked; numbers attached to a DIFFERENT role
+    (e.g. an 8B policy LLM in an RLHF setup) are exempt. No role anywhere
+    keeps the old global behaviour (conservative)."""
     text = (gap_text or "").lower()
     spec = (model_spec or "").lower()
     if not spec:
         return []
     cap: float | None = None
+    cap_role: str | None = None
     m = re.search(
         r"(?:<|<=|≤|under|below|smaller than|less than|up to)\s*(\d+(?:\.\d+)?)\s*b\b",
         text,
     )
     if m:
         cap = float(m.group(1))
+        cap_role = _role_in_window(text, m.start())
     elif re.search(r"\b(?:small language models?|small models?|slms?)\b", text):
         cap = 7.0
+        cap_role = _role_in_window(
+            text,
+            re.search(r"\b(?:small language models?|small models?|slms?)\b", text).start(),
+        )
     if cap is None:
         return []
-    for num in re.findall(r"\b(\d+(?:\.\d+)?)\s*b\b", spec):
-        if float(num) > cap:
-            return ["MODEL_SCOPE_CONFLICT"]
+    for num_m in re.finditer(r"\b(\d+(?:\.\d+)?)\s*b\b", spec):
+        num = float(num_m.group(1))
+        if num <= cap:
+            continue
+        num_role = _role_in_window(spec, num_m.start())
+        if cap_role and num_role and num_role != cap_role:
+            # The oversized checkpoint belongs to a different role than the
+            # capped one (e.g. policy LLM vs the <=3B reward model) — exempt.
+            continue
+        return [
+            f"MODEL_SCOPE_CONFLICT: model_spec cites {num:g}B at \"{spec[max(0, num_m.start()-40):num_m.end() + 10].strip()}\""
+            f" but the gap's scope caps {cap_role or 'models'} at {cap:g}B"
+            f" — every model serving that role must stay at or below {cap:g}B parameters"
+        ]
     return []
 
 
@@ -673,6 +750,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                         task_id[:8], len(stale))
     idea_ids = []
     experiment_ids = []
+    # P0-3 layer 2: rejected clusters persisted as research_direction_only
+    # ideas — surfaced to the user, never counted as executable output.
+    direction_only_idea_ids = []
     seen_titles: set[str] = set()
 
     # P2-A hypothesis-cluster gate: interventions of the SAME gap are grouped
@@ -741,7 +821,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             plan = None
             plan_failures: list[str] = []
             feedback = ""
-            for _attempt in range(2):
+            for _attempt in range(_PLAN_GENERATION_ATTEMPTS):
                 user_content = _MIN_EXPERIMENT_USER.format(
                     observed_problem=gap.observed_problem or "(not specified)",
                     remaining_delta=(audit.remaining_delta if audit else gap.claimed_delta) or "(not specified)",
@@ -780,21 +860,41 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 feedback = (
                     "\n\nYour previous plan was REJECTED by the quality gate:\n- "
                     + "\n- ".join(plan_failures)
-                    + "\n\nRewrite the plan so that: (1) every scenario atom listed above appears "
-                    "VERBATIM as a literal word in the dataset/model_spec/oracle/steps/"
+                    + "\n\nFix EVERY listed failure exactly as stated (codes name the offending "
+                    "value and the bound). Rewrite the plan so that: (1) every scenario atom listed "
+                    "above appears VERBATIM as a literal word in the dataset/model_spec/oracle/steps/"
                     "statistical_analysis/risks text (e.g. atom \"verifier\" requires the word "
                     "\"verifier\", not \"verification\"), (2) every required field is non-empty with "
                     ">=2 steps and explicit controls, and (3) the experiment genuinely exercises "
                     "the gap's scenario rather than merely naming it in scenario_atoms."
                 )
             if plan_failures:
-                plan_summary = {}
+                # P0-3 layer 2 + P1-3 (task d6f64087): a cluster that burned its
+                # retries no longer evaporates. The FULL rejected plan is traced
+                # (previously a 100-char summary made post-hoc debugging
+                # impossible — the role of the violating 8B checkpoint in the
+                # rejected model_spec could not be verified), and a
+                # research_direction_only idea is persisted so the user sees
+                # the near-complete direction plus exactly which gate withheld
+                # it, instead of a bare "abstained" terminal state.
+                rejected_plan_full = {}
                 if plan is not None:
-                    plan_summary = {
-                        "dataset": (plan.dataset or "")[:100],
-                        "model_spec": (plan.model_spec or "")[:100],
-                        "oracle": (plan.oracle or "")[:100],
-                        "steps": [s[:100] for s in (plan.steps or [])[:3]],
+                    rejected_plan_full = {
+                        "title": plan.title,
+                        "summary": plan.summary,
+                        "dataset": plan.dataset,
+                        "dataset_provenance": plan.dataset_provenance,
+                        "model_spec": plan.model_spec,
+                        "oracle": plan.oracle,
+                        "metrics": plan.metrics,
+                        "statistical_analysis": plan.statistical_analysis,
+                        "resource_budget": plan.resource_budget,
+                        "success_condition": plan.success_condition,
+                        "falsification_condition": plan.falsification_condition,
+                        "scenario_atoms": plan.scenario_atoms,
+                        "controls": plan.controls,
+                        "risks": plan.risks,
+                        "steps": plan.steps,
                     }
                 paper_repo.save_trace(db, task_id, "idea_quality_gate", "decision", output_data={
                     "gap_id": gap.id,
@@ -803,8 +903,55 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     "status": "rejected",
                     "reason_codes": plan_failures,
                     "retry_attempted": bool(feedback),
-                    "rejected_plan_summary": plan_summary,
+                    "rejected_plan_summary": {
+                        "dataset": (plan.dataset or "")[:100] if plan else "",
+                        "model_spec": (plan.model_spec or "")[:100] if plan else "",
+                        "oracle": (plan.oracle or "")[:100] if plan else "",
+                        "steps": [s[:100] for s in (plan.steps or [])[:3]] if plan else [],
+                    },
+                    "rejected_plan_full": rejected_plan_full,
                 })
+                if plan is not None and contract is not None:
+                    tier = getattr(intervention, "confidence_tier", "C") or "C"
+                    fallback_title = _normalize_idea_title(
+                        plan.title or (intervention.proposed_intervention or "")[:80])
+                    if fallback_title in seen_titles:
+                        mech = (intervention.failure_mechanism or "").strip()
+                        fallback_title = f"{fallback_title} — {mech[:40]}" if mech else f"{fallback_title} (2)"
+                    seen_titles.add(fallback_title)
+                    motivation = _build_idea_motivation(
+                        gap, intervention,
+                        evidence_claims=_load_gap_evidence_claims(db, gap.id))
+                    motivation += (
+                        "\n\n[research_direction_only] The experiment plan for this "
+                        "direction was drafted but rejected by the consistency gate "
+                        "after all retries. Blocking reasons: "
+                        + "; ".join(plan_failures[:6])
+                        + ". The full draft plan is preserved in the "
+                        "idea_quality_gate trace (rejected_plan_full)."
+                    )
+                    direction_idea = paper_repo.save_idea(db, task_id, {
+                        "title": fallback_title,
+                        "description": plan.summary or "(draft plan rejected by consistency gate)",
+                        "motivation": motivation,
+                        "method_sketch": (plan.idea_method or "").strip() or intervention.proposed_intervention,
+                        "expected_contribution": intervention.measurable_outcome,
+                        "related_paper_ids_json": json.dumps(paper_ids, ensure_ascii=False),
+                        "contract_id": contract.id,
+                        "gap_id": gap.id,
+                        "intervention_id": intervention.id,
+                        "pipeline_version": state.pipeline_version,
+                        "decision": "research_direction_only",
+                        "score_status": "unscored",
+                        "quality_reason_codes_json": json.dumps(
+                            ["PLAN_REJECTED_BY_CONSISTENCY_GATE"] + plan_failures[:8],
+                            ensure_ascii=False),
+                        "confidence_tier": tier,
+                    })
+                    direction_only_idea_ids.append(direction_idea.id)
+                    logger.info("Task %s: persisted rejected cluster as "
+                                "research_direction_only idea %s",
+                                task_id[:8], direction_idea.id[:8])
                 logger.warning("Task %s: experiment plan rejected by quality gate: %s", task_id[:8], plan_failures)
                 continue
 
@@ -954,7 +1101,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
         "experiment_count": len(experiment_ids),
     })
     db.commit()
-    return MinimalExperimentResult(idea_ids, experiment_ids)
+    return MinimalExperimentResult(idea_ids, experiment_ids, direction_only_idea_ids)
 
 
 from app.db.repositories import gap_repo
