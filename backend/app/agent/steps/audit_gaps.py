@@ -92,7 +92,13 @@ _AUDIT_TEXT_CONFLICT_RE = re.compile(
 # novelty_confidence capped at settings.audit_ceiling_novelty_cap. Killer
 # query terms are also terminology-expanded (community terms from neighbor
 # titles), so the vacuous-recall mode can actually recover on retry.
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v13"
+# v14 (2026-08-29, run10 review): diminishing-return stop — a more_search
+# loop whose verdict stays flat (novelty within 0.1) while the neighbors
+# barely move (Jaccard >= 0.5) is rejected with DIMINISHING_RETURN_STOP
+# instead of buying another full audit round. The exact-equality undecidable
+# guard never fired in run10 because every round added a few papers; the
+# loop then terminated only through the ceiling budget after ~2.5h.
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v14"
 
 
 # --- Canonical atomic claims (Phase 3H) ---
@@ -1151,6 +1157,59 @@ def _audit_input_repeats(previous: GapAudit | None, gap: GapCandidate,
         paper.id for paper in neighbors}
 
 
+# P1 (run10 review): diminishing-return stop thresholds. These are engineering
+# heuristics for "this audit loop has stopped learning", NOT scientific
+# thresholds — calibrate them on historical tasks if the loop trades too much
+# recall for budget.
+_DIMINISHING_NOVELTY_EPSILON = 0.1   # verdict improvement below this = flat
+_DIMINISHING_NEIGHBOR_JACCARD = 0.5  # neighbors mostly the same = no new input
+
+
+def _diminishing_return_stop(previous: GapAudit | None, gap: GapCandidate,
+                             decision, neighbors: list[Paper]) -> dict | None:
+    """P1 (run10 review): should this more_search verdict stop the loop?
+
+    Run10 (task 1ced462e) spent ~2.5h in audit rounds that alternated
+    confirmed->ceiling-downgrade->more_search while novelty stayed flat at 0.5
+    and every fresh round re-considered mostly the same neighbors. The exact-
+    equality undecidable guard never fired because each round did add a few
+    papers. This check answers the cheaper question: did the previous
+    more_search round actually buy anything?
+
+    Stops the loop when ALL hold:
+      1. the previous decided audit already asked for more_search (so this
+         would be at least the second retry);
+      2. the claim is unchanged (a narrowed gap deserves its re-audit);
+      3. the verdict did not improve (novelty within _EPSILON);
+      4. the neighbor set barely moved (Jaccard >= 0.5): the retrieval is
+         converging, not exploring.
+    Returns the stop metadata (for the audit record) or None to continue.
+    """
+    if previous is None or previous.recommended_action != "more_search":
+        return None
+    if previous.audited_claimed_delta is None:
+        return None
+    if previous.audited_claimed_delta != (gap.claimed_delta or ""):
+        return None
+    prev_novelty = previous.novelty_confidence
+    if prev_novelty is None or decision.novelty_confidence is None:
+        return None
+    if decision.novelty_confidence > prev_novelty + _DIMINISHING_NOVELTY_EPSILON:
+        return None
+    prev_nids = set(json.loads(previous.neighbor_paper_ids_json or "[]"))
+    cur_nids = {paper.id for paper in neighbors}
+    if not prev_nids or not cur_nids:
+        return None
+    jaccard = len(prev_nids & cur_nids) / len(prev_nids | cur_nids)
+    if jaccard < _DIMINISHING_NEIGHBOR_JACCARD:
+        return None
+    return {"prev_novelty": float(prev_novelty),
+            "novelty": float(decision.novelty_confidence),
+            "neighbor_jaccard": round(jaccard, 3),
+            "prev_neighbor_count": len(prev_nids),
+            "current_neighbor_count": len(cur_nids)}
+
+
 async def audit_gap_candidate(
     db,
     state: ResearchState,
@@ -1639,6 +1698,34 @@ async def audit_gap_candidate(
         db, task_id, gap, decision, failure_codes, killer_work, neighbors)
 
     action = decision.recommended_action
+    # P1 (run10 review): diminishing-return stop. The existing undecidable
+    # guard (above, before the LLM call) only fires when the neighbor set is
+    # EXACTLY unchanged — run10's more_search rounds always added papers, so
+    # it never fired and the loop terminated only through the ceiling budget
+    # (~2.5h of audits ending with no surviving gap). A loop whose verdict
+    # stops improving while the retrieval keeps converging to (mostly) the
+    # same neighbors is spending full audit rounds without buying
+    # information: stop it and spend the budget on gaps that can still be
+    # judged.
+    stop_meta = _diminishing_return_stop(
+        _latest_decided_audit(db, gap.id), gap, decision, neighbors)
+    if action == "more_search" and stop_meta:
+        decision.recommended_action = "reject"
+        decision.rejection_reason = (
+            "diminishing_return_stop: the previous more_search verdict did not "
+            f"improve (novelty {stop_meta['prev_novelty']:.2f} -> "
+            f"{stop_meta['novelty']:.2f}) and the fresh adversarial round "
+            f"converged to the same neighbors (Jaccard "
+            f"{stop_meta['neighbor_jaccard']:.2f}); further search rounds have "
+            "low expected information gain")
+        failure_codes.append("DIMINISHING_RETURN_STOP")
+        paper_repo.save_trace(db, task_id, "gap_audit_diminishing_return_stop",
+                              "decision", output_data={"gap_id": gap.id,
+                                                       **stop_meta})
+        logger.info("Gap %s: stopping more_search loop — verdict flat at %.2f, "
+                    "neighbor Jaccard %.2f", gap.id[:8], stop_meta["novelty"],
+                    stop_meta["neighbor_jaccard"])
+        action = "reject"
     if action == "continue" and decision.audit_result == "confirmed":
         # E2E 2026-08-26: text-verdict consistency guard. A confirmed/continue
         # decision whose own remaining_delta concludes "the decision is
