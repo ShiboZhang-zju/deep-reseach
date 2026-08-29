@@ -1986,6 +1986,40 @@ def _apply_audit_verdict_ceiling(db, task_id, gap, decision, failure_codes,
                        original_novelty, decision.novelty_confidence)
 
 
+def _killer_query_source_distribution(gap: GapCandidate, llm_terms: list[str],
+                                      expansion_meta: dict) -> dict:
+    """P1 (run8 review): cheap observability for killer-query composition.
+
+    The run8 failure mode was a query set built almost entirely from the
+    system's own coined phrase ("contamination velocity benchmark") — recall
+    was garbage, and 0 hits were misread as absence of the killer. To tell
+    whether _expand_killer_terms actually changed the query mix on the next
+    run, classify each executed term: neighbor-title phrases (mechanical
+    expansion), LLM terms whose tokens all appear in the gap's own text
+    (system-invented vocabulary), and the remaining LLM terms (community /
+    mechanism / evaluation vocabulary the field would actually use).
+    Classification is deliberately mechanical — no scoring, just counts.
+    """
+    gap_tokens = set(re.findall(
+        r"[a-z][a-z-]{2,}",
+        " ".join(filter(None, [
+            getattr(gap, "observed_problem", "") or "",
+            getattr(gap, "claimed_delta", "") or "",
+            getattr(gap, "testable_hypothesis", "") or "",
+        ])).lower()))
+    system_invented = 0
+    for term in llm_terms:
+        tokens = [t for t in term.lower().split() if len(t) >= 3]
+        if tokens and all(t in gap_tokens for t in tokens):
+            system_invented += 1
+    return {
+        "llm_provided_total": len(llm_terms),
+        "system_invented_terms": system_invented,
+        "neighbor_title_terms": len(expansion_meta.get("added") or []),
+        "community_or_mechanism_terms": len(llm_terms) - system_invented,
+    }
+
+
 async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
                              audit_round, perform_search: bool = True) -> dict:
     """One final adversarial search for the audit's own named killer (P1.2).
@@ -2025,6 +2059,10 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
     if expansion_meta.get("added"):
         record["expanded_query_terms"] = expanded_terms
         record["term_expansion"] = expansion_meta
+    # P1 observability: how the executed query mix is composed (system-invented
+    # vs community/mechanism vs neighbor-title vocabulary).
+    record["query_source_distribution"] = _killer_query_source_distribution(
+        gap, terms, expansion_meta)
     executions = []
     for term in expanded_terms[:settings.killer_search_max_queries]:
         query_record = save_search_query(
