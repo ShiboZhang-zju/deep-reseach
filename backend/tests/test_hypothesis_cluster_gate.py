@@ -124,6 +124,13 @@ class _ClusterMockLLM:
                 success_condition="regression rate drops significantly",
                 falsification_condition="no measurable regression difference",
                 risks=f"verifier environment flakiness: {text}",
+                construct_identification={
+                    "observed_variable": "Regression rate and pass@1 per filter arm",
+                    "claimed_construct": "Functional-regression risk of stylistic corrections",
+                    "identification_assumptions": ["Verifier outcomes reflect regressions"],
+                    "major_confounders": [],
+                    "required_control_or_oracle": "Execution engine verifier plus manual adjudication",
+                },
             )
         if name == "IdeaScore":
             return IdeaScore(novelty=0.7, feasibility=0.9, significance=0.7,
@@ -563,7 +570,7 @@ async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
 
 def test_policy_version_bumped():
     """The experiment policy version encodes the novelty-check rules."""
-    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v11"
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v12"
 
 
 def _plan(**overrides):
@@ -592,6 +599,13 @@ def _plan(**overrides):
         success_condition="Regression rate drops by >5% relative",
         falsification_condition="No significant difference",
         risks="Synthetic noise may not reflect real stylistic edits",
+        construct_identification={
+            "observed_variable": "Per-problem regression rate per filter arm",
+            "claimed_construct": "Functional-regression risk of stylistic corrections",
+            "identification_assumptions": ["Execution oracle flags regressions reliably"],
+            "major_confounders": [],
+            "required_control_or_oracle": "Python execution engine plus human adjudication",
+        },
     )
     base.update(overrides)
     return MinimalExperimentSchema(**base)
@@ -847,6 +861,13 @@ def _identity_plan(title, factor, operation, signature=None, contrast="self_vs_e
         controls=["same decoding budget"],
         steps=["inject stylistic noise", "run filtering arms"],
         risks="verifier flakiness",
+        construct_identification={
+            "observed_variable": "Per-arm regression rate and pass@1 delta",
+            "claimed_construct": "Functional-regression risk of stylistic corrections",
+            "identification_assumptions": ["Verifier outcomes reflect regressions"],
+            "major_confounders": [],
+            "required_control_or_oracle": "Execution engine verifier",
+        },
     )
 
 

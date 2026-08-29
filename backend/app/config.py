@@ -338,6 +338,28 @@ class Settings(BaseSettings):
     audit_neighbor_evidence_extraction: bool = True
     audit_neighbor_evidence_max_papers: int = 5
 
+    # P0-B (run8 review, task 03e0f59a): audit verdict ceiling — retrieval
+    # diagnostics recorded since P1.2 must CONSTRAIN the verdict, not merely
+    # document it. Run8 stamped confirmed/0.9 while its own diagnostics said
+    # search_confidence=INSUFFICIENT_OBSERVATION, zero neighbors carried
+    # verified full-text evidence, and the killer search recalled only 2
+    # off-topic papers (medical classification / video OCR) using the gap's
+    # self-invented terminology. A confirmed verdict requires an audit basis
+    # that could plausibly have found prior work.
+    # >= this many neighbors must carry verified full-text evidence.
+    audit_ceiling_min_fulltext_neighbors: int = 1
+    # Median family stability@20 below this + no cross-round validation
+    # (first audit) = unvalidated unstable retrieval.
+    audit_ceiling_stability_floor: float = 0.15
+    # A killer search that recalled fewer fresh papers than this tested
+    # nothing (its terms were too narrow to find ANY paper).
+    audit_ceiling_killer_min_recall: int = 3
+    # After the more_search budget is exhausted the gap may survive, but its
+    # novelty_confidence is capped here (weak survive, explicitly recorded).
+    audit_ceiling_novelty_cap: float = 0.6
+    # Max queries executed for the (terminology-expanded) killer search.
+    killer_search_max_queries: int = 6
+
     # P2-C idea-level novelty quick-check (generate_minimal_experiments):
     # retrieval against each hypothesis cluster's hypothesis + primary
     # mechanism. already_implemented verdicts demote the idea to

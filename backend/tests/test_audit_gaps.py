@@ -421,7 +421,7 @@ def _pin_admission_and_neighbors(monkeypatch, db, gap):
     returns different papers on every call.
     """
     from app.agent.steps import audit_gaps as module
-    from app.db.models import Paper, TaskPaper
+    from app.db.models import EvidenceUnit, Paper, TaskPaper
 
     neighbor = Paper(title="Neighbor B", abstract="Evaluates generic long-context recall.",
                      citation_count=20)
@@ -429,6 +429,13 @@ def _pin_admission_and_neighbors(monkeypatch, db, gap):
     db.flush()
     db.add(TaskPaper(task_id=gap.task_id, paper_id=neighbor.id, discovered_round=1,
                      final_score=0.8, priority="high"))
+    # P0-B verdict ceiling: a confirmed verdict requires at least one
+    # neighbor carrying verified full-text evidence, so the fixture must
+    # provide one (run8: confirmed/0.9 with zero fulltext evidence).
+    db.add(EvidenceUnit(task_id=gap.task_id, paper_id=neighbor.id,
+                        evidence_type="limitation",
+                        normalized_claim="No boundary evaluation under fixed budgets",
+                        verification_status="verified"))
     db.commit()
 
     admission = module.GapSearchAdmission(
@@ -895,7 +902,59 @@ async def test_killer_search_hit_degrades_confirmed_verdict(temp_db, monkeypatch
 @pytest.mark.asyncio
 async def test_killer_search_without_hits_keeps_verdict(temp_db, monkeypatch):
     """No match for the killer description: the verdict survives, and the
-    killer record still lands (the falsifier is now explicit and searchable)."""
+    killer record still lands (the falsifier is now explicit and searchable).
+
+    P0-B: the recall must be non-vacuous for this path — a killer search that
+    recalls nothing tested nothing, so the fixture recalls 3 non-matching
+    papers (>= audit_ceiling_killer_min_recall) that embed far from the
+    killer description."""
+    from app.agent.state import ResearchState
+    from app.agent.steps import audit_gaps as module
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.models import Paper
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
+
+    recalled = []
+    for i in range(3):
+        p = Paper(title=f"Unrelated retrieval result {i}",
+                  abstract="An unrelated study.", citation_count=1)
+        db.add(p)
+        recalled.append(p)
+    db.commit()
+
+    async def fake_search(db_, state_, executions, task_id_, round_):
+        return len(recalled), len(recalled), [p.id for p in recalled]
+
+    monkeypatch.setattr(module, "search_and_save_papers", fake_search)
+    monkeypatch.setattr(module.settings, "audit_score_retrieved_papers", False)
+    # Recalled papers embed orthogonally to the killer description: no hits.
+    import app.services.embedding_service as emb
+    monkeypatch.setattr(emb, "embed_texts",
+                        lambda texts: [[float(i == 0), 1.0] for i in range(len(texts))])
+    monkeypatch.setattr(emb, "cosine_similarity", lambda a, b: 0.0)
+
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+    results = await audit_gap_candidates(db, state, KillerSearchLLM(), task.id,
+                                         perform_search=True)
+
+    assert results[0].audit_result == "confirmed"
+    audit = gap_repo.list_gap_audits(db, gap.id)[-1]
+    killer = json.loads(audit.killer_work_json)
+    assert killer["retrieved_new_paper_count"] == 3
+    assert "KILLER_WORK_FOUND" not in json.loads(audit.failure_reason_codes_json)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_verdict_ceiling_vacuous_killer_recall_downgrades(temp_db, monkeypatch):
+    """P0-B (run8): a killer search recalling fewer papers than the minimum
+    tested nothing — its query terms could not find ANY paper, so 'no killer
+    found' is a retrieval artifact, not evidence of novelty. The verdict
+    downgrades to uncertain/more_search."""
     from app.agent.state import ResearchState
     from app.agent.steps import audit_gaps as module
     from app.agent.steps.audit_gaps import audit_gap_candidates
@@ -915,9 +974,120 @@ async def test_killer_search_without_hits_keeps_verdict(temp_db, monkeypatch):
     results = await audit_gap_candidates(db, state, KillerSearchLLM(), task.id,
                                          perform_search=True)
 
-    assert results[0].audit_result == "confirmed"
+    assert results[0].audit_result == "uncertain"
+    assert results[0].recommended_action == "more_search"
+    assert gap_repo.get_gap(db, gap.id).status != "surviving"
     audit = gap_repo.list_gap_audits(db, gap.id)[-1]
-    killer = json.loads(audit.killer_work_json)
-    assert killer["retrieved_new_paper_count"] == 0
-    assert "KILLER_WORK_FOUND" not in json.loads(audit.failure_reason_codes_json)
+    assert "KILLER_SEARCH_VACUOUS_RECALL" in json.loads(audit.failure_reason_codes_json)
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_verdict_ceiling_no_fulltext_evidence_downgrades(temp_db, monkeypatch):
+    """P0-B (run8): confirmed requires >= 1 neighbor with VERIFIED full-text
+    evidence. Run8 stamped confirmed/0.9 while all neighbor extractions
+    yielded nothing (no PDFs); abstract-only comparisons cannot rule out
+    method-level overlap, so the verdict downgrades to uncertain/more_search."""
+    from app.agent.state import ResearchState
+    from app.agent.steps import audit_gaps as module
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.models import EvidenceUnit, Paper
+    from app.db.repositories import gap_repo
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    _pin_admission_and_neighbors(monkeypatch, db, gap)
+    # Strip the verified evidence the fixture added — simulate the run8
+    # situation where PDF extraction yielded nothing for any neighbor.
+    db.query(EvidenceUnit).filter(EvidenceUnit.paper_id.isnot(None)).delete()
+    # A NON-vacuous killer search (3 recalls, no hits) so only the fulltext
+    # ceiling fires in this test.
+    recalled = []
+    for i in range(3):
+        p = Paper(title=f"Unrelated recall {i}", abstract="Unrelated.",
+                  citation_count=1)
+        db.add(p)
+        recalled.append(p)
+    db.commit()
+
+    async def fake_search(db_, state_, executions, task_id_, round_):
+        return len(recalled), len(recalled), [p.id for p in recalled]
+
+    monkeypatch.setattr(module, "search_and_save_papers", fake_search)
+    monkeypatch.setattr(module.settings, "audit_score_retrieved_papers", False)
+    import app.services.embedding_service as emb
+    monkeypatch.setattr(emb, "cosine_similarity", lambda a, b: 0.0)
+
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+    results = await audit_gap_candidates(db, state, ConfirmingAuditLLM(), task.id,
+                                         perform_search=True)
+
+    assert results[0].audit_result == "uncertain"
+    assert results[0].recommended_action == "more_search"
+    audit = gap_repo.list_gap_audits(db, gap.id)[-1]
+    assert "NO_FULLTEXT_NEIGHBOR_EVIDENCE" in json.loads(audit.failure_reason_codes_json)
+    coverage = json.loads(audit.search_coverage_json)
+    assert coverage["fulltext_neighbors_reviewed"] == 0
+    db.close()
+
+
+def test_killer_term_expansion_uses_neighbor_title_phrases(monkeypatch):
+    """P1 (run8): the killer query must never search only the gap's
+    self-invented terminology. Run8 queried "contamination velocity
+    benchmark" and recalled 2 off-topic papers (medical classification,
+    video OCR) while real killers used "benchmark half-life" /
+    "temporal leakage" vocabulary. Neighbor titles are the community
+    terminology source; phrases closest to the killer description win."""
+    from app.agent.steps.audit_gaps import _expand_killer_terms, _title_phrases
+    from app.db.models import Paper
+
+    # Title-phrase extraction: content bigrams only, no stopword edges.
+    phrases = _title_phrases(
+        "AI Benchmark Half-Life in Recursive Corpora: A Theory of Validity Decay")
+    assert "benchmark half-life" in phrases
+    assert "validity decay" in phrases
+    assert not any(p.startswith("a ") or p.endswith(" of") for p in phrases)
+
+    neighbors = [
+        Paper(title="AI Benchmark Half-Life in Recursive Corpora: "
+                    "A Theory of Validity Decay"),
+        Paper(title="The Temporal Gap in Static Benchmarks"),
+    ]
+    # Embedding ranks "temporal gap" closest to the killer description.
+    import app.services.embedding_service as emb
+
+    def fake_embed(texts):
+        return [[1.0, 0.0]] * len(texts)
+
+    def fake_cos(a, b):
+        return 1.0 if a[0] == b[0] else 0.0
+
+    monkeypatch.setattr(emb, "embed_texts", fake_embed)
+    monkeypatch.setattr(emb, "cosine_similarity", fake_cos)
+    from app.config import settings
+    monkeypatch.setattr(settings, "killer_search_max_queries", 6)
+
+    expanded, meta = _expand_killer_terms(
+        ["contamination velocity benchmark"], neighbors,
+        "A longitudinal study tracking benchmark validity decay")
+    # The self-invented term is kept, community phrases are appended.
+    assert expanded[0] == "contamination velocity benchmark"
+    assert len(expanded) > 1
+    assert meta["added"]
+
+
+def test_killer_term_expansion_fails_open(monkeypatch):
+    """Without embeddings the original LLM terms pass through unchanged."""
+    from app.agent.steps.audit_gaps import _expand_killer_terms
+    from app.db.models import Paper
+
+    def boom(texts):
+        raise RuntimeError("embedding service down")
+
+    import app.services.embedding_service as emb
+    monkeypatch.setattr(emb, "embed_texts", boom)
+    neighbors = [Paper(title="AI Benchmark Half-Life in Recursive Corpora")]
+    expanded, meta = _expand_killer_terms(
+        ["contamination velocity"], neighbors, "killer description")
+    assert expanded == ["contamination velocity"]
+    assert meta.get("degraded")

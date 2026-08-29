@@ -75,7 +75,7 @@ class ScriptedLLM:
             )])
         if schema.__name__ == "MinimalExperimentSchema":
             from app.agent.steps.generate_minimal_experiments import MinimalExperimentSchema
-            return MinimalExperimentSchema(title="State-change memory evaluation", summary="A minimal evaluation of state-change retention.", hypothesis="State changes reduce fixed-budget memory accuracy.", core_factor="episode state change", core_operation="toggle_state_change", core_contrast="stable_vs_changing", expected_signature="State-change episodes score lower than stable ones.", mechanism_being_tested="Fixed-budget memory does not re-prioritise after state changes.", dataset="A small existing state-change task subset", baselines="Existing memory baseline", metrics="State-change accuracy", model_spec="3B inference-only model", dataset_provenance="Existing task subset; verify source availability", oracle="Executable held-out tests plus manual adjudication", statistical_analysis="Paired bootstrap confidence interval", resource_budget="One CPU run within 30 minutes", scenario_atoms=["state change"], controls=["same budget"], steps=["Construct stable and state-change examples", "Compare the same memory baseline"], success_condition="The difference is measurable.", falsification_condition="No difference appears.")
+            return MinimalExperimentSchema(title="State-change memory evaluation", summary="A minimal evaluation of state-change retention.", hypothesis="State changes reduce fixed-budget memory accuracy.", core_factor="episode state change", core_operation="toggle_state_change", core_contrast="stable_vs_changing", expected_signature="State-change episodes score lower than stable ones.", mechanism_being_tested="Fixed-budget memory does not re-prioritise after state changes.", dataset="A small existing state-change task subset", baselines="Existing memory baseline", metrics="State-change accuracy", model_spec="3B inference-only model", dataset_provenance="Existing task subset; verify source availability", oracle="Executable held-out tests plus manual adjudication", statistical_analysis="Paired bootstrap confidence interval", resource_budget="One CPU run within 30 minutes", scenario_atoms=["state change"], controls=["same budget"], steps=["Construct stable and state-change examples", "Compare the same memory baseline"], success_condition="The difference is measurable.", falsification_condition="No difference appears.", construct_identification={"observed_variable": "State-change vs stable episode accuracy", "claimed_construct": "Fixed-budget memory state-change blind spot", "identification_assumptions": ["Held-out tests measure retention"], "major_confounders": [], "required_control_or_oracle": "Executable held-out tests plus manual adjudication"})
         if schema.__name__ == "IdeaScore":
             from app.schemas.schemas import IdeaScore
             return IdeaScore(novelty=0.8, feasibility=0.8, significance=0.8, evidence_support=0.8, differentiation=0.7, experimentability=0.9, potential_impact=0.8, risk=0.1, reason="Grounded in the confirmed state-change gap.")
@@ -123,6 +123,16 @@ async def test_opportunity_pipeline_is_lineage_safe_and_idempotent(temp_db, monk
         for index in range(3)
     ]
     db.add_all(neighbour_papers)
+    db.flush()
+    # P0-B verdict ceiling: the audit's admitted neighbours must include at
+    # least one paper carrying VERIFIED full-text evidence, otherwise the
+    # confirmed verdict is correctly downgraded and the pipeline never
+    # reaches the idea stage this E2E asserts.
+    db.add(EvidenceUnit(task_id=task.id, paper_id=neighbour_papers[0].id,
+                        evidence_type="limitation",
+                        normalized_claim="No state-change evaluation under fixed budgets",
+                        verification_status="verified",
+                        extraction_confidence=0.9))
     db.commit()
     neighbour_ids = [item.id for item in neighbour_papers]
 

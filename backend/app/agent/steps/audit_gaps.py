@@ -82,7 +82,17 @@ _AUDIT_TEXT_CONFLICT_RE = re.compile(
 # more_search (search-absence novelty, observed: surviving gap at 0.3 feeding
 # three tier-A interventions). Verdict rules changed, so previously stamped
 # audits must be invalidated on resume.
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v12"
+# v13 (2026-08-29, task 03e0f59a, run8 review): audit verdict ceiling — the
+# retrieval diagnostics recorded since v12 now CONSTRAIN the verdict. Run8
+# stamped confirmed/0.9 while search_confidence=INSUFFICIENT_OBSERVATION,
+# fulltext neighbor evidence=0, and a killer search that recalled 2 off-topic
+# papers (medical classification / video OCR) via the gap's self-invented
+# terms. First ceiling violations downgrade to uncertain/more_search (bounded
+# by the existing budget); after budget exhaustion the gap survives with
+# novelty_confidence capped at settings.audit_ceiling_novelty_cap. Killer
+# query terms are also terminology-expanded (community terms from neighbor
+# titles), so the vacuous-recall mode can actually recover on retry.
+GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v13"
 
 
 # --- Canonical atomic claims (Phase 3H) ---
@@ -257,7 +267,16 @@ direct hit — NOT a probability that the gap is novel. audit_result "confirmed"
 - closest_killer_work: describe the study that, if it existed, would DIRECTLY close
   this gap's claimed delta (concrete method + setting + comparison). This is the
   audit's own falsifier — name it honestly, even when you believe it does not exist.
-- killer_query_terms: 2-4 search terms that would find that killer work.
+- killer_query_terms: 2-6 search terms that would find that killer work, drawn from
+  DIFFERENT terminology sources. Real papers never use terms this system invented
+  for the gap, so at most ONE term may reuse the gap's own coined phrase. The rest
+  must use: (a) established COMMUNITY terminology for the underlying phenomenon
+  (the vocabulary the killer's authors would use — check the neighbor titles for
+  how the field actually names it), (b) MECHANISM terminology (what is measured or
+  manipulated, e.g. "training cutoff", "performance decay", not the gap's brand
+  name for it), (c) EVALUATION terminology (the protocol or benchmark family).
+  A query set that only searches the gap's self-invented phrase retrieves random
+  off-topic papers and proves nothing about the killer's absence.
 - killer_found: true only if one of the supplied neighbors IS that killer.
 - residual_uncertainty: what this audit could not rule out given the retrieval
   coverage you actually saw (e.g. "one abstract-only near neighbor left unread")."""
@@ -1610,6 +1629,15 @@ async def audit_gap_candidate(
                             "median_family_stability": diagnostics.median_family_stability,
                         })
 
+    # P0-B (run8 review): the verdict ceiling runs AFTER the union-convergence
+    # gate above — union convergence says "more queries would not change the
+    # Top-K", but says nothing about whether that Top-K is on-topic or backed
+    # by full-text evidence. Run8 converged to a stable set of off-topic
+    # neighbors and still stamped confirmed/0.9. Applies to both LLM-direct
+    # and claim-derived confirmed verdicts.
+    _apply_audit_verdict_ceiling(
+        db, task_id, gap, decision, failure_codes, killer_work, neighbors)
+
     action = decision.recommended_action
     if action == "continue" and decision.audit_result == "confirmed":
         # E2E 2026-08-26: text-verdict consistency guard. A confirmed/continue
@@ -1683,9 +1711,10 @@ async def audit_gap_candidate(
         "queries_executed": len(queries),
         "query_families": sorted({spec.family for spec in query_specs}),
         "closest_neighbors_reviewed": len(neighbors),
-        "fulltext_neighbors_reviewed": (
-            min(len(neighbors), settings.audit_neighbor_evidence_max_papers)
-            if settings.audit_neighbor_evidence_extraction else 0),
+        # P0-B fix: the REAL verified-evidence count, not the mechanical
+        # attempt bound. Run8 recorded 3 attempts / 0 successes while the
+        # snapshot alone read as compliant.
+        "fulltext_neighbors_reviewed": _neighbor_fulltext_evidence_count(db, neighbors),
         "candidate_pool_size": int(original_candidate_count or 0),
         "search_admission_status": admission.status,
     }
@@ -1759,6 +1788,204 @@ def _neighbor_verified_evidence(db, paper_id: str, limit: int = 2) -> list[Evide
     return units[:limit]
 
 
+def _neighbor_fulltext_evidence_count(db, neighbors: list[Paper]) -> int:
+    """Count neighbors carrying verified full-text evidence (P0-B signal).
+
+    The recorded search_coverage.fulltext_neighbors_reviewed is the mechanical
+    extraction ATTEMPT bound; the ceiling needs the real outcome — how many
+    neighbors actually have verified/upgraded evidence units. Run8 attempted 3
+    extractions and got 0 (no PDFs available), yet the coverage snapshot alone
+    would have read as compliant.
+    """
+    if not neighbors:
+        return 0
+    return db.query(EvidenceUnit.paper_id).filter(
+        EvidenceUnit.paper_id.in_([p.id for p in neighbors]),
+        EvidenceUnit.verification_status.in_(("verified", "upgraded")),
+    ).distinct().count()
+
+
+# P1 (run8 review): words that carry no retrieval signal in title phrases.
+_KILLER_TERM_STOPWORDS = {
+    "a", "an", "the", "of", "for", "in", "on", "to", "and", "with", "via",
+    "from", "by", "as", "at", "or", "is", "are", "how", "what", "why", "toward",
+    "towards", "using", "use", "used", "based", "study", "studies", "paper",
+    "titled", "something", "like",
+}
+
+
+def _title_phrases(title: str) -> list[str]:
+    """Content-word bigrams from a paper title (P1 killer-term expansion).
+
+    Neighbor titles are where the community's real terminology lives — e.g.
+    run8's pool contained "AI Benchmark Half-Life ... A Theory of Validity
+    Decay" and "The Temporal Gap in Static Benchmarks", whose phrases
+    ("benchmark half-life", "validity decay", "temporal gap") are exactly the
+    vocabulary a killer paper would use, and exactly what the gap's coined
+    phrase "contamination velocity" never matches.
+    """
+    words = re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", (title or "").lower())
+    phrases = []
+    for i in range(len(words) - 1):
+        w1, w2 = words[i], words[i + 1]
+        if w1 in _KILLER_TERM_STOPWORDS or w2 in _KILLER_TERM_STOPWORDS:
+            continue
+        if len(w1) < 4 or len(w2) < 4:
+            continue
+        phrases.append(f"{w1} {w2}")
+    return phrases
+
+
+def _expand_killer_terms(llm_terms: list[str], neighbors: list[Paper],
+                         killer_description: str) -> tuple[list[str], dict]:
+    """Terminology-expand the killer query set (P1, run8 review).
+
+    Complements the audit LLM's killer_query_terms (which gravitate to the
+    gap's self-invented vocabulary) with salient bigrams mined from the
+    neighbor titles — the community terminology a real killer paper would
+    actually be indexed under. Selection is embedding-based: phrases closest
+    to the killer description win. Fail-open: without embeddings, or when the
+    LLM already supplied enough terms, the original set passes through.
+    """
+    meta: dict = {"llm_terms": list(llm_terms), "added": []}
+    if not neighbors:
+        return llm_terms, meta
+    budget = settings.killer_search_max_queries - len(llm_terms)
+    if budget <= 0:
+        return llm_terms, meta
+    if not (killer_description or "").strip():
+        return llm_terms, meta
+
+    seen = {t.lower() for t in llm_terms}
+    candidates: list[str] = []
+    for paper in neighbors[:_MAX_NEIGHBORS]:
+        for phrase in _title_phrases(paper.title or ""):
+            if phrase.lower() not in seen:
+                candidates.append(phrase)
+                seen.add(phrase.lower())
+    if not candidates:
+        return llm_terms, meta
+
+    try:
+        from app.services import embedding_service
+
+        vectors = embedding_service.embed_texts(
+            [killer_description] + candidates)
+        scored = sorted(
+            zip(candidates, range(1, len(candidates) + 1)),
+            key=lambda pc: -embedding_service.cosine_similarity(
+                vectors[0], vectors[pc[1]]))
+        added = [phrase for phrase, _ in scored[:budget]]
+        meta["added"] = added
+        meta["candidate_count"] = len(candidates)
+        return llm_terms + added, meta
+    except Exception as exc:
+        logger.warning("Killer term expansion degraded (embedding unavailable): %s",
+                       exc)
+        meta["degraded"] = str(exc)[:200]
+        return llm_terms, meta
+
+
+def _apply_audit_verdict_ceiling(db, task_id, gap, decision, failure_codes,
+                                 killer_work: dict, neighbors: list[Paper]) -> None:
+    """P0-B (run8 review): retrieval diagnostics CONSTRAIN the verdict.
+
+    Diagnostics recorded since P1.2 (search coverage, NPA stability, killer
+    recall) were observability metadata — the auditor could say confirmed/0.9
+    while its own signals said the retrieval could not have found prior work.
+    Run8 (task 03e0f59a) did exactly that: search_confidence=
+    INSUFFICIENT_OBSERVATION, median stability@20 = 0.055 with every
+    non-exact family at 0.0, zero neighbors with full-text evidence, and a
+    killer search whose 2 recalls (medical classification, video OCR) were
+    off-topic garbage proving the query terms could not find ANY relevant
+    paper — let alone a killer.
+
+    Ceiling rules (only bind a confirmed verdict):
+      1. NO_FULLTEXT_NEIGHBOR_EVIDENCE — no neighbor carries verified
+         full-text evidence; abstract-only comparisons cannot rule out
+         method-level overlap.
+      2. UNVALIDATED_UNSTABLE_RETRIEVAL — first audit (cross-round stability
+         unmeasured) AND median family stability@20 below floor: the query
+         families each found disjoint paper sets, so the "converged" union
+         Top-K may simply be a stable set of off-topic papers.
+      3. KILLER_SEARCH_VACUOUS_RECALL — the killer search ran but recalled
+         fewer than the minimum fresh papers; it tested nothing.
+
+    First violations downgrade confirmed -> uncertain/more_search (bounded by
+    the existing family-instability more_search budget so the loop cannot
+    spin). Once that budget is exhausted the gap may survive, but
+    novelty_confidence is capped at settings.audit_ceiling_novelty_cap and the
+    ceiling codes are recorded — a weak survive that never reads as a bare
+    high-confidence confirmed.
+    """
+    from app.config import settings
+
+    if decision.audit_result != "confirmed":
+        return
+
+    ceiling_codes: list[str] = []
+    fulltext_count = _neighbor_fulltext_evidence_count(db, neighbors)
+    if fulltext_count < settings.audit_ceiling_min_fulltext_neighbors:
+        ceiling_codes.append("NO_FULLTEXT_NEIGHBOR_EVIDENCE")
+
+    diagnostics = _compute_npa_diagnostics(db, gap)
+    stability20 = diagnostics.stability_at_k.get(20)
+    if (diagnostics.cross_round_stability is None
+            and stability20 is not None
+            and stability20 < settings.audit_ceiling_stability_floor):
+        ceiling_codes.append("UNVALIDATED_UNSTABLE_RETRIEVAL")
+
+    killer_ran = ("retrieved_new_paper_count" in killer_work
+                  and not killer_work.get("search_degraded"))
+    if killer_ran and killer_work.get("retrieved_new_paper_count", 0) < settings.audit_ceiling_killer_min_recall:
+        ceiling_codes.append("KILLER_SEARCH_VACUOUS_RECALL")
+
+    if not ceiling_codes:
+        return
+
+    more_search_count = sum(
+        1 for a in gap_repo.list_gap_audits(db, gap.id)
+        if a.recommended_action == "more_search")
+    trace_data = {
+        "gap_id": gap.id,
+        "ceiling_codes": ceiling_codes,
+        "fulltext_neighbor_count": fulltext_count,
+        "stability_at_20": stability20,
+        "cross_round_stability": diagnostics.cross_round_stability,
+        "search_confidence": diagnostics.search_confidence,
+        "killer_recall": killer_work.get("retrieved_new_paper_count"),
+        "more_search_count": more_search_count,
+    }
+    if more_search_count < settings.family_instability_more_search_budget:
+        trace_data["downgraded_to"] = "uncertain"
+        decision.audit_result = "uncertain"
+        decision.recommended_action = "more_search"
+        decision.novelty_confidence = min(decision.novelty_confidence, 0.5)
+        decision.rejection_reason = (
+            "audit verdict ceiling: " + ", ".join(ceiling_codes)
+            + " — the retrieval basis could not plausibly have found prior "
+            "work; retry with better retrieval before claiming survival"
+        )
+        failure_codes.extend(ceiling_codes)
+        paper_repo.save_trace(db, task_id, "gap_audit_verdict_ceiling", "decision",
+                              output_data=trace_data)
+        logger.warning("Gap %s: verdict ceiling %s — downgrading confirmed->"
+                       "uncertain/more_search", gap.id[:8], ceiling_codes)
+    else:
+        trace_data["weak_survive"] = True
+        original_novelty = decision.novelty_confidence
+        decision.novelty_confidence = min(
+            decision.novelty_confidence, settings.audit_ceiling_novelty_cap)
+        failure_codes.extend(ceiling_codes)
+        failure_codes.append("VERDICT_CEILING_WEAK_SURVIVE")
+        paper_repo.save_trace(db, task_id, "gap_audit_verdict_ceiling", "decision",
+                              output_data=trace_data)
+        logger.warning("Gap %s: verdict ceiling %s — more_search budget "
+                       "exhausted; weak survive with novelty_confidence "
+                       "%.2f -> %.2f", gap.id[:8], ceiling_codes,
+                       original_novelty, decision.novelty_confidence)
+
+
 async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
                              audit_round, perform_search: bool = True) -> dict:
     """One final adversarial search for the audit's own named killer (P1.2).
@@ -1768,6 +1995,16 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
     embed close to the killer description count as hits (the caller degrades
     the verdict). Degraded infrastructure returns the record without hits —
     an outage is not evidence that the killer exists.
+
+    P1 (run8 review): the LLM's killer_query_terms are terminology-EXPANDED
+    before execution. Run8 searched only the gap's self-invented phrase
+    ("contamination velocity benchmark"), recalled 2 off-topic papers
+    (medical classification, video OCR), and concluded "no killer exists"
+    from a vacuous retrieval — the killer papers (longitudinal contamination,
+    post-cutoff decay, benchmark half-life) use community vocabulary that
+    never matches the coined term. Neighbor titles are the cheapest source
+    of real community terminology, so salient title phrases closest to the
+    killer description complement the LLM's terms.
     """
     terms = [t.strip() for t in (decision.killer_query_terms or []) if t.strip()]
     record = {
@@ -1783,8 +2020,13 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
     if not perform_search:
         record["skipped"] = "perform_search_disabled"
         return record
+    expanded_terms, expansion_meta = _expand_killer_terms(
+        terms, neighbors, decision.closest_killer_work or "")
+    if expansion_meta.get("added"):
+        record["expanded_query_terms"] = expanded_terms
+        record["term_expansion"] = expansion_meta
     executions = []
-    for term in terms[:4]:
+    for term in expanded_terms[:settings.killer_search_max_queries]:
         query_record = save_search_query(
             db, task_id, term, "gap_killer", None, None, audit_round,
             target_gap_id=gap.id, query_family="killer",

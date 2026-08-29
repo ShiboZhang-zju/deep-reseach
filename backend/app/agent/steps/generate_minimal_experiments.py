@@ -61,6 +61,31 @@ For dataset and baselines, be concrete enough to actually run:
   signature, or tested mechanism — the variable LAYER itself does NOT need to
   differ: two experiments on the same factor with different operations (e.g.
   swap_label vs remove_label) are complementary and both valuable.
+- CONSTRUCT IDENTIFICATION (required, the claim-to-evidence gap): the
+  observed variable is what the experiment DIRECTLY measures; the claimed
+  construct is what the final conclusion asserts. These are usually NOT the
+  same thing, and the distance between them is where invalid science lives:
+  a temporal decay of benchmark scores does not identify "contamination
+  velocity" (capability growth, knowledge recency, and item drift produce
+  the same signal); a Self/External label effect does not identify
+  "self-preference" (run7); a Kalman-smoothed score curve is still a score
+  curve. Fill construct_identification honestly:
+  * observed_variable: the quantity actually read out (e.g. "regression
+    slope of benchmark accuracy on item-publication-to-cutoff time gap").
+  * claimed_construct: the scientific concept the conclusion names (e.g.
+    "data contamination accumulation rate").
+  * identification_assumptions: every unverified assumption needed for the
+    observation to imply the construct (e.g. "score decay is contamination-
+    driven, not capability- or difficulty-driven").
+  * major_confounders: alternative explanations that would produce the SAME
+    observed signature (name them; an empty list asserts there are none).
+  * required_control_or_oracle: the control condition, matched comparison,
+    or ground-truth source that separates the construct from the confounders
+    (e.g. "matched clean-control items", "injected contamination dose").
+    Leave EMPTY ("") if no such control exists in this design.
+  If major_confounders is non-empty while required_control_or_oracle is
+  empty, the experiment can at most establish the observed phenomenon — the
+  pipeline will withhold the executable Idea tier accordingly.
 - STATISTICS: ratio-style paired metrics (pass rate, regression rate, accuracy,
   success rate, proportions) must be analyzed with McNemar's test, Wilcoxon
   signed-rank, a permutation test, or bootstrap confidence intervals — NEVER a
@@ -139,7 +164,21 @@ For dataset and baselines, be concrete enough to actually run:
 # "must differ at the variable layer" constraint is relaxed to "must differ
 # materially in manipulation/signature/mechanism" — complementary same-layer
 # designs are exactly what a factorial evidence chain needs.
-EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v11"
+# v12 (2026-08-29, run8 review): construct identification gate — run7's
+# claim/manipulation mismatch recurred in run8 as observed-signal/claimed-
+# construct mismatch: the surviving gap renamed "temporal benchmark score
+# decay" as "contamination velocity", the experiments measured the former
+# while claiming the latter (capability growth, knowledge recency, item
+# drift all produce the same signature), and the Kalman plan smoothed a
+# score curve and called it latent contamination. Every plan now declares
+# construct_identification (observed_variable / claimed_construct /
+# identification_assumptions / major_confounders / required_control_or_oracle).
+# A plan that names confounders but carries no control/oracle cannot be an
+# executable_candidate: it is demoted to research_direction_only with
+# UNCONTROLLED_CONFOUNDER, keeping the direction and the missing-control
+# diagnosis visible instead of stamping a construct the evidence cannot
+# identify.
+EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v12"
 
 # Sibling relation thresholds (run7 review round 2): per-field embedding
 # cosine bounds. These are workflow heuristics for relation triage, not
@@ -849,6 +888,41 @@ class InterventionTriageListSchema(BaseModel):
     triage: list[InterventionTriageItemSchema] = Field(default_factory=list)
 
 
+class ConstructIdentificationSchema(BaseModel):
+    """P0-A (run8 review): observed signal vs claimed construct, declared.
+
+    Run8's surviving gap renamed temporal score decay as "contamination
+    velocity"; the experiments observed the former while claiming the latter.
+    An observation implies a construct only through identification
+    assumptions, and every uncontrolled confounder is a live alternative
+    explanation for the same signature. Declaring the bridge makes it
+    auditable; the mechanical gate (confounders named + no control/oracle)
+    withholds the executable tier when the bridge cannot carry the claim.
+    """
+    observed_variable: str = Field(min_length=10)
+    claimed_construct: str = Field(min_length=5)
+    identification_assumptions: list[str] = Field(min_length=1)
+    major_confounders: list[str] = Field(default_factory=list)
+    # Empty string is a VALID assertion: "no control exists in this design".
+    # The gate treats confounders-without-control as non-executable, so the
+    # model cannot dodge by inventing a fake control.
+    required_control_or_oracle: str = ""
+
+
+def _construct_gate_verdict(ci: ConstructIdentificationSchema) -> str | None:
+    """P0-A (run8 review): the construct identification gate verdict.
+
+    Returns UNCONTROLLED_CONFOUNDER when the plan itself declares confounders
+    that produce the same observed signature but names no control, matched
+    comparison, or oracle separating them — the observation cannot carry the
+    claimed construct (run8: temporal score decay claimed as "contamination
+    velocity"; run7: Self/External label effect claimed as self-preference).
+    """
+    if ci.major_confounders and not (ci.required_control_or_oracle or "").strip():
+        return "UNCONTROLLED_CONFOUNDER"
+    return None
+
+
 class MinimalExperimentSchema(BaseModel):
     # P2-B: title names the concrete mechanism (no "Minimal Experiment:" prefix
     # — that prefix restates the gap topic and made sibling ideas read as
@@ -873,6 +947,8 @@ class MinimalExperimentSchema(BaseModel):
     core_contrast: str = Field(min_length=3)
     expected_signature: str = Field(min_length=10)
     mechanism_being_tested: str = Field(min_length=10)
+    # P0-A (run8 review): the observed->claimed construct bridge, required.
+    construct_identification: ConstructIdentificationSchema
     summary: str = Field(min_length=10)
     hypothesis: str = Field(min_length=10)
     dataset: str
@@ -1563,6 +1639,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             # novelty/feasibility/... as NULL. Reuse the V1 scoring prompt; even the
             # weak fallback model gives directional signal, and the graded tier keeps
             # the O1 A/B/C ranking on top of it.
+            # P0-A: extracted before the scoring try so the plan-level construct
+            # declaration survives a scoring failure path unchanged.
+            ci = plan.construct_identification
             try:
                 from app.agent.steps.generate_ideas import _score_idea
                 score = await _score_idea(db, state, llm, idea)
@@ -1586,6 +1665,30 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 if novelty_verdict == "already_implemented":
                     decision = "conditional_review"
                     quality_reason_codes.append("METHOD_ALREADY_PUBLISHED")
+                # P0-A (run8 review): construct identification gate. The plan
+                # itself declared which confounders produce the same observed
+                # signature and whether a control/oracle separates them. Naming
+                # confounders with no control means the observation cannot
+                # carry the claimed construct (run8: temporal score decay
+                # claimed as "contamination velocity") — withhold the
+                # executable tier, keep the direction visible with the
+                # missing-control diagnosis.
+                construct_code = _construct_gate_verdict(ci)
+                if construct_code:
+                    if decision == "executable_candidate":
+                        decision = "research_direction_only"
+                    quality_reason_codes.append(construct_code)
+                    idea.description = (
+                        (idea.description or plan.summary)
+                        + "\n\n[research_direction_only] Construct identification "
+                        "gate: the experiment observes '" + ci.observed_variable[:120]
+                        + "' while the claim asserts '" + ci.claimed_construct[:120]
+                        + "'. Declared confounders with no separating control or "
+                        "oracle: " + "; ".join(ci.major_confounders[:4])
+                        + ". Add a matched control, an injected-exposure oracle, or "
+                        "an equivalent identification design before promoting this "
+                        "to an executable experiment."
+                    )
                 # P2-b: re-select related work by mechanism relevance — the
                 # novelty check retrieved papers against the IDEA's mechanism,
                 # so its relevance-filtered ids beat the gap-audit neighbour set
@@ -1610,6 +1713,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     "status": decision,
                     "confidence_tier": tier,
                     "reason_codes": quality_reason_codes,
+                    "construct_identification": ci.model_dump(),
                 })
             except Exception as e:
                 idea.decision = "conditional_review"
@@ -1655,6 +1759,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     "core_contrast": plan.core_contrast,
                     "expected_signature": plan.expected_signature,
                     "mechanism_being_tested": plan.mechanism_being_tested,
+                    "construct_identification": ci.model_dump(),
                 }, ensure_ascii=False),
                 "risks": plan.risks,
             })

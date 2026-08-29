@@ -40,6 +40,13 @@ def _plan(**overrides):
         success_condition="The effect exceeds baseline variance.",
         falsification_condition="The effect is absent.",
         risks="The labels require audit.",
+        construct_identification={
+            "observed_variable": "False-negative rate per scenario arm",
+            "claimed_construct": "Scenario-dependence of verifier blind spots",
+            "identification_assumptions": ["The oracle labels errors reliably"],
+            "major_confounders": [],
+            "required_control_or_oracle": "Executable tests plus manual adjudication",
+        },
     )
     values.update(overrides)
     return MinimalExperimentSchema(**values)
@@ -136,3 +143,37 @@ def test_model_scope_check_exempts_boundary_study_gaps():
     spec_mixed = "Reward model Llama-3-8B."
     failures = _check_model_scope(gap_mixed, spec_mixed)
     assert any(f.startswith("MODEL_SCOPE_CONFLICT") for f in failures)
+
+
+def test_construct_gate_flags_uncontrolled_confounders():
+    """P0-A (run8 review): confounders named without a separating control or
+    oracle mean the observed signal cannot carry the claimed construct —
+    run8 measured temporal score decay while claiming "contamination
+    velocity" (capability growth, knowledge recency, item drift produce the
+    same signature). The gate must flag exactly that shape."""
+    from app.agent.steps.generate_minimal_experiments import (
+        ConstructIdentificationSchema, _construct_gate_verdict)
+
+    # The run8 shape: confounders declared, no control/oracle named.
+    run8 = ConstructIdentificationSchema(
+        observed_variable="Regression slope of benchmark accuracy on time gap",
+        claimed_construct="Data contamination accumulation rate",
+        identification_assumptions=["Score decay is contamination-driven"],
+        major_confounders=["capability growth", "knowledge recency",
+                           "item difficulty drift"],
+        required_control_or_oracle="",
+    )
+    assert _construct_gate_verdict(run8) == "UNCONTROLLED_CONFOUNDER"
+
+    # Declared confounders WITH a separating control: executable shape.
+    controlled = run8.model_copy(update={
+        "required_control_or_oracle": "Matched clean-control benchmark items"})
+    assert _construct_gate_verdict(controlled) is None
+
+    # No confounders declared (asserts there are none): clean pass.
+    clean = run8.model_copy(update={"major_confounders": []})
+    assert _construct_gate_verdict(clean) is None
+
+    # A whitespace-only control string must not dodge the gate.
+    blank = run8.model_copy(update={"required_control_or_oracle": "   "})
+    assert _construct_gate_verdict(blank) == "UNCONTROLLED_CONFOUNDER"
