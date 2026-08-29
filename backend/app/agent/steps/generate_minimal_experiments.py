@@ -85,7 +85,11 @@ For dataset and baselines, be concrete enough to actually run:
     Leave EMPTY ("") if no such control exists in this design.
   If major_confounders is non-empty while required_control_or_oracle is
   empty, the experiment can at most establish the observed phenomenon — the
-  pipeline will withhold the executable Idea tier accordingly.
+  pipeline will withhold the executable Idea tier accordingly. And whatever
+  control you NAME here must actually appear in the steps/controls of this
+  plan: naming "matched clean controls" without a matched-clean arm in the
+  steps is compliance theater and will also be withheld
+  (CONTROL_NOT_IMPLEMENTED).
 - STATISTICS: ratio-style paired metrics (pass rate, regression rate, accuracy,
   success rate, proportions) must be analyzed with McNemar's test, Wilcoxon
   signed-rank, a permutation test, or bootstrap confidence intervals — NEVER a
@@ -178,7 +182,14 @@ For dataset and baselines, be concrete enough to actually run:
 # UNCONTROLLED_CONFOUNDER, keeping the direction and the missing-control
 # diagnosis visible instead of stamping a construct the evidence cannot
 # identify.
-EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v12"
+# v13 (2026-08-29, run10 review): control implementation cross-check — a
+# declared control must appear in the design. The next gaming surface after
+# v12 is a schema-compliant string ("control for model capability") with no
+# matched arm in the steps; _control_implementation_check cross-validates
+# the declaration against steps/controls/contrast (token overlap, then
+# embedding similarity) and demotes unimplemented declarations with
+# CONTROL_NOT_IMPLEMENTED. Schema compliance is not scientific validity.
+EXPERIMENT_GENERATION_POLICY_VERSION = "experiment-consistency-v13"
 
 # Sibling relation thresholds (run7 review round 2): per-field embedding
 # cosine bounds. These are workflow heuristics for relation triage, not
@@ -921,6 +932,59 @@ def _construct_gate_verdict(ci: ConstructIdentificationSchema) -> str | None:
     if ci.major_confounders and not (ci.required_control_or_oracle or "").strip():
         return "UNCONTROLLED_CONFOUNDER"
     return None
+
+
+def _control_implementation_check(plan: "MinimalExperimentSchema",
+                                  ci: ConstructIdentificationSchema) -> str | None:
+    """P0 (run10 review): a declared control must be implemented, not named.
+
+    The run10 review flagged the next gaming surface: a model can satisfy the
+    construct schema by writing a control-looking string ("control for model
+    capability") while the design contains no corresponding arm. Schema
+    compliance is not scientific validity, so cross-check the DECLARED control
+    against the DESIGN: at least half its content tokens appear in
+    steps/controls/contrast, OR it embeds close enough to some step/control
+    segment. A declaration that fails both is compliance theater — the idea is
+    withheld from the executable tier with CONTROL_NOT_IMPLEMENTED.
+    """
+    control = (ci.required_control_or_oracle or "").strip()
+    if not control or not ci.major_confounders:
+        # Nothing declared to implement (the UNCONTROLLED_CONFOUNDER gate
+        # handles confounders-without-control separately).
+        return None
+    tokens = re.findall(r"[a-z][a-z-]{3,}", control.lower())
+    if not tokens:
+        return None
+    implementation_text = " ".join(filter(None, [
+        " ".join(plan.steps or []),
+        " ".join(plan.controls or []),
+        plan.core_contrast or "",
+        " ".join(plan.scenario_atoms or []),
+        plan.baselines or "",
+    ])).lower()
+    hits = sum(1 for t in tokens if t in implementation_text)
+    if hits >= max(1, int(len(tokens) * settings.construct_control_token_match_min)):
+        return None
+    # Token check failed: try the semantic route before rejecting — a design
+    # can implement "matched clean control items" as "equal-difficulty
+    # held-out problems never seen in training" without sharing vocabulary.
+    try:
+        from app.services import embedding_service
+
+        segments = [s for s in list(plan.steps or []) + list(plan.controls or [])
+                    if (s or "").strip()]
+        if segments:
+            vectors = embedding_service.embed_texts([control] + segments)
+            best = max(embedding_service.cosine_similarity(vectors[0], v)
+                       for v in vectors[1:])
+            if best >= settings.construct_control_embedding_min:
+                return None
+    except Exception:
+        # Embedding unavailable: the token check already ran; treat the miss
+        # as not-implemented (fail-closed — the demotion keeps the idea
+        # visible as a research direction, it does not delete it).
+        pass
+    return "CONTROL_NOT_IMPLEMENTED"
 
 
 class MinimalExperimentSchema(BaseModel):
@@ -1688,6 +1752,25 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                         + ". Add a matched control, an injected-exposure oracle, or "
                         "an equivalent identification design before promoting this "
                         "to an executable experiment."
+                    )
+                # P0 (run10 review): cross-field validation — a control the
+                # plan DECLARES must also be IMPLEMENTED in the design.
+                # Otherwise the schema string is compliance theater (run10
+                # review: "control for model capability" with no matched arm).
+                impl_code = _control_implementation_check(plan, ci)
+                if impl_code:
+                    if decision == "executable_candidate":
+                        decision = "research_direction_only"
+                    quality_reason_codes.append(impl_code)
+                    idea.description = (
+                        (idea.description or plan.summary)
+                        + "\n\n[research_direction_only] Control implementation "
+                        "gate: the construct declaration names the control '"
+                        + ci.required_control_or_oracle[:120]
+                        + "' but the experiment design (steps/controls/contrast) "
+                        "does not implement it. Either add the control arm to the "
+                        "steps or rename the declaration to what the design "
+                        "actually provides."
                     )
                 # P2-b: re-select related work by mechanism relevance — the
                 # novelty check retrieved papers against the IDEA's mechanism,

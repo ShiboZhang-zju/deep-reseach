@@ -570,7 +570,7 @@ async def test_novelty_check_degraded_never_demotes(temp_db, monkeypatch):
 
 def test_policy_version_bumped():
     """The experiment policy version encodes the novelty-check rules."""
-    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v12"
+    assert EXPERIMENT_GENERATION_POLICY_VERSION == "experiment-consistency-v13"
 
 
 def _plan(**overrides):

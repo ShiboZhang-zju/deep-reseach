@@ -360,6 +360,22 @@ class Settings(BaseSettings):
     # Max queries executed for the (terminology-expanded) killer search.
     killer_search_max_queries: int = 6
 
+    # P0 (run10 review): construct-declared control implementation check.
+    # A construct_identification that declares confounders AND names a
+    # control/oracle must actually implement it in the experiment design;
+    # otherwise the schema-complete string is compliance theater (run10
+    # review: "control for model capability" with no matched arm anywhere).
+    # The check is token-overlap first, embedding-similarity second; both
+    # are engineering heuristics for "the design references the control",
+    # NOT scientific thresholds — calibrate on historical tasks.
+    # >= this fraction of the control declaration's content tokens must
+    # appear in steps/controls/contrast (substring match, so "clean" hits
+    # "clean-control").
+    construct_control_token_match_min: float = 0.5
+    # Or: the control declaration must embed at least this similar to SOME
+    # step/control segment.
+    construct_control_embedding_min: float = 0.55
+
     # P2-C idea-level novelty quick-check (generate_minimal_experiments):
     # retrieval against each hypothesis cluster's hypothesis + primary
     # mechanism. already_implemented verdicts demote the idea to
