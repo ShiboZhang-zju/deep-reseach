@@ -936,16 +936,23 @@ def _construct_gate_verdict(ci: ConstructIdentificationSchema) -> str | None:
 
 def _control_implementation_check(plan: "MinimalExperimentSchema",
                                   ci: ConstructIdentificationSchema) -> str | None:
-    """P0 (run10 review): a declared control must be implemented, not named.
+    """P0 (run10 review): cross-field implementation CONSISTENCY gate.
 
-    The run10 review flagged the next gaming surface: a model can satisfy the
-    construct schema by writing a control-looking string ("control for model
-    capability") while the design contains no corresponding arm. Schema
-    compliance is not scientific validity, so cross-check the DECLARED control
-    against the DESIGN: at least half its content tokens appear in
-    steps/controls/contrast, OR it embeds close enough to some step/control
-    segment. A declaration that fails both is compliance theater — the idea is
-    withheld from the executable tier with CONTROL_NOT_IMPLEMENTED.
+    This is an implementation-presence heuristic: it checks that a control
+    the construct declaration NAMES is also REFERENCED by the experiment
+    design (steps/controls/contrast vocabulary). It does NOT verify that the
+    design causally implements the control — a plan that echoes the control's
+    words into its steps without building the arm can still pass. That gap is
+    expected; closing it needs structured control arms (matched_clean_arm /
+    treatment vs control groups), which stays out of scope until fresh-E2E
+    evidence shows models actually game the textual check.
+
+    The run10 review flagged the gaming surface this DOES close: a model
+    satisfying the construct schema by writing a control-looking string
+    ("control for model capability") while the design contains no
+    corresponding vocabulary at all — schema compliance is not scientific
+    validity, and a declaration with zero design references is compliance
+    theater. Returns CONTROL_NOT_IMPLEMENTED in exactly that case.
     """
     control = (ci.required_control_or_oracle or "").strip()
     if not control or not ci.major_confounders:

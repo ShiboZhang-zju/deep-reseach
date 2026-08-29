@@ -292,14 +292,16 @@ async def test_run10_unstable_retrieval_rejects_strong_verdict(temp_db, monkeypa
     db.close()
 
 
-def test_run10_diminishing_return_stop():
+def test_run10_diminishing_return_stop(temp_db):
     """A more_search loop whose verdict stays flat while the neighbors barely
     move must stop instead of buying another audit round (run10 spent ~2.5h
-    in exactly this loop)."""
+    in exactly this loop). The veto keeps the loop alive when the new churn
+    contains a killer hit or a strong-claim new neighbor."""
     from app.agent.steps.audit_gaps import _diminishing_return_stop
     from app.db.models import GapAudit, GapCandidate
     from app.db.models import Paper
 
+    db = temp_db()
     previous = GapAudit(
         gap_id="g1", task_id="t1", audit_result="uncertain",
         recommended_action="more_search", novelty_confidence=0.5,
@@ -307,30 +309,50 @@ def test_run10_diminishing_return_stop():
         neighbor_paper_ids_json=json.dumps(["p1", "p2", "p3", "p4", "p5"]),
         search_admission_status="PASS")
     gap = GapCandidate(task_id="t1", contract_id="c1", gap_type="capability",
-                       observed_problem="x", claimed_delta="A longitudinal framework",
+                       observed_problem="x", description="x",
+                       claimed_delta="A longitudinal framework",
                        status="auditing")
+    db.add(gap)
+    db.commit()
     decision = GapAuditDecisionSchema(
         audit_result="uncertain", recommended_action="more_search",
         remaining_delta="", novelty_confidence=0.5, audit_confidence=0.6)
     neighbors = [Paper(id=f"p{i}", title=f"N{i}", abstract="a")
                  for i in range(1, 7)]  # 5 of 6 shared -> Jaccard 0.83
 
-    meta = _diminishing_return_stop(previous, gap, decision, neighbors)
+    meta = _diminishing_return_stop(db, previous, gap, decision, neighbors)
     assert meta is not None
     assert meta["neighbor_jaccard"] >= 0.5
     assert meta["novelty"] <= meta["prev_novelty"] + 0.1
 
+    # Veto 1: a fresh killer hit reopens the loop.
+    assert _diminishing_return_stop(db, previous, gap, decision, neighbors,
+                                    killer_hits=[{"paper_id": "p6"}]) is None
+
+    # Veto 2: a new neighbor judged to make progress on the gap's claims
+    # (claim_overlap == "yes") reopens the loop.
+    from app.db.models import GapPaperRelevance
+
+    db.add(GapPaperRelevance(gap_id=gap.id, paper_id="p6", task_id="t1",
+                             relevance_score=0.9, problem_overlap="yes",
+                             mechanism_overlap="partial",
+                             evaluation_overlap="yes", claim_overlap="yes",
+                             rationale="Directly evaluates the claim"))
+    db.commit()
+    assert _diminishing_return_stop(db, previous, gap, decision, neighbors) is None
+
     # Verdict improving -> keep searching.
     improving = decision.model_copy(update={"novelty_confidence": 0.75})
-    assert _diminishing_return_stop(previous, gap, improving, neighbors) is None
+    assert _diminishing_return_stop(db, previous, gap, improving, neighbors) is None
 
     # Fresh neighbors (low Jaccard) -> keep searching.
     fresh = [Paper(id=f"q{i}", title=f"M{i}", abstract="a") for i in range(1, 6)]
-    assert _diminishing_return_stop(previous, gap, decision, fresh) is None
+    assert _diminishing_return_stop(db, previous, gap, decision, fresh) is None
 
     # Claim rewritten by narrowing -> the re-audit is warranted.
     narrowed = GapCandidate(task_id="t1", contract_id="c1", gap_type="capability",
-                            observed_problem="x",
+                            observed_problem="x", description="x",
                             claimed_delta="A narrowed longitudinal framework",
                             status="auditing")
-    assert _diminishing_return_stop(previous, narrowed, decision, neighbors) is None
+    assert _diminishing_return_stop(db, previous, narrowed, decision, neighbors) is None
+    db.close()

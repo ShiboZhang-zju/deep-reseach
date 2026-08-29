@@ -15,7 +15,8 @@ from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
 from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
 from app.agent.steps.gap_relevance import score_all_gap_candidates
-from app.db.models import (EvidenceUnit, GapAudit, GapCandidate, Paper, QuestionEvidenceLink,
+from app.db.models import (EvidenceUnit, GapAudit, GapCandidate, GapPaperRelevance,
+                          Paper, QuestionEvidenceLink,
                           SearchQueryPaper, SearchQueryRecord, SearchRawResult, TaskPaper)
 from app.db.repositories import gap_repo, paper_repo, task_repo
 from app.db.repositories.search_query_repo import save_search_query
@@ -1165,8 +1166,9 @@ _DIMINISHING_NOVELTY_EPSILON = 0.1   # verdict improvement below this = flat
 _DIMINISHING_NEIGHBOR_JACCARD = 0.5  # neighbors mostly the same = no new input
 
 
-def _diminishing_return_stop(previous: GapAudit | None, gap: GapCandidate,
-                             decision, neighbors: list[Paper]) -> dict | None:
+def _diminishing_return_stop(db, previous: GapAudit | None, gap: GapCandidate,
+                             decision, neighbors: list[Paper],
+                             killer_hits: list | None = None) -> dict | None:
     """P1 (run10 review): should this more_search verdict stop the loop?
 
     Run10 (task 1ced462e) spent ~2.5h in audit rounds that alternated
@@ -1182,7 +1184,12 @@ def _diminishing_return_stop(previous: GapAudit | None, gap: GapCandidate,
       2. the claim is unchanged (a narrowed gap deserves its re-audit);
       3. the verdict did not improve (novelty within _EPSILON);
       4. the neighbor set barely moved (Jaccard >= 0.5): the retrieval is
-         converging, not exploring.
+         converging, not exploring;
+      5. VETO — nothing in the new 30-50% of neighbors is actually
+         threatening: no fresh killer hit, and no new neighbor whose
+         claim_overlap is "yes" (relevance screen already judged it makes
+         progress on the gap's atomic claims). At Jaccard 0.5 the churn can
+         hide exactly the killer paper; do not spend the stop on it.
     Returns the stop metadata (for the audit record) or None to continue.
     """
     if previous is None or previous.recommended_action != "more_search":
@@ -1203,11 +1210,24 @@ def _diminishing_return_stop(previous: GapAudit | None, gap: GapCandidate,
     jaccard = len(prev_nids & cur_nids) / len(prev_nids | cur_nids)
     if jaccard < _DIMINISHING_NEIGHBOR_JACCARD:
         return None
+    # P1 veto (review round 3): a fresh killer hit always reopens the loop.
+    if killer_hits:
+        return None
+    new_nids = cur_nids - prev_nids
+    if new_nids:
+        strong_new = db.query(GapPaperRelevance).filter(
+            GapPaperRelevance.gap_id == gap.id,
+            GapPaperRelevance.paper_id.in_(new_nids),
+            GapPaperRelevance.claim_overlap == "yes",
+        ).count()
+        if strong_new:
+            return None
     return {"prev_novelty": float(prev_novelty),
             "novelty": float(decision.novelty_confidence),
             "neighbor_jaccard": round(jaccard, 3),
             "prev_neighbor_count": len(prev_nids),
-            "current_neighbor_count": len(cur_nids)}
+            "current_neighbor_count": len(cur_nids),
+            "new_neighbor_count": len(new_nids)}
 
 
 async def audit_gap_candidate(
@@ -1708,7 +1728,8 @@ async def audit_gap_candidate(
     # information: stop it and spend the budget on gaps that can still be
     # judged.
     stop_meta = _diminishing_return_stop(
-        _latest_decided_audit(db, gap.id), gap, decision, neighbors)
+        db, _latest_decided_audit(db, gap.id), gap, decision, neighbors,
+        killer_hits=(killer_work or {}).get("killer_hits") or [])
     if action == "more_search" and stop_meta:
         decision.recommended_action = "reject"
         decision.rejection_reason = (
