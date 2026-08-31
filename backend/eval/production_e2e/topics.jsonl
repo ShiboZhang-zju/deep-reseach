@@ -1,0 +1,24 @@
+{"topic_id": "pe2e-001", "stratum": "narrow_mature", "topic": "Context compression for retrieval-augmented generation with long documents"}
+{"topic_id": "pe2e-002", "stratum": "narrow_mature", "topic": "Speculative decoding for small language models"}
+{"topic_id": "pe2e-003", "stratum": "narrow_mature", "topic": "Catastrophic forgetting in parameter-efficient fine-tuning of large language models"}
+{"topic_id": "pe2e-004", "stratum": "narrow_mature", "topic": "Faithfulness of chain-of-thought prompting in arithmetic reasoning"}
+{"topic_id": "pe2e-005", "stratum": "narrow_mature", "topic": "Knowledge distillation from large to small language models"}
+{"topic_id": "pe2e-006", "stratum": "narrow_mature", "topic": "Model merging of task vectors for multi-task large language models"}
+{"topic_id": "pe2e-007", "stratum": "narrow_mature", "topic": "Position bias (lost-in-the-middle) in long-context language models"}
+{"topic_id": "pe2e-008", "stratum": "narrow_mature", "topic": "Hallucination detection via self-consistency sampling in LLMs"}
+{"topic_id": "pe2e-009", "stratum": "narrow_mature", "topic": "Data scaling laws for instruction tuning of language models"}
+{"topic_id": "pe2e-010", "stratum": "narrow_mature", "topic": "Retrieval-augmented code generation and automated program repair"}
+{"topic_id": "pe2e-011", "stratum": "narrow_mature", "topic": "Quantization error propagation in quantized LLM inference"}
+{"topic_id": "pe2e-012", "stratum": "narrow_mature", "topic": "Cross-lingual transfer of fine-tuned multilingual encoders"}
+{"topic_id": "pe2e-013", "stratum": "emerging_sparse", "topic": "Test-time training for adaptive inference in language models"}
+{"topic_id": "pe2e-014", "stratum": "emerging_sparse", "topic": "Diffusion language models for controllable text generation"}
+{"topic_id": "pe2e-015", "stratum": "emerging_sparse", "topic": "Mechanistic interpretability of mixture-of-experts routing decisions"}
+{"topic_id": "pe2e-016", "stratum": "emerging_sparse", "topic": "Self-improving multi-agent LLM systems without external verification"}
+{"topic_id": "pe2e-017", "stratum": "emerging_sparse", "topic": "Agentic reinforcement learning for tool use in LLMs"}
+{"topic_id": "pe2e-018", "stratum": "emerging_sparse", "topic": "Verbalized confidence calibration in small language models"}
+{"topic_id": "pe2e-019", "stratum": "broad_ambiguous", "topic": "How to improve the scientific discovery capability of large language models"}
+{"topic_id": "pe2e-020", "stratum": "broad_ambiguous", "topic": "Efficient multimodal foundation models"}
+{"topic_id": "pe2e-021", "stratum": "broad_ambiguous", "topic": "A general framework for AI alignment and safety"}
+{"topic_id": "pe2e-022", "stratum": "broad_ambiguous", "topic": "Sustainable and energy-efficient training of neural networks"}
+{"topic_id": "pe2e-023", "stratum": "broad_ambiguous", "topic": "Personalized education with AI tutors"}
+{"topic_id": "pe2e-024", "stratum": "broad_ambiguous", "topic": "General-purpose uncertainty quantification for deep learning"}
