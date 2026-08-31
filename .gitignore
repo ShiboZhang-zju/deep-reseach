@@ -55,6 +55,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# ===== Eval harness (benchmark clones, downloaded data, run outputs) =====
+backend/eval/benchmarks/
+backend/eval_results/
+
 # ===== Paper assets (downloaded PDFs / images) =====
 paper_assets/
 backend/paper_assets/
