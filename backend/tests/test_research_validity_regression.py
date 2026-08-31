@@ -1,6 +1,6 @@
-"""Research validity regression cases (run7 / run8 / run10).
+"""Research validity regression cases (run7 / run8 / run10 / run12).
 
-The three E2E runs each exposed a distinct scientific-validity failure that
+The E2E runs each exposed a distinct scientific-validity failure that
 the pipeline MUST NOT regress into. These cases pin the corresponding gates:
 
   run7 (task d6f64087): Self/External LABEL effect claimed as
@@ -16,6 +16,12 @@ the pipeline MUST NOT regress into. These cases pin the corresponding gates:
   run10 review: schema-compliant control declarations ("control for model
       capability") with no matched arm in the steps — compliance theater;
       and more_search loops that stop learning but keep buying audit rounds.
+
+  run12: a Granger-style temporal predictive relation claimed as a causal
+      mechanism — predictive precedence cannot identify causation while
+      latent common causes / reverse feedback / non-stationary trends
+      produce the same signature and no intervention or matched control
+      separates them (the idea was demoted by the construct gate).
 
 Run this file whenever prompts, models, or audit policies change. The thing
 being guarded is NOT "the code does not error" but "the system does not
@@ -176,6 +182,45 @@ def test_run8_temporal_decay_is_not_contamination_velocity():
             "Matched clean-control benchmark items plus injected "
             "contamination dose ladder",
     })
+    assert _construct_gate_verdict(rescued) is None
+
+
+# --------------------------------------------------------------------------
+# run12: Granger / temporal predictive relation != causal mechanism
+# --------------------------------------------------------------------------
+
+def test_run12_granger_predictive_relation_is_not_causal_mechanism():
+    """Run12's failure: an idea measured lagged predictive precedence
+    (Granger-style regressions) and claimed a causal mechanism. Temporal
+    precedence cannot carry a causal construct: latent common causes,
+    reverse feedback, and non-stationary trends yield the same signature,
+    and no intervention or matched control separates them — so the
+    construct gate must withhold (demote, keep the idea visible)."""
+    run12 = _ci(
+        observed_variable="Granger-style F-statistics / lagged predictive "
+                          "coefficients of X preceding Y",
+        claimed_construct="Causal effect of X on Y",
+        identification_assumptions=[
+            "X temporally preceding Y in predictive regressions implies "
+            "X causes Y"],
+        major_confounders=[
+            "latent common causes driving both series",
+            "reverse causality / feedback from Y to X",
+            "spurious correlation from non-stationary trends"],
+        required_control_or_oracle="",
+    )
+    assert _construct_gate_verdict(run12) == "UNCONTROLLED_CONFOUNDER"
+
+    # A design with real causal identification does carry the construct:
+    # randomized intervention on X (or a valid natural experiment) with
+    # matched controls on Y.
+    rescued = run12.model_copy(update={
+        "observed_variable": "Y difference between randomized-X intervention "
+                             "and matched no-intervention controls",
+        "required_control_or_oracle":
+            "Randomized intervention on X with matched controls (or a valid "
+            "instrument/natural experiment)"},
+    )
     assert _construct_gate_verdict(rescued) is None
 
 
