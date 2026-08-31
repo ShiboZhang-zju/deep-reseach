@@ -62,10 +62,18 @@ async def _run_researchbench_task(args, task: str) -> None:
 
     llm = get_llm()
     runner = rb.RUNNERS[task]
+    if task == "ranking":
+        ranking_kwargs = {
+            "ranking_policy": (rb.RANKING_POLICY_V2 if args.ranking_policy == "v2"
+                               else rb.RANKING_POLICY_V1)}
+        cfg.update({"ranking_policy": ranking_kwargs["ranking_policy"]})
+        run.write_config(cfg, overwrite=True)
+    else:
+        ranking_kwargs = {}
 
     async def run_one(sample: dict) -> dict:
         stats = CallStats()
-        out = await runner(sample, llm, stats)
+        out = await runner(sample, llm, stats, **ranking_kwargs)
         record = {
             "sample_id": str(sample.get("sample_id") or sample.get("source") or ""),
             "prediction": out["prediction"],
@@ -361,6 +369,9 @@ def build_parser() -> argparse.ArgumentParser:
     rb_parser.add_argument("--task", choices=["retrieval", "generation", "ranking", "all"],
                            default="all")
     rb_parser.add_argument("--split", choices=["tiny", "full"], default="tiny")
+    rb_parser.add_argument("--ranking-policy", choices=["v1", "v2"], default="v1",
+                           help="ranking judgment policy: v1=pairwise quality, "
+                                "v2=criterion-first (substance over packaging)")
     rb_parser.set_defaults(func=lambda args: asyncio.run(_run_researchbench(args)))
 
     rino_parser = sub.add_parser("rinobench", parents=[common],

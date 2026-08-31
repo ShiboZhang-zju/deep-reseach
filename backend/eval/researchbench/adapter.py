@@ -172,6 +172,27 @@ class PairwiseSelection(BaseModel):
     reason: str = ""
 
 
+class CandidateCriteria(BaseModel):
+    on_topic: bool = Field(description="directly addresses the research question's core problem")
+    grounded: bool = Field(
+        description="mechanisms/data/numbers are anchored and self-consistent; invented "
+                    "quantities, unsupported parameter claims, or methods asserted without "
+                    "basis are red flags")
+    mechanism_checkable: bool = Field(
+        description="names a causal mechanism one could actually check, not just a list of "
+                    "techniques or a goal statement")
+    falsifiable: bool = Field(
+        description="implies a concrete, distinguishable test or comparison")
+    note: str = ""
+
+
+class CriterionPairwiseSelection(BaseModel):
+    candidate_1: CandidateCriteria
+    candidate_2: CandidateCriteria
+    selection: Literal[1, 2]
+    reason: str = ""
+
+
 # --------------------------------------------------------------------------
 # Task A: retrieval (official candidate pool + official window protocol)
 # --------------------------------------------------------------------------
@@ -374,9 +395,30 @@ async def run_generation_sample(record: dict, llm, stats: CallStats | None = Non
 
 # --------------------------------------------------------------------------
 # Task C: ranking (official pairwise protocol + our pairwise prompt)
+#
+# V2 diagnosis (pre-registered before any prompt change, from the V1
+# Ranking-50 failure analysis):
+#   - gold wins only 14% of pairwise judgments (random baseline ~50%)
+#   - outcome is uncorrelated with negative source (fake 0.206 vs
+#     model-generated 0.256 gold-win rate) and with length (negatives are
+#     longer in 97.5% of WON and 99.9% of LOST comparisons — the dataset
+#     simply makes negatives longer)
+#   - manual reading of both-orders-lost comparisons shows negatives are
+#     "research-proposal style": framework lists, parameter formulas,
+#     invented quantified promises (">30%"), while gold hypotheses are
+#     compressed, hedged, but anchored claims from real papers
+#   => the judge weights PROPOSAL COMPLETENESS / SPECIFICITY THEATER over
+#      scientific substance (H-V2 confirmed, mechanism refined: not fluency).
+#
+# V2 = criterion-first discrimination: score both candidates on substance
+# criteria first (anchored mechanisms, falsifiability), explicitly ignore
+# packaging (length/detail volume/proposal completeness), then choose.
 # --------------------------------------------------------------------------
 
 _RANKING_SYSTEM = "You are an expert researcher judging the quality of research hypotheses."
+
+RANKING_POLICY_V1 = "ranking-pairwise-v1"
+RANKING_POLICY_V2 = "ranking-criterion-first-v2"
 
 
 def _ranking_prompt(research_question: str, candidate_1: str, candidate_2: str) -> str:
@@ -391,8 +433,39 @@ def _ranking_prompt(research_question: str, candidate_1: str, candidate_2: str) 
     )
 
 
+def _criterion_ranking_prompt(research_question: str, candidate_1: str, candidate_2: str) -> str:
+    return (
+        f"Research question:\n{research_question}\n\n"
+        "Two candidate research hypotheses:\n\n"
+        f"Candidate 1:\n{candidate_1}\n\n"
+        f"Candidate 2:\n{candidate_2}\n\n"
+        "Decide which is the stronger SCIENTIFIC hypothesis. Judge substance only.\n\n"
+        "IGNORE completely: length, writing style, formatting, how complete or "
+        "detailed the description is, presence of formulas/numbers/framework lists, "
+        "and how much it reads like a full research proposal. A longer, more "
+        "elaborate proposal is NOT a better hypothesis; real scientific hypotheses "
+        "are often short and hedged.\n\n"
+        "For EACH candidate judge:\n"
+        "1. on_topic — directly addresses the research question's core problem\n"
+        "2. grounded — its mechanisms/data/numbers are anchored and self-consistent; "
+        "invented quantities, unsupported parameter claims, or methods asserted "
+        "without basis are red flags\n"
+        "3. mechanism_checkable — names a causal mechanism one could actually check, "
+        "not just a list of techniques or a goal statement\n"
+        "4. falsifiable — implies a concrete, distinguishable test or comparison\n\n"
+        "Then choose the candidate whose CORE CLAIM is more scientifically defensible.\n\n"
+        'Output JSON: {"candidate_1": {"on_topic": <bool>, "grounded": <bool>, '
+        '"mechanism_checkable": <bool>, "falsifiable": <bool>, "note": "<one short '
+        'sentence>"}, "candidate_2": {...}, "selection": <1 or 2>, "reason": "<one '
+        'short sentence>"}'
+    )
+
+
 async def run_ranking_sample(record: dict, llm, stats: CallStats | None = None, *,
-                             order: str = "both") -> dict:
+                             order: str = "both",
+                             ranking_policy: str = RANKING_POLICY_V1) -> dict:
+    if ranking_policy not in (RANKING_POLICY_V1, RANKING_POLICY_V2):
+        raise ValueError(f"unknown ranking policy: {ranking_policy!r}")
     order_names = ["res", "fan_1_res"] if order == "both" else [order]
     negatives = (list(record.get("fake_negative_hypotheses") or [])
                  + list(record.get("model_negative_hypotheses") or []))
@@ -410,16 +483,23 @@ async def run_ranking_sample(record: dict, llm, stats: CallStats | None = None, 
                 candidate_1, candidate_2 = record["gold_hypothesis"], negative
             else:
                 candidate_1, candidate_2 = negative, record["gold_hypothesis"]
+            if ranking_policy == RANKING_POLICY_V2:
+                prompt = _criterion_ranking_prompt(
+                    record["research_question"], candidate_1, candidate_2)
+                schema = CriterionPairwiseSelection
+            else:
+                prompt = _ranking_prompt(
+                    record["research_question"], candidate_1, candidate_2)
+                schema = PairwiseSelection
             selection, reason, error = 1, "", None
             try:
                 result = await chat_json(
                     llm,
                     [
                         {"role": "system", "content": _RANKING_SYSTEM},
-                        {"role": "user",
-                         "content": _ranking_prompt(record["research_question"], candidate_1, candidate_2)},
+                        {"role": "user", "content": prompt},
                     ],
-                    PairwiseSelection,
+                    schema,
                     temperature=0.0,
                     stats=stats,
                 )
@@ -455,7 +535,8 @@ async def run_ranking_sample(record: dict, llm, stats: CallStats | None = None, 
         "orders": orders_out,
     }
     gold = {"gold_hypothesis": record.get("gold_hypothesis")}
-    return {"prediction": prediction, "gold": gold, "eval_extra": {"parse_failures": parse_failures}}
+    eval_extra = {"parse_failures": parse_failures, "ranking_policy": ranking_policy}
+    return {"prediction": prediction, "gold": gold, "eval_extra": eval_extra}
 
 
 RUNNERS = {

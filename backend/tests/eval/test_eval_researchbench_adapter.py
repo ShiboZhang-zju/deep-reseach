@@ -170,6 +170,55 @@ def test_ranking_parse_failure_defaults_to_1_like_official():
     assert fan["comparisons"][0]["selected"] == "negative"
 
 
+def test_ranking_v2_criterion_first_schema_and_policy_tag():
+    record = _ranking_record(9)
+    # v2 responses carry per-candidate criteria plus the final choice.
+    scripted = []
+    for _ in range(18):
+        scripted.append({
+            "candidate_1": {"on_topic": True, "grounded": True, "mechanism_checkable": True,
+                            "falsifiable": True, "note": "anchored"},
+            "candidate_2": {"on_topic": False, "grounded": False, "mechanism_checkable": False,
+                            "falsifiable": False, "note": "packaging"},
+            "selection": 1, "reason": "gold claim is defensible",
+        })
+    llm = FakeEvalLLM(scripted)
+    out = asyncio.run(rb.run_ranking_sample(record, llm, ranking_policy=rb.RANKING_POLICY_V2))
+    pred = out["prediction"]
+    assert out["eval_extra"]["ranking_policy"] == rb.RANKING_POLICY_V2
+    res, fan = pred["orders"]["res"], pred["orders"]["fan_1_res"]
+    # selection=1 everywhere: gold wins in res order (candidate_1), loses in fan order.
+    assert res["rank"] == 16 and res["gold_wins"] is True
+    assert fan["rank"] == 7 and fan["gold_wins"] is False
+    assert set(pred) >= {"sample_id", "model", "orders"}
+
+
+def test_ranking_v2_parse_failure_defaults_like_official():
+    record = _ranking_record(1)
+    llm = FakeEvalLLM([RuntimeError("bad json"), {"selection": 1, "reason": "r"}])
+    out = asyncio.run(rb.run_ranking_sample(record, llm, ranking_policy=rb.RANKING_POLICY_V2))
+    res = out["prediction"]["orders"]["res"]
+    assert res["comparisons"][0]["selection"] == 1
+    assert "error" in res["comparisons"][0]
+    assert out["eval_extra"]["parse_failures"]
+
+
+def test_ranking_v2_official_scorer_compatible():
+    if not (RESEARCHBENCH_DIR / "src").exists():
+        pytest.skip("official ResearchBench repo not cloned")
+    _score_retrieve, _score_generation, score_ranking = rb.load_official_scorers()
+    record = _ranking_record(9)
+    scripted = [{"candidate_1": {"on_topic": True, "grounded": True, "mechanism_checkable": True,
+                                 "falsifiable": True, "note": ""},
+                 "candidate_2": {"on_topic": False, "grounded": False, "mechanism_checkable": False,
+                                 "falsifiable": False, "note": ""},
+                 "selection": 1, "reason": "r"} for _ in range(18)]
+    llm = FakeEvalLLM(scripted)
+    pred = asyncio.run(rb.run_ranking_sample(record, llm, ranking_policy=rb.RANKING_POLICY_V2))["prediction"]
+    result = score_ranking([pred])
+    assert result["summary"]["overall_accuracy"] == pytest.approx(0.5)
+
+
 # ---------------------------- generation ----------------------------
 
 def test_generation_mechanical_pick_and_official_schema():
