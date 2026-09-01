@@ -1,19 +1,22 @@
-"""production_e2e_v1 — Independent Super Audit (design point 3).
+"""production_e2e_v1 — Independent Evaluation Procedure (design points 3 & 4).
 
+Terminology note (frozen): this is an *independent evaluation procedure*, NOT an
+independent retrieval corpus — OpenAlex / Semantic Scholar / arXiv overlap with
+the production data sources. What makes it independent enough for v1:
+  - a DIFFERENT prompt template (wider query families: exact / paraphrase /
+    adjacent-domain / survey-style),
+  - a fresh multi-source retrieval pass,
+  - human prior-art adjudication of the machine-found candidates.
 The production Gap Audit must NOT be re-run and called independent validation:
 it would share query family, retrieval sources, model preference and retrieval
 blind spots with the system under test — both could miss the same killer paper.
+Citation snowballing is deferred until the pilot shows the miss rate.
 
-This module instead freezes the three systems' outputs and searches for
-candidate "killer" prior art with:
-  - a DIFFERENT prompt template (wider query families: exact / paraphrase /
-    adjacent-domain / survey-style),
-  - multi-source retrieval (OpenAlex + Semantic Scholar + arXiv),
-  - (v1.1 TODO) citation snowballing from the idea's cited papers.
-
-It never makes the FULL/PARTIAL/NONE verdict itself: candidates go to
-human_review.md for cheap manual adjudication (only machine-found nearest
-prior art plus a small sample of "no killer found" controls).
+Blind review (design point 4): the human review sheet exposes ONLY
+research topic / claim / candidate prior art. System identity (A/B/C),
+target_type, topic stratum, V2 internal scores and production audit verdicts
+are hidden behind random submission_ids; mapping.json restores identities
+only after review. Order is shuffled.
 
 Usage:
     cd backend
@@ -26,13 +29,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
+import uuid
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from eval.common import CallStats, EvalRun
 from eval.config import DEFAULT_RESULTS_DIR, build_run_config
-from eval.production_e2e.baseline_direct import GENERATION_TEMPERATURE
 
 BENCHMARK = "production_e2e"
 MODE = "super_audit"
@@ -87,6 +91,8 @@ def _iter_targets(run_dirs: list[Path]):
                 rec = json.loads(line)
                 if rec.get("parse_status") not in (None, "ok"):
                     continue
+                if rec.get("protocol_flag"):
+                    continue  # protocol violations are not audited outcomes
                 if rec.get("decision") == "propose_idea" and rec.get("idea"):
                     idea = rec["idea"]
                     claim = idea.get("research_question") or idea.get("title") or ""
@@ -157,26 +163,38 @@ async def search_candidates(queries: list[str]) -> list[dict]:
     return candidates[:CANDIDATES_PER_TARGET]
 
 
-def human_review_row(target: dict, candidates: list[dict]) -> str:
+def blind_review_section(submission_id: str, topic: str, claim: str,
+                         candidates: list[dict]) -> str:
+    """Blind sheet: NO system identity, NO target_type, NO internal scores."""
     lines = [
-        f"## [{target['target_type']}] {target['system']} / {target['topic_id']}",
+        f"## Submission {submission_id}",
         "",
-        f"Claim: {target['claim']}",
+        f"Research topic: {topic or '(unspecified)'}",
         "",
-        "Candidate prior art (mark each: FULL / PARTIAL / NONE coverage of the claim):",
+        f"Claim under audit: {claim}",
+        "",
+        "For each candidate below, mark whether it already covers the claim:",
+        "FULL (implements the same mechanism for the same purpose) / "
+        "PARTIAL (overlapping but not the same) / NONE.",
         "",
     ]
     if not candidates:
-        lines.append("- (no candidates found — control sample: please judge the "
-                     "claim's novelty yourself)")
+        lines.append("- (no candidates found — control sample: judge from your "
+                     "own knowledge)")
     for idx, cand in enumerate(candidates, 1):
         lines.append(
             f"- [ ] {idx}. {cand['title']} ({cand.get('year') or 'n.d.'}, "
-            f"{cand.get('venue') or cand['source']}) — verdict: ____")
-    lines.append("")
-    lines.append("Overall verdict for this claim: [ ] false-open (already covered) "
-                 "/ [ ] genuinely open")
-    lines.append("")
+            f"{cand.get('venue') or cand['source']}) — FULL / PARTIAL / NONE: ____")
+    lines += [
+        "",
+        "Overall: does prior art already cover this claim (false-open)? [ ] yes [ ] no",
+        "Novelty of the claim vs the nearest prior art (1-5): ____",
+        "Feasibility of testing this claim as a research direction (1-5): ____",
+        "Credible as a research idea/direction? [ ] yes [ ] no",
+        "",
+        "---",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -197,49 +215,94 @@ async def _run(args) -> None:
             "systems": [str(p.resolve()) for p in run_dirs],
             "query_generation_temperature": 0.0,
             "candidates_per_target": CANDIDATES_PER_TARGET,
-            "independence": "different prompt template + multi-source retrieval; "
-                            "production query family NOT reused; FULL/PARTIAL/NONE "
-                            "verdict reserved for human review",
-            "citation_snowball": "TODO v1.1",
+            "independence": "independent evaluation procedure (NOT an independent "
+                            "retrieval corpus: sources overlap with production); "
+                            "different prompt template + fresh multi-source "
+                            "retrieval + human prior-art adjudication; production "
+                            "query family NOT reused",
+            "citation_snowball": "deferred until pilot shows the miss rate",
+            "blind_review": {
+                "shuffle_seed": args.shuffle_seed,
+                "hidden_fields": ["system", "target_type", "stratum",
+                                  "internal scores", "production audit verdicts"],
+                "protocol_flagged_samples": "excluded from audit",
+            },
         },
     )
     run.write_config(cfg, overwrite=True)
 
     llm = get_llm()
     targets = list(_iter_targets(run_dirs))
-    print(f"[super_audit] {len(targets)} audit targets "
-          f"({sum(1 for t in targets if t[4] == 'idea')} ideas, "
-          f"{sum(1 for t in targets if t[4] == 'gap')} surviving gaps)")
+    # Blind protocol: shuffle order, hide identities behind submission_ids.
+    random.Random(args.shuffle_seed).shuffle(targets)
+    submissions = []
+    for system, topic_id, topic, claim, target_type in targets:
+        submissions.append({
+            "submission_id": uuid.uuid4().hex[:12],
+            "system": system,
+            "topic_id": topic_id,
+            "target_type": target_type,
+            "claim": claim,
+            "_topic": topic,
+        })
+    print(f"[super_audit] {len(submissions)} audit targets "
+          f"({sum(1 for s in submissions if s['target_type'] == 'idea')} ideas, "
+          f"{sum(1 for s in submissions if s['target_type'] == 'gap')} surviving gaps), "
+          f"shuffled with seed={args.shuffle_seed}")
 
     candidates_path = run.dir / "candidate_killer_papers.jsonl"
-    review_md = ["# Super Audit — human review sheet",
-                 "",
-                 "Mark each candidate FULL / PARTIAL / NONE; then the overall verdict.",
-                 "FULL = the candidate already implements the claimed mechanism+purpose.",
-                 ""]
-    for idx, (system, topic_id, topic, claim, target_type) in enumerate(targets):
+    review_md = [
+        "# Super Audit — BLIND human review sheet",
+        "",
+        "Review each submission WITHOUT knowing which system produced it.",
+        "Fill every field; identities are restored automatically afterwards.",
+        "",
+        "",
+    ]
+    template_path = run.dir / "human_verdicts.jsonl"
+    for idx, sub in enumerate(submissions):
         stats = CallStats()
-        print(f"[{idx+1}/{len(targets)}] ({target_type}) {system}/{topic_id}")
+        print(f"[{idx+1}/{len(submissions)}] {sub['submission_id']}")
         try:
-            queries = await gen_queries(llm, topic, claim, stats)
+            queries = await gen_queries(llm, sub["_topic"], sub["claim"], stats)
             candidates = await search_candidates(queries.queries)
         except Exception as exc:  # per-target isolation
             print(f"    FAILED: {type(exc).__name__}: {exc}")
             candidates = []
             queries = AuditQueries(queries=[])
-        target_record = {
-            "system": system, "topic_id": topic_id, "topic": topic,
-            "target_type": target_type, "claim": claim,
-            "queries": queries.queries,
-            "candidate_papers": candidates,
-            "llm": stats.as_dict(),
-        }
+        sub["queries"] = queries.queries
+        sub["candidate_papers"] = candidates
+        sub["llm"] = stats.as_dict()
         with candidates_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(target_record, ensure_ascii=False, default=str) + "\n")
-        review_md.append(human_review_row(target_record, candidates))
-    (run.dir / "human_review.md").write_text("\n".join(review_md), encoding="utf-8")
+            fh.write(json.dumps(sub, ensure_ascii=False, default=str) + "\n")
+        review_md.append(blind_review_section(
+            sub["submission_id"], sub["_topic"], sub["claim"], candidates))
+        # Fill-in template: reviewer edits the nulls, keyed by submission_id only.
+        with template_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "submission_id": sub["submission_id"],
+                "false_open": None,
+                "novelty": None,
+                "feasibility": None,
+                "credible": None,
+                "notes": "",
+            }, ensure_ascii=False) + "\n")
+
+    # Identity mapping: DO NOT share with the reviewer before review is done.
+    mapping = {
+        "shuffle_seed": args.shuffle_seed,
+        "submissions": [
+            {k: s[k] for k in ("submission_id", "system", "topic_id",
+                               "target_type", "claim")}
+            for s in submissions
+        ],
+    }
+    (run.dir / "submission_mapping.json").write_text(
+        json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    (run.dir / "human_review_blind.md").write_text("\n".join(review_md), encoding="utf-8")
     print(f"[super_audit] run dir: {run.dir}")
-    print(f"[super_audit] next: fill human_review.md verdicts, then run evaluate.py")
+    print("[super_audit] next: fill human_verdicts.jsonl from human_review_blind.md "
+          "(keyed by submission_id), then run evaluate.py --audit-dir")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -247,6 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--systems", nargs="+", required=True,
                         help="run dirs of the three systems (predictions.jsonl required)")
+    parser.add_argument("--shuffle-seed", type=int, default=42)
     parser.add_argument("--output-dir", default=None)
     return parser
 

@@ -46,10 +46,15 @@ DEFAULT_TIMEOUT_S = 3 * 3600  # 3h per topic; a full run is 20-60 min
 PAPERS_PAGE_LIMIT = 200
 
 # Statuses that mean "run finished, outcome collectable". waiting_for_clarification
-# is handled inside the poll loop (auto-answer, at most once per topic).
+# is handled inside the poll loop per the frozen clarification protocol.
 AUTO_CLARIFY_ANSWER = (
     "No further clarification is needed. Please research this direction as stated."
 )
+# Frozen fairness protocol (README design point 1): the 24 topics are pre-registered
+# to be specific enough. If Full V2 still asks for clarification, that sample is
+# flagged as a protocol violation and gets NO auto-generated extra information —
+# auto-answering would hand V2 a better problem definition than Baselines A/B get.
+CLARIFY_POLICIES = ("protocol_violation", "auto_answer")
 
 
 class ApiClient:
@@ -104,6 +109,16 @@ class ApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_interventions(self, task_id: str) -> list[dict]:
+        resp = self._client.get(f"/tasks/{task_id}/interventions")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_traces(self, task_id: str) -> list[dict]:
+        resp = self._client.get(f"/tasks/{task_id}/traces")
+        resp.raise_for_status()
+        return resp.json()
+
     def get_experiments(self, task_id: str) -> list[dict]:
         resp = self._client.get(f"/tasks/{task_id}/experiments")
         resp.raise_for_status()
@@ -117,7 +132,7 @@ class ApiClient:
 
 
 def run_one_topic(api: ApiClient, sample: dict, poll_interval: float,
-                  timeout_s: float) -> dict:
+                  timeout_s: float, clarify_policy: str) -> dict:
     """Drive one production task to a terminal state; returns the collection dict."""
     topic_id = sample["topic_id"]
     task = api.create_task(sample["topic"])
@@ -125,17 +140,24 @@ def run_one_topic(api: ApiClient, sample: dict, poll_interval: float,
     api.start_task(task_id)
 
     clarified = False
+    protocol_flag: str | None = None
     started = time.perf_counter()
     status = "unknown"
     while True:
         time.sleep(poll_interval)
         task = api.get_task(task_id)
         status = str(task.get("status") or "unknown")
-        if status == "waiting_for_clarification" and not clarified:
-            # Auto-answer once: the E2E protocol treats the topic text as final.
-            api.clarify(task_id, [AUTO_CLARIFY_ANSWER])
-            clarified = True
-            continue
+        if status == "waiting_for_clarification":
+            if clarify_policy == "auto_answer" and not clarified:
+                # Pilot-observation mode ONLY: auto-answering hands V2 a better
+                # problem definition than Baselines A/B get — never use for the
+                # frozen 24-topic run.
+                api.clarify(task_id, [AUTO_CLARIFY_ANSWER])
+                clarified = True
+                continue
+            # Frozen protocol (design point 1): flag and stop, no extra info.
+            protocol_flag = "clarification_triggered"
+            break
         if status in TERMINAL_STATUSES:
             break
         if (time.perf_counter() - started) > timeout_s:
@@ -147,10 +169,40 @@ def run_one_topic(api: ApiClient, sample: dict, poll_interval: float,
             break
     wall_clock_s = int(time.perf_counter() - started)
 
+    if protocol_flag:
+        # Flagged sample: do not treat it as a system outcome; record minimal info.
+        return {
+            "task_id": task_id,
+            "final_status": status,
+            "stop_reason": task.get("stop_reason"),
+            "wall_clock_s": wall_clock_s,
+            "clarified_once": clarified,
+            "protocol_flag": protocol_flag,
+            "ideas": [],
+            "gaps": [],
+            "experiments": [],
+            "papers": [],
+            "interventions": [],
+            "llm_tokens_used_total": None,
+            "trace_count": None,
+        }
+
     ideas = api.get_ideas(task_id)
     gaps = api.get_gaps(task_id)
     experiments = api.get_experiments(task_id)
     papers = api.get_papers(task_id)
+    interventions = api.get_interventions(task_id)
+    # Best-effort LLM accounting from traces (tokens summed; trace count is a
+    # step-level proxy, NOT the LLM call count — documented cost caveat).
+    llm_tokens_used_total: int | None = None
+    trace_count: int | None = None
+    try:
+        traces = api.get_traces(task_id)
+        trace_count = len(traces)
+        llm_tokens_used_total = sum(
+            int(t.get("llm_tokens_used") or 0) for t in traces)
+    except Exception:
+        pass
 
     return {
         "task_id": task_id,
@@ -158,10 +210,14 @@ def run_one_topic(api: ApiClient, sample: dict, poll_interval: float,
         "stop_reason": task.get("stop_reason"),
         "wall_clock_s": wall_clock_s,
         "clarified_once": clarified,
+        "protocol_flag": protocol_flag,
         "ideas": ideas,
         "gaps": gaps,
         "experiments": experiments,
         "papers": papers,
+        "interventions": interventions,
+        "llm_tokens_used_total": llm_tokens_used_total,
+        "trace_count": trace_count,
     }
 
 
@@ -186,22 +242,36 @@ def map_final_idea(idea: dict, experiments: list[dict]) -> FinalIdea:
 
 def to_prediction_record(sample: dict, collected: dict) -> dict:
     ideas = collected["ideas"] or []
+    gaps = collected["gaps"] or []
+    interventions = collected.get("interventions") or []
+    gap_status_counts = _count_by(gaps, "status")
     extra = {
         "task_id": collected["task_id"],
         "final_status": collected["final_status"],
         "stop_reason": collected["stop_reason"],
         "wall_clock_s": collected["wall_clock_s"],
         "clarified_once": collected["clarified_once"],
+        "protocol_flag": collected.get("protocol_flag"),
         "papers_count": len(collected["papers"]),
         "active_ideas_count": len(ideas),
+        # best-of-N accounting (design point 3): how many internal candidates
+        # the bundle had before the final top-1 pick — kept, NOT normalized away.
+        "gap_candidate_count": gap_status_counts.get("candidate", 0),
+        "gap_survived_count": gap_status_counts.get("surviving", 0),
+        "interventions_count": len(interventions),
+        "interventions_passed": sum(
+            1 for i in interventions
+            if str(i.get("gate_status") or i.get("status") or "") != "FAIL"),
+        "llm_tokens_used_total": collected.get("llm_tokens_used_total"),
+        "trace_count": collected.get("trace_count"),
         "all_idea_decisions": [
             {"title": i.get("title"), "decision": i.get("decision"),
              "final_score": i.get("final_score"), "confidence_tier": i.get("confidence_tier")}
             for i in ideas
         ],
-        "gap_status_counts": _count_by(collected["gaps"], "status"),
+        "gap_status_counts": gap_status_counts,
         "surviving_gap_claimed_deltas": [
-            g.get("claimed_delta") for g in collected["gaps"]
+            g.get("claimed_delta") for g in gaps
             if g.get("status") == "surviving" and g.get("claimed_delta")
         ],
     }
@@ -219,6 +289,8 @@ def to_prediction_record(sample: dict, collected: dict) -> dict:
         abstain_reason = (
             f"terminal_status={collected['final_status']}; "
             f"stop_reason={collected['stop_reason']}; active_ideas=0")
+        if collected.get("protocol_flag"):
+            abstain_reason = f"protocol_violation ({collected['protocol_flag']}); " + abstain_reason
         decision = E2EDecision(decision="abstain", idea=None, abstain_reason=abstain_reason)
         record = build_prediction_record(
             topic_id=sample["topic_id"], stratum=sample["stratum"],
@@ -289,9 +361,13 @@ def _run(args) -> None:
             "api_base": args.api_base,
             "poll_interval_s": args.poll_interval,
             "timeout_s": args.timeout_seconds,
+            "clarify_policy": args.clarify_policy,
             "strata": strata_counts(topics),
             "fairness": "production pipeline unmodified; same provider/temperature "
-                        "as baselines; one final idea per topic (top final_score)",
+                        "as baselines; one final idea per topic (top final_score); "
+                        "clarification protocol: topics are pre-registered specific, "
+                        "a clarification request is flagged protocol_violation and "
+                        "gets no auto-generated extra info",
         },
     )
     run.write_config(cfg, overwrite=True)
@@ -311,7 +387,8 @@ def _run(args) -> None:
                   f"({sample['stratum']}) -> {sample['topic'][:70]}")
             record = None
             try:
-                collected = run_one_topic(api, sample, args.poll_interval, args.timeout_seconds)
+                collected = run_one_topic(api, sample, args.poll_interval,
+                                          args.timeout_seconds, args.clarify_policy)
                 record = to_prediction_record(sample, collected)
                 with papers_path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(export_papers(sample, collected),
@@ -369,6 +446,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL_S)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_S)
+    parser.add_argument("--clarify-policy", choices=list(CLARIFY_POLICIES),
+                        default="protocol_violation",
+                        help="protocol_violation (frozen): a clarification request "
+                             "flags the sample and gets no extra info; auto_answer "
+                             "is pilot-observation only")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output-dir", default=None)
     return parser

@@ -154,6 +154,8 @@ async def _run_rinobench(args) -> None:
     cfg = build_run_config(
         benchmark=rino.BENCHMARK, task=rino.TASK, mode=rino.MODE, split=args.split,
         sample_count=len(samples), seed=args.seed, limit=args.limit,
+        extra={"novelty_policy": (rino.NOVELTY_POLICY_V3 if args.novelty_policy == "v3"
+                                  else rino.NOVELTY_POLICY_V1)},
     )
     run.write_config(cfg)
 
@@ -162,7 +164,8 @@ async def _run_rinobench(args) -> None:
 
     async def run_one(sample: dict) -> dict:
         stats = CallStats()
-        out = await rino.run_novelty_sample(sample, llm, stats, rubric=rubric)
+        out = await rino.run_novelty_sample(sample, llm, stats, rubric=rubric,
+                                            novelty_policy=args.novelty_policy)
         record = {
             "sample_id": sample["source"],
             "prediction": out["prediction"],
@@ -377,6 +380,9 @@ def build_parser() -> argparse.ArgumentParser:
     rino_parser = sub.add_parser("rinobench", parents=[common],
                                  help="RINoBench novelty judgment (gold_related_works, no self retrieval)")
     rino_parser.add_argument("--split", default="test", help="dataset split file (train/test)")
+    rino_parser.add_argument("--novelty-policy", choices=["v1", "v3"], default="v1",
+                             help="novelty judgment policy: v1=holistic 1-5, "
+                                  "v3=criterion-first (closest-work coverage -> residual delta -> score)")
     rino_parser.set_defaults(func=lambda args: asyncio.run(_run_rinobench(args)))
 
     internal_parser = sub.add_parser(

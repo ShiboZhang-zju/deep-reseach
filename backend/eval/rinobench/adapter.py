@@ -39,7 +39,7 @@ Official prediction format (verified against the official evaluator):
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,47 @@ from eval.config import RINOBENCH_DIR, model_info
 BENCHMARK = "RINoBench"
 MODE = "gold_related_works"
 TASK = "novelty"
+
+NOVELTY_POLICY_V1 = "holistic-v1"
+NOVELTY_POLICY_V3 = "criterion-first-v3"
+
+# --------------------------------------------------------------------------
+# V3 pre-registered hypothesis (frozen before any V3 result was seen):
+# H-V3: Direct holistic novelty scoring systematically overweights
+# plausibility / proposal completeness and underweights whether the claimed
+# contribution is actually distinct from the closest prior work.
+# Decomposing novelty judgment into closest-work coverage and residual
+# substantive delta before ordinal scoring should improve novelty
+# discrimination, especially on low-novelty classes.
+# --------------------------------------------------------------------------
+
+# Frozen ordinal semantics for V3 (fixed wording; never tuned per run).
+ORDINAL_SEMANTICS_V3 = (
+    "Score 1: The essential contribution is already present in the closest "
+    "prior work, or the claimed novelty is unsupported.\n"
+    "Score 2: Most of the core contribution is already covered. Only a "
+    "limited modification, recombination, parameterization, or "
+    "implementation-level difference remains.\n"
+    "Score 3: There is a partially distinct contribution, but substantial "
+    "parts are already covered, or the importance of the residual delta "
+    "remains uncertain.\n"
+    "Score 4: The general research direction exists, but a major mechanism, "
+    "formulation, capability, or contribution remains materially distinct.\n"
+    "Score 5: The closest prior works do not cover the core "
+    "mechanism/contribution, and there is a clear, grounded, substantive "
+    "research delta."
+)
+
+# Frozen ban list for V3 (presentation signals must not drive the score).
+PRESENTATION_SIGNALS_BAN = (
+    "Do NOT judge novelty by: idea length, proposal completeness, the number "
+    "of formulas, the number of parameters, specific percentages, complex "
+    "framework names, whether it reads like a paper, how plausible it sounds, "
+    "or how fluent it is. These indicate only presentation quality / "
+    "plausibility. quality != novelty, plausibility != novelty, "
+    "specificity != novelty. Ask only: relative to the related works, what "
+    "does this idea actually ADD?"
+)
 
 VERDICT_BY_SCORE: dict[int, str] = {
     5: "confirmed",
@@ -77,6 +118,25 @@ class NoveltyJudgment(BaseModel):
         default=False,
         description="true if the related works are insufficient to make a reliable judgment; "
                     "novelty_score is still required as the best-effort estimate")
+
+
+class NoveltyJudgmentV3(BaseModel):
+    """Criterion-first novelty judgment (decomposed before ordinal scoring)."""
+
+    closest_work: str = Field(description="the single closest prior work to the idea")
+    core_coverage: Literal["none", "partial", "substantial", "near_complete"] = Field(
+        description="how completely the closest work covers the idea's core contribution")
+    residual_delta: str = Field(
+        description="what the idea adds BEYOND the closest work; explicit if nothing")
+    delta_grounded: bool = Field(
+        description="the residual delta is anchored and self-consistent, not invented "
+                    "details or unsupported parameter claims")
+    delta_substantive: bool = Field(
+        description="the residual delta is a materially different mechanism/formulation/"
+                    "capability, not a parameterization, re-skin, or implementation detail")
+    reasoning: str
+    novelty_score: int = Field(ge=1, le=5)
+    abstained: bool = False
 
 
 def data_path(split: str) -> Path:
@@ -139,42 +199,105 @@ def _novelty_prompt(record: dict, works: list[dict], rubric: list[str]) -> str:
     )
 
 
+def _v3_novelty_prompt(record: dict, works: list[dict]) -> str:
+    idea = record.get("research_idea") or {}
+    works_block = "\n".join(
+        f"{idx + 1}. {work.get('title', '')}\n   Abstract: {(work.get('abstract') or '')[:600]}"
+        for idx, work in enumerate(works)
+    )
+    return (
+        "You are judging the novelty of a research idea against a list of related "
+        "works. Work in this EXACT order:\n\n"
+        f"Research idea:\n"
+        f"- Objective: {idea.get('objective', '')}\n"
+        f"- Problem statement: {idea.get('problem_statement', '')}\n"
+        f"- Solution approach: {idea.get('solution_approach', '')}\n\n"
+        f"Related works (title + abstract):\n{works_block}\n\n"
+        "1. Identify the single closest prior work (closest_work) — the work whose "
+        "core contribution is nearest to the idea.\n"
+        "2. Assess how completely it covers the idea's core contribution "
+        "(core_coverage: none | partial | substantial | near_complete).\n"
+        "3. State the residual delta: what the idea adds BEYOND that closest work "
+        "(residual_delta). If nothing remains, say so explicitly.\n"
+        "4. Judge whether the residual delta is grounded (delta_grounded): anchored, "
+        "self-consistent, checkable — not invented details or unsupported parameter "
+        "claims.\n"
+        "5. Judge whether the residual delta is substantive (delta_substantive): a "
+        "materially different mechanism, formulation, or capability — not a "
+        "parameterization, re-skin, or implementation detail.\n"
+        "6. Map to the ordinal novelty score using EXACTLY these definitions:\n"
+        f"{ORDINAL_SEMANTICS_V3}\n\n"
+        f"{PRESENTATION_SIGNALS_BAN}\n\n"
+        "Only abstain (abstained=true) if the related works are insufficient to "
+        "determine coverage, or the idea itself is materially underspecified; even "
+        "then, still output your best-effort novelty_score.\n\n"
+        'Output JSON: {"closest_work": "<title or 1-line description>", '
+        '"core_coverage": "<none|partial|substantial|near_complete>", '
+        '"residual_delta": "<1-3 sentences>", "delta_grounded": <bool>, '
+        '"delta_substantive": <bool>, "reasoning": "<2-4 sentence justification '
+        'for the score>", "novelty_score": <1-5>, "abstained": <bool>}'
+    )
+
+
 async def run_novelty_sample(record: dict, llm, stats: CallStats | None = None, *,
                              max_related_works: int = 40,
-                             rubric: list[str] | None = None) -> dict:
-    rubric = rubric if rubric is not None else load_rubric()
+                             rubric: list[str] | None = None,
+                             novelty_policy: str = NOVELTY_POLICY_V1) -> dict:
+    if novelty_policy not in (NOVELTY_POLICY_V1, NOVELTY_POLICY_V3):
+        raise ValueError(f"unknown novelty policy: {novelty_policy!r}")
     all_works = list(record.get("related_works") or [])
     works = all_works[:max_related_works]
     if not works:
         raise ValueError("sample has no related works")
 
+    if novelty_policy == NOVELTY_POLICY_V3:
+        prompt = _v3_novelty_prompt(record, works)
+        schema: type = NoveltyJudgmentV3
+    else:
+        rubric = rubric if rubric is not None else load_rubric()
+        prompt = _novelty_prompt(record, works, rubric)
+        schema = NoveltyJudgment
+
     judgment = await chat_json(
         llm,
         [
             {"role": "system", "content": _NOVELTY_SYSTEM},
-            {"role": "user", "content": _novelty_prompt(record, works, rubric)},
+            {"role": "user", "content": prompt},
         ],
-        NoveltyJudgment,
+        schema,
         temperature=0.0,
         stats=stats,
     )
     verdict = internal_verdict_for(judgment.novelty_score)
 
-    prediction = {
+    prediction: dict = {
         "novelty_score": judgment.novelty_score,
         "reasoning": judgment.reasoning,
         "internal_verdict": verdict,
         "verdict_mapping": VERDICT_MAPPING_NOTE,
-        "known_aspects": judgment.known_aspects,
-        "novelty_aspects": judgment.novelty_aspects,
         "abstained": judgment.abstained,
         "related_works_used": len(works),
         "related_works_truncated": len(all_works) > max_related_works,
+        "novelty_policy": novelty_policy,
     }
+    if novelty_policy == NOVELTY_POLICY_V3:
+        v3 = judgment  # type: NoveltyJudgmentV3
+        prediction.update({
+            "closest_work": v3.closest_work,
+            "core_coverage": v3.core_coverage,
+            "residual_delta": v3.residual_delta,
+            "delta_grounded": v3.delta_grounded,
+            "delta_substantive": v3.delta_substantive,
+        })
+    else:
+        prediction.update({
+            "known_aspects": judgment.known_aspects,
+            "novelty_aspects": judgment.novelty_aspects,
+        })
     official_element = {"reasoning": judgment.reasoning, "novelty_score": judgment.novelty_score}
     gold = {"novelty_score": record.get("novelty_score")}
     return {"prediction": prediction, "official_element": official_element,
-            "gold": gold, "eval_extra": {}}
+            "gold": gold, "eval_extra": {"novelty_policy": novelty_policy}}
 
 
 # --------------------------------------------------------------------------

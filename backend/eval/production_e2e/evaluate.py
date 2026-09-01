@@ -49,6 +49,29 @@ def read_jsonl(path: Path) -> list[dict]:
     return out
 
 
+def load_verdicts(audit_dir: Path | None, human_path: str | None) -> list[dict]:
+    """Human verdicts keyed by submission_id are de-anonymized via
+    submission_mapping.json; legacy verdicts carrying system/topic_id directly
+    are passed through."""
+    verdicts: list[dict] = []
+    if audit_dir:
+        mapping = json.loads(
+            (audit_dir / "submission_mapping.json").read_text(encoding="utf-8"))
+        by_sid = {s["submission_id"]: s for s in mapping["submissions"]}
+        for v in read_jsonl(audit_dir / "human_verdicts.jsonl"):
+            sub = by_sid.get(str(v.get("submission_id")))
+            if not sub:
+                continue
+            merged = dict(v)
+            merged.update({k: sub[k] for k in
+                           ("system", "topic_id", "target_type")})
+            verdicts.append(merged)
+        return verdicts
+    if human_path:
+        return read_jsonl(Path(human_path))
+    return []
+
+
 def load_system_predictions(run_dir: Path) -> tuple[str, list[dict]]:
     cfg = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     system = str(cfg.get("system") or run_dir.name)
@@ -96,8 +119,11 @@ def _fmt_score(x: float | None) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="production_e2e headline aggregation")
     parser.add_argument("--runs", nargs="+", required=True)
+    parser.add_argument("--audit-dir", default=None,
+                        help="super_audit run dir: de-anonymizes human_verdicts.jsonl "
+                             "via submission_mapping.json (blind review protocol)")
     parser.add_argument("--human", default=None,
-                        help="human_verdicts.jsonl (filled from super_audit human_review.md)")
+                        help="legacy: verdicts file that already carries system/topic_id")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
@@ -105,7 +131,8 @@ def main() -> None:
     topics = load_topics()
     total_topics = len(topics)
 
-    verdicts = read_jsonl(Path(args.human)) if args.human else []
+    verdicts = load_verdicts(
+        Path(args.audit_dir) if args.audit_dir else None, args.human)
     # key: (target_type, system, topic_id) -> verdict record
     verdict_map = {
         (str(v.get("target_type")), str(v.get("system")), str(v.get("topic_id"))): v
@@ -113,9 +140,16 @@ def main() -> None:
     }
 
     systems: dict[str, list[dict]] = {}
+    flagged: dict[str, int] = {}
     for run_path in args.runs:
         system, records = load_system_predictions(Path(run_path))
-        systems[system] = records
+        # Protocol-violation samples (e.g. clarification_triggered) are excluded
+        # from official aggregates and reported separately (design point 1).
+        official = [r for r in records if not r.get("protocol_flag")]
+        flagged_n = len(records) - len(official)
+        if flagged_n:
+            flagged[system] = flagged_n
+        systems[system] = official
 
     metrics: dict[str, dict] = {}
     for system, records in systems.items():
@@ -179,7 +213,9 @@ def main() -> None:
     cfg = build_run_config(
         benchmark=BENCHMARK, task="headline", mode=MODE, split="topics_v1",
         sample_count=total_topics, seed=None, limit=None,
-        extra={"runs": args.runs, "human_verdicts": args.human,
+        extra={"runs": args.runs, "audit_dir": args.audit_dir,
+               "human_verdicts": args.human,
+               "protocol_violations_excluded": flagged,
                "headline": "False-open-gap + Credible Idea Yield (dual, frozen)"},
     )
     run.write_config(cfg, overwrite=True)
@@ -212,6 +248,16 @@ def main() -> None:
     lines += [
         "",
         "Notes:",
+        "- This is a SYSTEM-level E2E comparison (Full V2 bundle vs simple baselines), "
+        "not a causal ablation of Gap Audit: a V2 win does not prove the audit alone "
+        "causes it (V2 also has full-text chunks, evidence units, multi-round "
+        "retrieval, best-of-N candidates). Mechanism attribution needs later "
+        "ablations (e.g. V2-no-audit).",
+        "- Samples flagged protocol_violation (e.g. clarification_triggered) are "
+        "excluded from official aggregates and reported in metrics.json "
+        "(protocol_violations_excluded).",
+        "- Human verdicts are blind: reviewers see only submission_id + topic + claim "
+        "+ candidates; identities restored via submission_mapping.json.",
         "- False-open-gap: idea-level = proposed ideas whose claimed contribution is "
         "already covered by prior art (human verdict from super_audit); gap-level "
         "(full_v2 surviving gaps) in metrics.json.",

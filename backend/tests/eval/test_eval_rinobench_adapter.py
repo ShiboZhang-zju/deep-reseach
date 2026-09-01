@@ -161,3 +161,130 @@ def test_load_rubric_from_benchmark_repo():
     rubric = rino.load_rubric()
     assert len(rubric) == 5
     assert all(str(i + 1) in text.split(":")[0] for i, text in enumerate(rubric))
+
+
+# --------------------------------------------------------------------------
+# V3 criterion-first novelty policy
+# --------------------------------------------------------------------------
+
+def _v3_payload(**overrides):
+    base = {
+        "closest_work": "Prior work X",
+        "core_coverage": "partial",
+        "residual_delta": "adds a new mechanism",
+        "delta_grounded": True,
+        "delta_substantive": True,
+        "reasoning": "r",
+        "novelty_score": 4,
+        "abstained": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_v3_valid_result_records_all_criteria():
+    llm = FakeEvalLLM([_v3_payload()])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(4), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V3))
+    p = out["prediction"]
+    assert p["novelty_policy"] == "criterion-first-v3"
+    assert p["closest_work"] == "Prior work X"
+    assert p["core_coverage"] == "partial"
+    assert p["delta_grounded"] is True and p["delta_substantive"] is True
+    assert p["internal_verdict"] == "confirmed"
+    assert out["official_element"] == {"reasoning": "r", "novelty_score": 4}
+    # The official rubric is NOT used in v3; the frozen ordinal semantics are.
+    user_message = llm.calls[0]["messages"][1]["content"]
+    assert "Score 5: The closest prior works do not cover" in user_message
+    assert "quality != novelty" in user_message
+
+
+def test_v3_invalid_core_coverage_becomes_sample_error(tmp_path):
+    from eval.common import EvalRun, run_samples
+    llm = FakeEvalLLM([_v3_payload(core_coverage="mostly")])
+    run = EvalRun(tmp_path, run_id="fixed")
+    records = asyncio.run(run_samples(
+        [_record(4)], lambda s: rino.run_novelty_sample(
+            s, llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V3),
+        run, resume=False))
+    assert records[0]["parse_status"] == "error"
+    assert "core_coverage" in records[0]["error"]
+
+
+def test_v3_missing_residual_delta_becomes_sample_error(tmp_path):
+    from eval.common import EvalRun, run_samples
+    payload = _v3_payload()
+    del payload["residual_delta"]
+    llm = FakeEvalLLM([payload])
+    run = EvalRun(tmp_path, run_id="fixed")
+    records = asyncio.run(run_samples(
+        [_record(4)], lambda s: rino.run_novelty_sample(
+            s, llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V3),
+        run, resume=False))
+    assert records[0]["parse_status"] == "error"
+    assert "residual_delta" in records[0]["error"]
+
+
+@pytest.mark.parametrize("bad_score", [0, 6])
+def test_v3_malformed_score_becomes_sample_error(tmp_path, bad_score):
+    from eval.common import EvalRun, run_samples
+    llm = FakeEvalLLM([_v3_payload(novelty_score=bad_score)])
+    run = EvalRun(tmp_path, run_id="fixed")
+    records = asyncio.run(run_samples(
+        [_record(4)], lambda s: rino.run_novelty_sample(
+            s, llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V3),
+        run, resume=False))
+    assert records[0]["parse_status"] == "error"
+    assert "novelty_score" in records[0]["error"]
+
+
+def test_v3_abstained_keeps_best_effort_score():
+    llm = FakeEvalLLM([_v3_payload(abstained=True, novelty_score=2,
+                                   delta_substantive=False)])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(1), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V3))
+    assert out["prediction"]["abstained"] is True
+    assert out["prediction"]["novelty_score"] == 2
+    # Official element still emitted for scorer compatibility.
+    assert out["official_element"]["novelty_score"] == 2
+
+
+def test_policy_default_is_v1_and_unchanged():
+    llm = FakeEvalLLM([{"novelty_score": 4, "reasoning": "r"}])
+    out = asyncio.run(rino.run_novelty_sample(_record(4), llm, rubric=RUBRIC))
+    assert out["prediction"]["novelty_policy"] == "holistic-v1"
+    assert "closest_work" not in out["prediction"]
+    assert out["prediction"]["internal_verdict"] == "confirmed"
+
+
+# Synthetic semantic-regression cases: criterion consistency (pipe level),
+# not benchmark scores.
+def test_v3_case_a_near_complete_coverage_maps_low():
+    llm = FakeEvalLLM([_v3_payload(core_coverage="near_complete", delta_substantive=False,
+                                   delta_grounded=False, novelty_score=1)])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(1), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V3))
+    assert out["prediction"]["core_coverage"] == "near_complete"
+    assert out["prediction"]["novelty_score"] == 1
+    assert out["prediction"]["internal_verdict"] == "closed"
+
+
+def test_v3_case_b_partial_coverage_maps_middle():
+    llm = FakeEvalLLM([_v3_payload(core_coverage="partial", delta_substantive=True,
+                                   delta_grounded=True, novelty_score=3)])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(3), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V3))
+    assert out["prediction"]["core_coverage"] == "partial"
+    assert out["prediction"]["novelty_score"] == 3
+    assert out["prediction"]["internal_verdict"] == "partially_closed"
+
+
+def test_v3_case_c_substantive_delta_maps_high():
+    llm = FakeEvalLLM([_v3_payload(core_coverage="none", delta_substantive=True,
+                                   delta_grounded=True, novelty_score=5)])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(5), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V3))
+    assert out["prediction"]["core_coverage"] == "none"
+    assert out["prediction"]["delta_substantive"] is True
+    assert out["prediction"]["novelty_score"] == 5
+    assert out["prediction"]["internal_verdict"] == "confirmed"

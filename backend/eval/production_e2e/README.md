@@ -8,6 +8,12 @@ ResearchBench 与 RINoBench 已承担**局部能力**评估（retrieval / genera
 > **同样的文献供给下，Evidence → Gap Audit → Intervention → Experiment 全链路
 > 相对简单方案（直接生成 / 检索后生成）更能产生可信科研 Idea，更能拒绝假 Idea。**
 
+**定位（v1 冻结）**：这是**系统级 E2E 对比**——回答"Full V2 system bundle 是否值得存在"，
+**不是 Gap Audit 的严格因果消融**。Baseline B 只看 top-20 abstract，而 V2 拥有全文 chunk、
+Evidence Units、多轮检索、多个内部候选取最高分；V2 赢了只能证明
+`Full V2 system bundle > simple Retrieval+LLM`，不能证明 `Gap Audit alone causes it`。
+机制归因（V2-no-audit 等消融）留待 pilot 之后按需增加，v1 不扩大 harness。
+
 不修改 production `app/` 代码、不动冻结的 eval-harness-v1、不新建数据库表。
 
 ## 实验设计（v1 冻结，改动须递增版本号）
@@ -20,11 +26,20 @@ ResearchBench 与 RINoBench 已承担**局部能力**评估（retrieval / genera
 | B: Retrieval + LLM | topic + **Full V2 检索到的同一批论文**（top-K 摘要） | 读文献 → 单次 LLM 调用产 Idea |
 | C: Full V2 | topic | Search → Evidence → Coverage → Gap → NPA Audit → Intervention → Experiment |
 
-**设计点 1（检索条件控制）**：Baseline B 不自己检索，直接消费 Full V2 的论文导出
-（`papers_export.jsonl`，按 final_score 排序取 top-K=20 的 title/year/venue/abstract）。
-这样比较的是"同样的文献供给下，Evidence + Gap Audit 到底有没有增益"。
-若 B 自检索（50 篇）而 V2 检索 300 篇，赢了也无法归因是检索强还是审计强。
+**设计点 1（检索条件控制 + clarification 消除信息不对称）**：Baseline B 不自己检索，
+直接消费 Full V2 的论文导出（`papers_export.jsonl`，按 final_score 排序取 top-K=20 的
+title/year/venue/abstract）。这样比较的是"同样的文献供给下，Evidence + Gap Audit 到底
+有没有增益"。若 B 自检索（50 篇）而 V2 检索 300 篇，赢了也无法归因是检索强还是审计强。
+Baseline B 的定位是**合理的简单 Retrieval+LLM baseline**（top-K=20 + abstract 截 800 字
+是它的定义，不是缺陷）；若 Full V2 明显胜出，后续可加更强的
+`Retrieval + Literature Synthesis + LLM` 基线，验证优势是否只来自简单基线太弱。
 self-retrieval Baseline B 留给 v2 单独测 adaptive retrieval 的增益。
+
+**Clarification 协议（冻结）**：24 个 topic 预注册为足够具体。Full V2 若仍触发
+clarification，该样本标记 `protocol_violation`（`protocol_flag=clarification_triggered`），
+**不自动生成额外信息**，并从正式聚合中剔除、单独报告——auto-answer 只在 pilot 观察模式
+（`--clarify-policy auto_answer`）下可用，因为它只给 V2 更好的问题定义，破坏公平。
+绝不允许"只有 V2 获得额外的问题定义"。
 
 **设计点 2（双 headline 指标，防 abstain 作弊）**：只看 False-open-gap rate 会激励
 "全部 abstain"（rate=0 但零科研价值）。因此同时冻结两个 headline：
@@ -46,19 +61,29 @@ Abstention rate 单独报告。最终表：
 Novelty / Feasibility / False-open-gap 由 Super Audit + 人工核对提供（见下），
 Abstention 与 Cost 由 harness 自动统计。
 
-**设计点 3（独立 Super Audit，不与 production auditor 共享盲区）**：不能把 production
+**设计点 3（独立评估程序，不与 production auditor 共享盲区）**：不能把 production
 Gap Audit 再跑一遍叫 independent validation——会共享 query family、检索源、模型偏好与
-检索盲区，可能一起漏掉同一篇 killer paper。流程：
+检索盲区，可能一起漏掉同一篇 killer paper。措辞冻结：这是 **independent evaluation
+procedure**，**不是 independent retrieval corpus**（OpenAlex/S2/arXiv 与 production
+数据源重合）。不同 query 模板 + 独立重检索 + 人工 prior-art adjudication 对 V1 已足够；
+citation snowball 等 pilot 观察漏检率后再决定是否补。流程：
 
 ```
 系统输出冻结
-  → Independent Super Audit（不同 prompt 模板 / 更宽 query / 多源检索 / citation snowball）
+  → Independent evaluation procedure（不同 prompt 模板 / 更宽 query / 多源检索）
   → candidate killer papers
   → 人工核对 FULL / PARTIAL / NONE 覆盖
 ```
 
 人工只审核机器找到的关键 nearest prior art + 少量"未找到 killer"的对照样本，
 不要求重新检索整个领域（成本可控）。
+
+**盲评协议（冻结）**：`human_review_blind.md` 不暴露 system（A/B/C）、target_type、
+topic stratum、V2 内部分数、production audit verdict。每个审计目标分配随机
+`submission_id` 并打乱顺序；评审者只看到 Research Topic、Claim、candidate prior art
+及待填字段（逐候选 FULL/PARTIAL/NONE、overall false-open、Novelty 1-5、Feasibility 1-5、
+Credible）。评完通过 `submission_mapping.json` 恢复系统身份——否则 evaluator 容易无意识
+偏向"复杂系统"。`protocol_flag` 样本不进入审计。
 
 **设计点 4（主题分层，防 selection bias）**：不按"V2 跑成功过"挑题。24 个主题预分层：
 
@@ -79,6 +104,13 @@ Gap Audit 再跑一遍叫 independent validation——会共享 query family、�
 2. **固定评价单位**：每系统每 topic 最多提交 1 个 final Idea（Full V2 取 active ideas 中
    final_score 最高者；Baseline 由 schema 约束单 Idea 输出），否则明确 Abstain。
    不允许 A 出 10 个、B 出 5 个、V2 出 1 个的可笑比较。
+
+3. **best-of-N 如实记录（不强行抹平）**：V2 内部产出多 Gap/Intervention/Idea 取最高分是
+   production 的真实能力，保留；但 `gap_candidate_count / gap_survived_count /
+   interventions_count / interventions_passed / llm_tokens_used_total / trace_count`
+   一并保存到 prediction record，使"Credible Idea Yield 提升"可归因于"更好的推理链"
+   还是"尝试次数更多"。成本是 secondary metric，此处理足够（tokens 从 traces 汇总，
+   trace_count 是 step 级代理不是 LLM 调用数——口径如实记录）。
 
 ### Abstain 语义
 
@@ -119,13 +151,16 @@ python -m eval.production_e2e.run_full_v2 --run-id pe2e_v1_fullv2
 python -m eval.production_e2e.baseline_retrieval --run-id pe2e_v1_retellm \
     --v2-run-dir ../eval_results/pe2e_v1_fullv2
 
-# 4. 独立超级审计（对三系统的全部 idea / V2 的 surviving gaps）
+# 4. 独立评估程序（对三系统的全部 idea / V2 的 surviving gaps；盲评 submission_id）
 python -m eval.production_e2e.super_audit --run-id pe2e_v1_audit \
-    --systems pe2e_v1_direct pe2e_v1_retellm pe2e_v1_fullv2
+    --systems ../eval_results/pe2e_v1_direct ../eval_results/pe2e_v1_retellm \
+              ../eval_results/pe2e_v1_fullv2
 
-# 5. 人工核对 super_audit 输出的候选 killer（FULL/PARTIAL/NONE），然后聚合
-python -m eval.production_e2e.evaluate --runs pe2e_v1_direct pe2e_v1_retellm pe2e_v1_fullv2 \
-    --audit pe2e_v1_audit
+# 5. 评审者按 human_review_blind.md 填 human_verdicts.jsonl（只有 submission_id），
+#    然后聚合（映射还原系统身份）
+python -m eval.production_e2e.evaluate --runs ../eval_results/pe2e_v1_direct \
+    ../eval_results/pe2e_v1_retellm ../eval_results/pe2e_v1_fullv2 \
+    --audit-dir ../eval_results/pe2e_v1_audit
 ```
 
 所有 run 产物在 `backend/eval_results/<run_id>/`：`config.json` / `predictions.jsonl` /
@@ -140,6 +175,15 @@ predictions.jsonl 每 topic 唯一最终成功记录）。
 - Full V2：wall_clock_s + papers_count（+ best-effort 的 traces token 汇总）。
   V2 是全链路成本、baseline 是单调用成本，两者本来就不在一个口径上——
   表格中 Cost 列分别呈现，不合成单一数字。
+
+## Pilot 定义（--limit 2）
+
+`--limit 2` 的运行是 **pilot，结果不作正式实验**，只验证工程闭环六项：
+①三系统都能完成；②schema 对齐；③clarification 是否出现；④abstain 是否正常；
+⑤human_review 是否能盲评；⑥六列表是否能正确聚合。
+pilot 通过后冻结 topics + protocol，直接跑完整 24 topics。
+**若 pilot 无结构性问题，不再继续"完善 harness"**——当前最重要的是获得第一组真实
+E2E 数据，而不是继续增加评估机制。
 
 ## 结果裁决规则（预注册）
 
