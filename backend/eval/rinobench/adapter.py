@@ -52,6 +52,7 @@ TASK = "novelty"
 
 NOVELTY_POLICY_V1 = "holistic-v1"
 NOVELTY_POLICY_V3 = "criterion-first-v3"
+NOVELTY_POLICY_V4A = "forced-binary-coverage-v4a"
 
 # --------------------------------------------------------------------------
 # V3 pre-registered hypothesis (frozen before any V3 result was seen):
@@ -139,6 +140,43 @@ class NoveltyJudgmentV3(BaseModel):
     abstained: bool = False
 
 
+# V4a pre-registered hypothesis (frozen before any V4a result was seen):
+# H-V4a: Forcing the coverage head into a discrete YES/NO decision — removing
+# the middle-category escape that V3 showed absorbs hedging (coverage
+# collapsed to 87% "substantial", none=0, grounded 100% true) — restores
+# discrimination at the coverage head, measured by
+#     CoverageDiscrimination = P(YES | gold<=2) vs P(YES | gold>=4),
+# and improves novelty discrimination without excessively sacrificing
+# high-novelty recall. If YES-rate instead collapses toward ~92% across all
+# gold levels, forced choice alone is insufficient and evidence anchoring
+# (V4b) is the next single-variable experiment.
+
+class NoveltyJudgmentV4A(BaseModel):
+    """Forced-binary coverage novelty judgment (single-variable change from
+    V3: the hedging-prone 4-way coverage head becomes an unconditional
+    YES/NO; everything else follows the V3 structure)."""
+
+    closest_work: str = Field(description="the single closest prior work to the idea")
+    covers_core_contribution: bool = Field(
+        description="UNCONDITIONAL YES or NO: does the closest prior work already "
+                    "contain the idea's core claimed contribution?")
+    covered_core_mechanism: str = Field(
+        default="",
+        description="if YES: which mechanism/formulation of the idea already exists "
+                    "there; if NO: the nearest thing the closest work does contain")
+    residual_delta: str = Field(
+        description="what the idea adds BEYOND the closest work; explicit if nothing")
+    delta_grounded: bool = Field(
+        description="the residual delta is anchored and self-consistent, not invented "
+                    "details or unsupported parameter claims")
+    delta_substantive: bool = Field(
+        description="the residual delta is a materially different mechanism/formulation/"
+                    "capability, not a parameterization, re-skin, or implementation detail")
+    reasoning: str
+    novelty_score: int = Field(ge=1, le=5)
+    abstained: bool = False
+
+
 def data_path(split: str) -> Path:
     path = RINOBENCH_DIR / "data" / "final_benchmark_dataset" / f"{split}.json"
     if not path.exists():
@@ -199,6 +237,67 @@ def _novelty_prompt(record: dict, works: list[dict], rubric: list[str]) -> str:
     )
 
 
+# Frozen ordinal semantics for V4a (single variable: binary coverage head;
+# YES/NO branches are disjoint so every score requires a committed decision).
+ORDINAL_SEMANTICS_V4A = (
+    "If covers_core_contribution = YES (the closest prior work already contains "
+    "the core claimed contribution):\n"
+    "  - only a trivial restatement or a pure parameter-level difference remains "
+    "-> Score 1\n"
+    "  - only a limited modification or recombination remains -> Score 2\n"
+    "  - a genuine but incremental contribution remains -> Score 3\n"
+    "If covers_core_contribution = NO (the closest prior work does NOT contain "
+    "the core claimed contribution):\n"
+    "  - the residual delta is ungrounded or non-substantive -> Score 3\n"
+    "  - the residual delta is grounded and materially substantive -> Score 4\n"
+    "  - the residual delta is grounded, substantive, and opens a materially new "
+    "research direction -> Score 5"
+)
+
+
+def _v4a_novelty_prompt(record: dict, works: list[dict]) -> str:
+    idea = record.get("research_idea") or {}
+    works_block = "\n".join(
+        f"{idx + 1}. {work.get('title', '')}\n   Abstract: {(work.get('abstract') or '')[:600]}"
+        for idx, work in enumerate(works)
+    )
+    return (
+        "You are judging the novelty of a research idea against related works. "
+        "The single most important judgment comes FIRST and is BINARY — you must "
+        "commit, there is no middle option:\n\n"
+        f"Research idea:\n"
+        f"- Objective: {idea.get('objective', '')}\n"
+        f"- Problem statement: {idea.get('problem_statement', '')}\n"
+        f"- Solution approach: {idea.get('solution_approach', '')}\n\n"
+        f"Related works (title + abstract):\n{works_block}\n\n"
+        "STEP 1 (forced binary): Identify the single closest prior work "
+        "(closest_work), then answer with an unconditional YES or NO: does that "
+        "work already contain the idea's CORE claimed contribution? Judge the "
+        "contribution itself, not surface similarity of topic.\n"
+        "STEP 2: If YES, describe which core mechanism/formulation of the idea "
+        "already exists there (covered_core_mechanism). If NO, describe the "
+        "nearest thing the closest work does contain.\n"
+        "STEP 3: State the residual delta (residual_delta) — what the idea adds "
+        "beyond the closest work. If nothing remains, say so explicitly.\n"
+        "STEP 4: Judge the residual delta: delta_grounded (anchored, "
+        "self-consistent, not invented details) and delta_substantive (a "
+        "materially different mechanism/formulation/capability, not a "
+        "parameterization or re-skin).\n"
+        "STEP 5: Map to the ordinal score using EXACTLY these rules:\n"
+        f"{ORDINAL_SEMANTICS_V4A}\n\n"
+        f"{PRESENTATION_SIGNALS_BAN}\n\n"
+        "Only abstain (abstained=true) if the related works are insufficient to "
+        "determine coverage, or the idea itself is materially underspecified; even "
+        "then, still output your best-effort novelty_score.\n\n"
+        'Output JSON: {"closest_work": "<title or 1-line description>", '
+        '"covers_core_contribution": <true|false>, "covered_core_mechanism": '
+        '"<1-2 sentences>", "residual_delta": "<1-3 sentences>", '
+        '"delta_grounded": <bool>, "delta_substantive": <bool>, "reasoning": '
+        '"<2-4 sentence justification for the score>", "novelty_score": <1-5>, '
+        '"abstained": <bool>}'
+    )
+
+
 def _v3_novelty_prompt(record: dict, works: list[dict]) -> str:
     idea = record.get("research_idea") or {}
     works_block = "\n".join(
@@ -243,7 +342,7 @@ async def run_novelty_sample(record: dict, llm, stats: CallStats | None = None, 
                              max_related_works: int = 40,
                              rubric: list[str] | None = None,
                              novelty_policy: str = NOVELTY_POLICY_V1) -> dict:
-    if novelty_policy not in (NOVELTY_POLICY_V1, NOVELTY_POLICY_V3):
+    if novelty_policy not in (NOVELTY_POLICY_V1, NOVELTY_POLICY_V3, NOVELTY_POLICY_V4A):
         raise ValueError(f"unknown novelty policy: {novelty_policy!r}")
     all_works = list(record.get("related_works") or [])
     works = all_works[:max_related_works]
@@ -253,6 +352,9 @@ async def run_novelty_sample(record: dict, llm, stats: CallStats | None = None, 
     if novelty_policy == NOVELTY_POLICY_V3:
         prompt = _v3_novelty_prompt(record, works)
         schema: type = NoveltyJudgmentV3
+    elif novelty_policy == NOVELTY_POLICY_V4A:
+        prompt = _v4a_novelty_prompt(record, works)
+        schema = NoveltyJudgmentV4A
     else:
         rubric = rubric if rubric is not None else load_rubric()
         prompt = _novelty_prompt(record, works, rubric)
@@ -289,6 +391,16 @@ async def run_novelty_sample(record: dict, llm, stats: CallStats | None = None, 
             "delta_grounded": v3.delta_grounded,
             "delta_substantive": v3.delta_substantive,
         })
+    elif novelty_policy == NOVELTY_POLICY_V4A:
+        v4 = judgment  # type: NoveltyJudgmentV4A
+        prediction.update({
+            "closest_work": v4.closest_work,
+            "covers_core_contribution": v4.covers_core_contribution,
+            "covered_core_mechanism": v4.covered_core_mechanism,
+            "residual_delta": v4.residual_delta,
+            "delta_grounded": v4.delta_grounded,
+            "delta_substantive": v4.delta_substantive,
+        })
     else:
         prediction.update({
             "known_aspects": judgment.known_aspects,
@@ -322,6 +434,32 @@ def _pure_f1_mae(predicted: list[int], gold: list[int]) -> tuple[dict[str, float
     macro = sum(per_class[label] for label in _LABELS) / len(_LABELS)
     mae = (sum(abs(p - g) for p, g in zip(predicted, gold)) / len(predicted)) if predicted else 0.0
     return {str(label): value for label, value in per_class.items()}, macro, mae
+
+
+def coverage_discrimination(processed: list[dict]) -> dict:
+    """Pre-registered V4a diagnostic: does the forced binary coverage head
+    actually discriminate?
+
+    Returns P(covers_core_contribution=YES | gold<=2) vs
+    P(YES | gold>=4). Under hedging collapse these converge; a working
+    coverage head shows a clear gap (low-novelty ideas answered YES more
+    often). Policies without a binary coverage field (v1/v3) yield None.
+    """
+    low = [r for r in processed if (r.get("gold") or {}).get("novelty_score", 99) <= 2]
+    high = [r for r in processed if (r.get("gold") or {}).get("novelty_score", -1) >= 4]
+
+    def rate(subset: list[dict]) -> float | None:
+        eligible = [r for r in subset if "covers_core_contribution" in r["prediction"]]
+        if not eligible:
+            return None
+        return sum(1 for r in eligible if r["prediction"]["covers_core_contribution"]) / len(eligible)
+
+    return {
+        "yes_rate_gold_le2": rate(low),
+        "yes_rate_gold_ge4": rate(high),
+        "n_low": len(low),
+        "n_high": len(high),
+    }
 
 
 def compute_score_metrics(predicted: list[int], gold: list[int]) -> dict:

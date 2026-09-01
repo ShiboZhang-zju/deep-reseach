@@ -288,3 +288,112 @@ def test_v3_case_c_substantive_delta_maps_high():
     assert out["prediction"]["delta_substantive"] is True
     assert out["prediction"]["novelty_score"] == 5
     assert out["prediction"]["internal_verdict"] == "confirmed"
+
+
+# --------------------------------------------------------------------------
+# V4a forced binary coverage
+# --------------------------------------------------------------------------
+
+def _v4a_payload(**overrides):
+    base = {
+        "closest_work": "Prior work X",
+        "covers_core_contribution": True,
+        "covered_core_mechanism": "the same mechanism already exists",
+        "residual_delta": "only parameter tuning",
+        "delta_grounded": True,
+        "delta_substantive": False,
+        "reasoning": "r",
+        "novelty_score": 2,
+        "abstained": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_v4a_valid_result_records_binary_coverage():
+    llm = FakeEvalLLM([_v4a_payload()])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(2), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V4A))
+    p = out["prediction"]
+    assert p["novelty_policy"] == "forced-binary-coverage-v4a"
+    assert p["covers_core_contribution"] is True
+    assert p["covered_core_mechanism"] == "the same mechanism already exists"
+    assert p["internal_verdict"] == "uncertain"
+    assert out["official_element"] == {"reasoning": "r", "novelty_score": 2}
+    # Frozen V4a semantics + ban list present in the prompt; no middle option.
+    user_message = llm.calls[0]["messages"][1]["content"]
+    assert "unconditional YES or NO" in user_message
+    assert "If covers_core_contribution = YES" in user_message
+    assert "If covers_core_contribution = NO" in user_message
+    assert "quality != novelty" in user_message
+    assert "none | partial | substantial | near_complete" not in user_message
+
+
+def test_v4a_missing_covers_field_becomes_sample_error(tmp_path):
+    from eval.common import EvalRun, run_samples
+    payload = _v4a_payload()
+    del payload["covers_core_contribution"]
+    llm = FakeEvalLLM([payload])
+    run = EvalRun(tmp_path, run_id="fixed")
+    records = asyncio.run(run_samples(
+        [_record(4)], lambda s: rino.run_novelty_sample(
+            s, llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V4A),
+        run, resume=False))
+    assert records[0]["parse_status"] == "error"
+    assert "covers_core_contribution" in records[0]["error"]
+
+
+@pytest.mark.parametrize("bad_score", [0, 6])
+def test_v4a_malformed_score_becomes_sample_error(tmp_path, bad_score):
+    from eval.common import EvalRun, run_samples
+    llm = FakeEvalLLM([_v4a_payload(novelty_score=bad_score)])
+    run = EvalRun(tmp_path, run_id="fixed")
+    records = asyncio.run(run_samples(
+        [_record(4)], lambda s: rino.run_novelty_sample(
+            s, llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V4A),
+        run, resume=False))
+    assert records[0]["parse_status"] == "error"
+    assert "novelty_score" in records[0]["error"]
+
+
+def test_v4a_branches_require_committed_decisions():
+    # NO branch: grounded + substantive delta can reach 4 (confirmed).
+    llm = FakeEvalLLM([_v4a_payload(covers_core_contribution=False,
+                                    delta_substantive=True, novelty_score=4)])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(4), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V4A))
+    assert out["prediction"]["covers_core_contribution"] is False
+    assert out["prediction"]["internal_verdict"] == "confirmed"
+    # NO branch with non-substantive delta caps at 3.
+    llm = FakeEvalLLM([_v4a_payload(covers_core_contribution=False,
+                                    delta_substantive=False, novelty_score=3)])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(3), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V4A))
+    assert out["prediction"]["novelty_score"] == 3
+    assert out["prediction"]["internal_verdict"] == "partially_closed"
+
+
+def test_v4a_abstained_keeps_best_effort_score():
+    llm = FakeEvalLLM([_v4a_payload(abstained=True, novelty_score=3)])
+    out = asyncio.run(rino.run_novelty_sample(
+        _record(3), llm, rubric=RUBRIC, novelty_policy=rino.NOVELTY_POLICY_V4A))
+    assert out["prediction"]["abstained"] is True
+    assert out["official_element"]["novelty_score"] == 3
+
+
+def test_coverage_discrimination_metric():
+    processed = [
+        {"gold": {"novelty_score": 1}, "prediction": {"covers_core_contribution": True}},
+        {"gold": {"novelty_score": 2}, "prediction": {"covers_core_contribution": True}},
+        {"gold": {"novelty_score": 2}, "prediction": {"covers_core_contribution": False}},
+        {"gold": {"novelty_score": 4}, "prediction": {"covers_core_contribution": False}},
+        {"gold": {"novelty_score": 5}, "prediction": {"covers_core_contribution": False}},
+        {"gold": {"novelty_score": 4}, "prediction": {"novelty_score": 4}},  # v1-style, excluded
+    ]
+    result = rino.coverage_discrimination(processed)
+    assert result["yes_rate_gold_le2"] == pytest.approx(2 / 3)
+    assert result["yes_rate_gold_ge4"] == 0.0
+    assert result["n_low"] == 3 and result["n_high"] == 3
+    # v1/v3 predictions without the binary field yield None rates.
+    no_binary = [{"gold": {"novelty_score": 1}, "prediction": {"novelty_score": 3}}]
+    assert rino.coverage_discrimination(no_binary)["yes_rate_gold_le2"] is None

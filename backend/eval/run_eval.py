@@ -161,8 +161,8 @@ async def _run_rinobench(args) -> None:
 
     llm = get_llm()
     rubric = rino.load_rubric()
-    novelty_policy = (rino.NOVELTY_POLICY_V3 if args.novelty_policy == "v3"
-                      else rino.NOVELTY_POLICY_V1)
+    novelty_policy = {"v1": rino.NOVELTY_POLICY_V1, "v3": rino.NOVELTY_POLICY_V3,
+                      "v4a": rino.NOVELTY_POLICY_V4A}[args.novelty_policy]
 
     async def run_one(sample: dict) -> dict:
         stats = CallStats()
@@ -382,9 +382,10 @@ def build_parser() -> argparse.ArgumentParser:
     rino_parser = sub.add_parser("rinobench", parents=[common],
                                  help="RINoBench novelty judgment (gold_related_works, no self retrieval)")
     rino_parser.add_argument("--split", default="test", help="dataset split file (train/test)")
-    rino_parser.add_argument("--novelty-policy", choices=["v1", "v3"], default="v1",
+    rino_parser.add_argument("--novelty-policy", choices=["v1", "v3", "v4a"], default="v1",
                              help="novelty judgment policy: v1=holistic 1-5, "
-                                  "v3=criterion-first (closest-work coverage -> residual delta -> score)")
+                                  "v3=criterion-first (4-way coverage), "
+                                  "v4a=forced binary coverage (YES/NO)")
     rino_parser.set_defaults(func=lambda args: asyncio.run(_run_rinobench(args)))
 
     internal_parser = sub.add_parser(
