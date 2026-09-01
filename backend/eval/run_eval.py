@@ -161,11 +161,13 @@ async def _run_rinobench(args) -> None:
 
     llm = get_llm()
     rubric = rino.load_rubric()
+    novelty_policy = (rino.NOVELTY_POLICY_V3 if args.novelty_policy == "v3"
+                      else rino.NOVELTY_POLICY_V1)
 
     async def run_one(sample: dict) -> dict:
         stats = CallStats()
         out = await rino.run_novelty_sample(sample, llm, stats, rubric=rubric,
-                                            novelty_policy=args.novelty_policy)
+                                            novelty_policy=novelty_policy)
         record = {
             "sample_id": sample["source"],
             "prediction": out["prediction"],
