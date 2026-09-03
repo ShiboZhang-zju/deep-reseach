@@ -24,7 +24,10 @@ def temp_db():
     try: os.unlink(path)
     except PermissionError: pass
 
-from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION, audit_gap_candidates, evaluate_gap_search_admission, select_gap_specific_neighbors
+from app.agent.steps import audit_gaps
+from app.agent.steps.audit_gaps import (audit_gap_candidates,
+                                        evaluate_gap_search_admission,
+                                        select_gap_specific_neighbors)
 from app.agent.state import ResearchState
 from app.db.models import Paper, SearchQueryPaper, SearchQueryRecord
 from app.db.repositories import gap_repo
@@ -55,7 +58,7 @@ def test_gap_specific_neighbor_selection_excludes_task_only_paper(temp_db):
     db.flush()
     records = []
     for family in ("exact_gap", "alternative_coverage", "claim_falsification"):
-        record = SearchQueryRecord(task_id=task.id, query_text=family, normalized_query_text=family, intent=f"gap_{family}", round_number=3, status="completed", target_gap_id=gap.id, query_family=family, search_policy_version=GAP_SEARCH_POLICY_VERSION)
+        record = SearchQueryRecord(task_id=task.id, query_text=family, normalized_query_text=family, intent=f"gap_{family}", round_number=3, status="completed", target_gap_id=gap.id, query_family=family, search_policy_version=audit_gaps.GAP_SEARCH_POLICY_VERSION)
         db.add(record)
         records.append(record)
     db.flush()

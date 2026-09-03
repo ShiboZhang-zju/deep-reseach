@@ -156,13 +156,22 @@ class SearchService:
             logger.warning("Source %s failed: %s", src.name, e)
             return []
 
-    async def search_all_sources(self, query: str, limit: int = 15) -> list[RawPaper]:
-        """Search all sources concurrently for a single query."""
-        tasks = [self._search_with_cache(src, query, limit) for src in self.sources]
+    async def search_all_sources(self, query: str, limit: int = 15,
+                                 allowed_sources: list[str] | None = None) -> list[RawPaper]:
+        """Search all sources concurrently for a single query.
+
+        allowed_sources (optional): restrict to the named sources (budgeted
+        audit mode searches only S2/OpenAlex/arXiv by default); None = all.
+        """
+        sources = self.sources
+        if allowed_sources:
+            wanted = {s.strip().lower() for s in allowed_sources}
+            sources = [src for src in self.sources if src.name.lower() in wanted]
+        tasks = [self._search_with_cache(src, query, limit) for src in sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_papers: list[RawPaper] = []
-        for src, result in zip(self.sources, results):
+        for src, result in zip(sources, results):
             if isinstance(result, Exception):
                 logger.warning("Source %s failed: %s", src.name, result)
                 continue
@@ -176,7 +185,8 @@ class SearchService:
 
         return all_papers
 
-    async def search_multiple_queries(self, queries: list[str], limit: int = 15) -> list[RawPaper]:
+    async def search_multiple_queries(self, queries: list[str], limit: int = 15,
+                                      allowed_sources: list[str] | None = None) -> list[RawPaper]:
         """Search all sources for multiple queries with bounded concurrency.
 
         Limits concurrent queries to search_query_concurrency to avoid
@@ -186,7 +196,7 @@ class SearchService:
 
         async def _one(q: str) -> list[RawPaper]:
             async with sem:
-                return await self.search_all_sources(q, limit)
+                return await self.search_all_sources(q, limit, allowed_sources)
 
         tasks = [_one(q) for q in queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)

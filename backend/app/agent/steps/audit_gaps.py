@@ -99,7 +99,46 @@ _AUDIT_TEXT_CONFLICT_RE = re.compile(
 # instead of buying another full audit round. The exact-equality undecidable
 # guard never fired in run10 because every round added a few papers; the
 # loop then terminated only through the ceiling budget after ~2.5h.
-GAP_SEARCH_POLICY_VERSION = "gap-search-admission-v14"
+# v15 (2026-09-02, user adjudication「渐进式对抗审计 + 增量重审」): behavior is
+# gated by settings.gap_audit_progressive (default OFF keeps exact v14
+# semantics while the production_e2e 24-topic run finishes on one version).
+# Progressive mode: P0-1 repeated/zero-new-neighbor stop signals run BEFORE
+# neighbor full-text extraction; P0-2 full-text extraction admits work in
+# waves and stops once the verdict-ceiling requirement is met. The version
+# string bumps with the flag so persisted audit records are attributable.
+GAP_SEARCH_POLICY_VERSION = (
+    "gap-search-budgeted-v16" if settings.gap_audit_budgeted else
+    "gap-search-admission-v15" if settings.gap_audit_progressive
+    else "gap-search-admission-v14")
+
+
+def _audit_budget() -> dict:
+    """Effective audit budget (v16 Budgeted Falsification vs legacy v14/v15).
+
+    Budgeted mode hard-caps every expensive dimension: 4 queries x 3 sources,
+    Top-10 candidates, Top-3 neighbors, <=2 full-text papers (suspect killers
+    first), killer search <=3 queries, Top-1 gap competition. Legacy mode
+    returns the v14 knobs unchanged.
+    """
+    if settings.gap_audit_budgeted:
+        return {
+            "queries": max(settings.budgeted_audit_max_queries, 1),
+            "candidates": max(settings.budgeted_audit_max_candidate_papers, 1),
+            "neighbors": max(settings.budgeted_audit_neighbors, 1),
+            "fulltext": max(settings.budgeted_audit_fulltext_max_papers, 0),
+            "killer_queries": max(settings.budgeted_killer_search_max_queries, 1),
+            "sources": [s.strip() for s in
+                        (settings.budgeted_audit_sources or "").split(",")
+                        if s.strip()],
+        }
+    return {
+        "queries": settings.gap_audit_max_queries,
+        "candidates": settings.gap_audit_max_candidate_papers,
+        "neighbors": _MAX_NEIGHBORS,
+        "fulltext": settings.audit_neighbor_evidence_max_papers,
+        "killer_queries": settings.killer_search_max_queries,
+        "sources": None,
+    }
 
 
 # --- Canonical atomic claims (Phase 3H) ---
@@ -1055,6 +1094,28 @@ def _audit_evidence_delta(db, gap, query_ids: list[str], admission, neighbors: l
 
 
 def _record_audit_timeout(db, task_id: str, gap: GapCandidate, audit_round: int) -> GapAuditResult:
+    if settings.gap_audit_budgeted:
+        # v16: the budget is the budget — a timed-out audit cannot re-enter the
+        # loop. Honest outcome: the gap is closed as unproven, never survived.
+        gap.status = "rejected"
+        gap_repo.create_gap_audit(
+            db, gap_id=gap.id, task_id=task_id, adversarial_queries=[],
+            audit_result="uncertain", neighbor_paper_ids=[],
+            recommended_action="reject",
+            rejection_reason=("audit_budget_exhausted: the budgeted adversarial "
+                              "audit did not complete within "
+                              f"{settings.gap_audit_timeout_seconds:.0f}s; the gap "
+                              "is unproven, not novel"),
+            audit_round=audit_round, search_policy_version=GAP_SEARCH_POLICY_VERSION,
+            search_admission_status="AUDIT_TIMEOUT", search_admission_reasons=["AUDIT_TIMEOUT"],
+            search_query_ids=[], audited_claimed_delta=gap.claimed_delta or "",
+            failure_reason_codes=["AUDIT_TIMEOUT"], evidence_delta={
+                "query_count": 0, "candidate_paper_count": 0,
+                "new_paper_count": 0, "new_evidence_count": 0,
+            },
+        )
+        db.commit()
+        return GapAuditResult(gap.id, "uncertain", "reject", "")
     gap.status = "auditing"
     gap_repo.create_gap_audit(
         db, gap_id=gap.id, task_id=task_id, adversarial_queries=[],
@@ -1156,6 +1217,53 @@ def _audit_input_repeats(previous: GapAudit | None, gap: GapCandidate,
         return False
     return set(json.loads(previous.neighbor_paper_ids_json or "[]")) == {
         paper.id for paper in neighbors}
+
+
+def _progressive_no_new_neighbor_stop(db, gap: GapCandidate,
+                                      neighbors: list[Paper]) -> str | None:
+    """v15 P0-1: cheap pre-fulltext stop for repeated adversarial rounds.
+
+    The latest PASS audit asked for more_search with an unchanged claim, and
+    this round's neighbor set adds nothing beyond what that round already
+    surfaced (its neighbors plus everything its queries recalled). Re-running
+    the expensive audit then cannot reach a different verdict, so the round is
+    closed before paying for PDF download + full-text extraction. Deliberately
+    asymmetric: this may close an UNPROVEN gap early, it can never confirm one.
+    Cross-version history is inspected on purpose (no policy-version filter):
+    the waste this guards against happens exactly when a version bump or a
+    remediation loop re-runs a settled question.
+    """
+    latest_pass = (db.query(GapAudit)
+                   .filter(GapAudit.gap_id == gap.id,
+                           GapAudit.search_admission_status == "PASS")
+                   .order_by(GapAudit.created_at.desc()).first())
+    if latest_pass is None or latest_pass.recommended_action != "more_search":
+        return None
+    if latest_pass.audited_claimed_delta is None:
+        return None
+    if latest_pass.audited_claimed_delta != (gap.claimed_delta or ""):
+        return None
+    previous_ids = set(json.loads(latest_pass.neighbor_paper_ids_json or "[]"))
+    previous_query_ids = set(json.loads(latest_pass.search_query_ids_json or "[]"))
+    if previous_query_ids:
+        previous_ids.update(row.paper_id for row in db.query(SearchQueryPaper).filter(
+            SearchQueryPaper.query_id.in_(previous_query_ids)).all())
+    if {paper.id for paper in neighbors} - previous_ids:
+        return None
+    return "NO_NEW_NEIGHBOR_EVIDENCE"
+
+
+def _count_verified_neighbors(db, neighbors: list[Paper]) -> int:
+    """Neighbors carrying at least one verified/upgraded full-text evidence unit."""
+    count = 0
+    for paper in neighbors:
+        has_fulltext = db.query(EvidenceUnit.id).filter(
+            EvidenceUnit.paper_id == paper.id,
+            EvidenceUnit.verification_status.in_(("verified", "upgraded")),
+        ).limit(1).first() is not None
+        if has_fulltext:
+            count += 1
+    return count
 
 
 # P1 (run10 review): diminishing-return stop thresholds. These are engineering
@@ -1279,7 +1387,13 @@ async def audit_gap_candidate(
         seen_normalized.add(normalized)
         unique_specs.append(spec)
     query_specs = unique_specs
-    query_cap = max(settings.gap_audit_max_queries, 1)
+    audit_budget = _audit_budget()
+    if settings.gap_audit_budgeted:
+        # v16: drop the benchmark family — with a 4-query budget the four
+        # remaining families (exact/problem, mechanism, synonym,
+        # method_neighbor) carry the killer-discovery weight.
+        query_specs = [spec for spec in query_specs if spec.family != "benchmark"]
+    query_cap = max(audit_budget["queries"], 1)
     generated_query_count = len(query_specs)
     if generated_query_count > query_cap:
         query_specs = _cap_query_specs_family_balanced(query_specs, query_cap)
@@ -1307,7 +1421,12 @@ async def audit_gap_candidate(
     db.commit()
     if perform_search and executions:
         try:
-            await search_and_save_papers(db, state, executions, task_id, audit_round)
+            # Legacy mode passes no source restriction at all (zero signature
+            # pressure on existing callers/tests); only budgeted mode restricts.
+            search_kwargs = ({"allowed_sources": audit_budget["sources"]}
+                             if audit_budget["sources"] else {})
+            await search_and_save_papers(db, state, executions, task_id, audit_round,
+                                         **search_kwargs)
             # Evidence-funnel repair: audit-recalled papers used to stay
             # priority=NULL (main-round scoring never saw them), so they were
             # invisible to extract_evidence (priority in [high, medium]) and
@@ -1330,7 +1449,7 @@ async def audit_gap_candidate(
     # (Task 9e56a131: 7/9 audits timed out with everything lost.)
     db.commit()
     admission = evaluate_gap_search_admission(db, gap, [item.query_id for item in executions])
-    candidate_cap = max(settings.gap_audit_max_candidate_papers, 1)
+    candidate_cap = max(audit_budget["candidates"], 1)
     original_candidate_count = len(admission.candidate_paper_ids)
     if original_candidate_count > candidate_cap:
         capped_ids = _cap_gap_candidate_papers(db, admission.candidate_paper_ids, candidate_cap)
@@ -1410,7 +1529,43 @@ async def audit_gap_candidate(
     neighbors = select_gap_specific_neighbors(
         db, gap, admission.completed_query_ids,
         candidate_paper_ids=admission.candidate_paper_ids,
+        limit=audit_budget["neighbors"],
     )
+    # v15 P0-1 (progressive mode): repeated-round stop signals run BEFORE
+    # full-text extraction. Legacy mode keeps the post-extraction check below
+    # so v14 semantics are untouched while the 24-topic run is in flight.
+    if settings.gap_audit_progressive:
+        stop_code = _progressive_no_new_neighbor_stop(db, gap, neighbors)
+        if stop_code is not None:
+            gap.status = "rejected"
+            reason = (f"novelty_undecidable: adversarial round {audit_round} "
+                      "surfaced no new neighbors after a more_search verdict "
+                      f"({stop_code}); re-auditing cannot change the verdict")
+            gap_repo.create_gap_audit(
+                db, gap_id=gap.id, task_id=task_id, adversarial_queries=queries,
+                audit_result="uncertain",
+                neighbor_paper_ids=[paper.id for paper in neighbors],
+                recommended_action="reject", rejection_reason=reason,
+                audit_round=audit_round,
+                search_policy_version=GAP_SEARCH_POLICY_VERSION,
+                search_admission_status=admission.status,
+                search_admission_reasons=admission.reason_codes,
+                search_query_ids=admission.query_ids,
+                audited_claimed_delta=gap.claimed_delta or "",
+                failure_reason_codes=sorted(set(failure_codes + [stop_code])),
+                evidence_delta={"query_count": len(queries),
+                                "candidate_paper_count": len(admission.candidate_paper_ids),
+                                "new_paper_count": 0, "new_evidence_count": 0},
+            )
+            paper_repo.save_trace(db, task_id, "gap_audit_pre_fulltext_stop",
+                                  "decision", output_data={
+                                      "gap_id": gap.id,
+                                      "neighbor_count": len(neighbors),
+                                      "reason_code": stop_code,
+                                  })
+            logger.info("Gap %s: pre-fulltext stop — %s", gap.id[:8], stop_code)
+            db.commit()
+            return GapAuditResult(gap.id, "uncertain", "reject", "")
     # Evidence-funnel repair: neighbors without verified full-text evidence
     # used to make NO_FULLTEXT_EVIDENCE structural (abstract-only comparison
     # material). Extract bounded full-text evidence for the selected neighbors
@@ -1460,7 +1615,11 @@ async def audit_gap_candidate(
     except Exception as exc:
         logger.warning("Gap %s: NPA diagnostics failed (non-fatal): %s",
                        gap.id[:8], exc)
-    if _audit_input_repeats(_latest_decided_audit(db, gap.id), gap, neighbors):
+    # Legacy (v14) placement of the exact-repeat guard. Progressive mode has
+    # already handled this case pre-fulltext above; keeping the legacy branch
+    # verbatim preserves v14 behavior while the flag is off.
+    if not settings.gap_audit_progressive and _audit_input_repeats(
+            _latest_decided_audit(db, gap.id), gap, neighbors):
         # A previous audit asked for more search and got none: same claim, same
         # neighbors. Observed cost of not detecting this: one gap audited four
         # times with an identical query set for an identical "uncertain", about
@@ -1747,6 +1906,23 @@ async def audit_gap_candidate(
                     "neighbor Jaccard %.2f", gap.id[:8], stop_meta["novelty"],
                     stop_meta["neighbor_jaccard"])
         action = "reject"
+    if settings.gap_audit_budgeted and (
+            decision.audit_result == "partially_closed" or action == "narrow"):
+        # v16 Budgeted Falsification: partial coverage is NOT a FULL killer.
+        # Frozen semantics: with no direct prior art covering the claimed
+        # delta, the gap SURVIVES the budgeted audit ("survived_budgeted_
+        # audit") and the partial overlap is disclosed in the failure codes
+        # instead of funding a narrowing re-audit the budget does not cover.
+        # Routed through the standard confirmed path below so the text-conflict
+        # and low-novelty guards still apply (a hedged 0.2-confidence partial
+        # still dies as insufficient evidence).
+        decision.audit_result = "confirmed"
+        action = "continue"
+        failure_codes.append("SURVIVED_BUDGETED_AUDIT_PARTIAL_COVERAGE_NOTED")
+        paper_repo.save_trace(db, task_id, "budgeted_partial_survive", "decision",
+                              output_data={"gap_id": gap.id,
+                                           "novelty_confidence": decision.novelty_confidence,
+                                           "remaining_delta": (decision.remaining_delta or "")[:400]})
     if action == "continue" and decision.audit_result == "confirmed":
         # E2E 2026-08-26: text-verdict consistency guard. A confirmed/continue
         # decision whose own remaining_delta concludes "the decision is
@@ -1958,7 +2134,10 @@ def _expand_killer_terms(llm_terms: list[str], neighbors: list[Paper],
     meta: dict = {"llm_terms": list(llm_terms), "added": []}
     if not neighbors:
         return llm_terms, meta
-    budget = settings.killer_search_max_queries - len(llm_terms)
+    killer_cap = (settings.budgeted_killer_search_max_queries
+                  if settings.gap_audit_budgeted
+                  else settings.killer_search_max_queries)
+    budget = killer_cap - len(llm_terms)
     if budget <= 0:
         return llm_terms, meta
     if not (killer_description or "").strip():
@@ -2172,7 +2351,9 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
     record["query_source_distribution"] = _killer_query_source_distribution(
         gap, terms, expansion_meta)
     executions = []
-    for term in expanded_terms[:settings.killer_search_max_queries]:
+    for term in expanded_terms[:(settings.budgeted_killer_search_max_queries
+                                 if settings.gap_audit_budgeted
+                                 else settings.killer_search_max_queries)]:
         query_record = save_search_query(
             db, task_id, term, "gap_killer", None, None, audit_round,
             target_gap_id=gap.id, query_family="killer",
@@ -2233,7 +2414,10 @@ async def _ensure_neighbor_evidence(db, state, llm, task_id: str, gap: GapCandid
         _download_pdfs, _extract_from_paper_safe,
     )
 
-    limit = max(settings.audit_neighbor_evidence_max_papers, 0)
+    limit = max(
+        settings.budgeted_audit_fulltext_max_papers
+        if settings.gap_audit_budgeted
+        else settings.audit_neighbor_evidence_max_papers, 0)
     if limit == 0:
         return
     pending: list[tuple[Paper, TaskPaper]] = []
@@ -2250,10 +2434,66 @@ async def _ensure_neighbor_evidence(db, state, llm, task_id: str, gap: GapCandid
         ).first()
         if tp is not None:
             pending.append((paper, tp))
+    if settings.gap_audit_budgeted:
+        # v16: full-text only for the most likely killers. relevance_score
+        # weights claim_overlap highest, so ranking the (already capped)
+        # pending list by it puts suspected killers first within the budget.
+        from app.db.models import GapPaperRelevance
+        rel_scores = {r.paper_id: (r.relevance_score or 0.0) for r in db.query(
+            GapPaperRelevance).filter(GapPaperRelevance.gap_id == gap.id).all()}
+        pending.sort(key=lambda pair: -rel_scores.get(pair[0].id, 0.0))
     if not pending:
         return
     logger.info("Gap %s audit: extracting full-text evidence for %d neighbor(s) "
                 "(round %d)", gap.id[:8], len(pending), audit_round)
+    if settings.gap_audit_progressive:
+        # v15 P0-2: wave-based work admission. The verdict ceiling requires
+        # only audit_ceiling_min_fulltext_neighbors verified neighbors, and
+        # re-audits usually already satisfy it from earlier rounds — in that
+        # case this returns without downloading anything (the purest fix for
+        # "re-paying for already-paid work"). Worst-case work is unchanged
+        # (pending is still capped by audit_neighbor_evidence_max_papers).
+        min_verified = max(settings.audit_ceiling_min_fulltext_neighbors, 1)
+        wave_size = max(settings.audit_neighbor_evidence_wave_size, 1)
+        if _count_verified_neighbors(db, neighbors) >= min_verified:
+            logger.info("Gap %s audit: full-text ceiling already satisfied; "
+                        "skipping neighbor extraction", gap.id[:8])
+            return
+        attempted_total = 0
+        try:
+            for wave_start in range(0, len(pending), wave_size):
+                wave = pending[wave_start:wave_start + wave_size]
+                attempted_total += len(wave)
+                pdf_paths = await _download_pdfs(wave, task_id)
+                semaphore = asyncio.Semaphore(len(wave))
+                results = await asyncio.gather(*[
+                    _extract_from_paper_safe(
+                        task_id, paper, tp, pdf_paths.get(paper.id), llm,
+                        audit_round, semaphore)
+                    for paper, tp in wave
+                ], return_exceptions=True)
+                extracted = sum(r for r in results if isinstance(r, int))
+                verified_neighbors = _count_verified_neighbors(db, neighbors)
+                paper_repo.save_trace(db, task_id, "audit_neighbor_evidence",
+                                      "action", output_data={
+                                          "gap_id": gap.id,
+                                          "round": audit_round,
+                                          "papers_attempted": len(wave),
+                                          "papers_attempted_total": attempted_total,
+                                          "evidence_extracted": extracted,
+                                          "verified_fulltext_neighbors": verified_neighbors,
+                                          "wave_mode": True,
+                                      })
+                db.commit()
+                if verified_neighbors >= min_verified:
+                    logger.info("Gap %s audit: full-text ceiling met after wave "
+                                "(%d verified neighbors)",
+                                gap.id[:8], verified_neighbors)
+                    return
+        except Exception as exc:
+            logger.warning("Gap %s: neighbor evidence extraction failed "
+                           "(non-fatal): %s", gap.id[:8], exc)
+        return
     try:
         pdf_paths = await _download_pdfs(pending, task_id)
         semaphore = asyncio.Semaphore(len(pending))

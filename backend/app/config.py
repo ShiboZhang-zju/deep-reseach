@@ -328,6 +328,31 @@ class Settings(BaseSettings):
     gap_audit_max_queries: int = 12
     gap_audit_max_candidate_papers: int = 20
     gap_audit_timeout_seconds: int = 600
+    # v15 渐进式对抗审计（2026-09-02，用户裁决「渐进式对抗审计 + 增量重审」）。
+    # 默认 off 保持 v14 语义——production_e2e 24 题正式跑须同版本完成。
+    # 开启后：P0-1 重复轮/零新邻的停止判断提前到近邻全文抽取之前；
+    # P0-2 近邻全文按 wave_size 一波波抽取、凑足 audit_ceiling_min_fulltext_neighbors
+    # 篇 verified 即停（ceiling 本来只要求 1 篇，v14 却最多一次跑 5 篇）。
+    # 激活时 GAP_SEARCH_POLICY_VERSION 自动升 v15；须跑 test_research_validity_regression。
+    gap_audit_progressive: bool = False
+    audit_neighbor_evidence_wave_size: int = 2
+    # v16 Budgeted Falsification（2026-09-03 用户裁决）：放弃「穷尽式查新」作为必经
+    # 门禁，改为固定预算内尽力找 killer prior art；预算内找不到 → survived_budgeted_
+    # audit（措辞：在当前检索预算与审计范围内未发现直接覆盖该 claimed delta 的
+    # prior art），绝不声称 confirmed novel。预算硬上限：
+    #   1 次主审计/gap + 1 次 killer search，无 re-audit/remediation；
+    #   4 查询（砍 benchmark 族）× 3 源（S2/OpenAlex/arXiv）→ Top-10 摘要筛选 →
+    #   Top-3 邻 claim 判断 → 0-2 篇全文（疑似 killer 优先，按 relevance_score）→
+    #   killer search ≤3 查询 → STOP；Top-1 gap 竞争（max_gaps_to_deep_audit）；
+    #   超时（GAP_AUDIT_TIMEOUT_SECONDS=600）→ insufficient_evidence，不补救。
+    gap_audit_budgeted: bool = False
+    budgeted_audit_max_queries: int = 4
+    budgeted_audit_max_candidate_papers: int = 10
+    budgeted_audit_neighbors: int = 3
+    budgeted_audit_fulltext_max_papers: int = 2
+    budgeted_killer_search_max_queries: int = 3
+    budgeted_audit_sources: str = "semantic_scholar,openalex,arxiv"
+    max_gaps_to_deep_audit: int = 1
     # Evidence-funnel repair (E2E 2026-08-26: audit-recalled papers stayed
     # priority=NULL and never entered evidence extraction, so 94/94 round-3
     # papers were invisible downstream and NO_FULLTEXT_EVIDENCE was structural).

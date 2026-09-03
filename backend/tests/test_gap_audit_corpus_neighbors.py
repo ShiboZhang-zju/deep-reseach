@@ -32,8 +32,8 @@ def temp_db():
         pass
 
 
-from app.agent.steps.audit_gaps import (GAP_SEARCH_POLICY_VERSION,
-                                        collect_same_question_neighbors,
+from app.agent.steps import audit_gaps
+from app.agent.steps.audit_gaps import (collect_same_question_neighbors,
                                         evaluate_gap_search_admission,
                                         select_gap_specific_neighbors)
 from app.db.models import (EvidenceUnit, Paper, QuestionEvidenceLink, ResearchQuestion,
@@ -75,7 +75,8 @@ def _add_queries(db, task, gap, *, families, papers, status="completed"):
         record = SearchQueryRecord(
             task_id=task.id, query_text=family, normalized_query_text=family,
             intent=f"gap_{family}", round_number=3, status=status, target_gap_id=gap.id,
-            query_family=family, search_policy_version=GAP_SEARCH_POLICY_VERSION)
+            query_family=family,
+            search_policy_version=audit_gaps.GAP_SEARCH_POLICY_VERSION)
         db.add(record)
         records.append(record)
     db.flush()

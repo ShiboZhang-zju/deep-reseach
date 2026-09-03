@@ -927,6 +927,16 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         db.commit()
         state = task_repo.get_state(db, task_id)
         if not state.surviving_gap_ids:
+            if settings.gap_audit_budgeted:
+                # v16 Budgeted Falsification: one audit per gap — no narrowing
+                # and no remediation re-audit. The top-ranked gap was audited
+                # within its budget and did not survive; the honest outcome is a
+                # task-level abstention, not another round of spending.
+                _finalize_inconclusive_gaps(db, task_id)
+                await _terminate_more_research(db, state, task_id,
+                                               "insufficient_evidence",
+                                               "budgeted_audit_no_surviving_gap")
+                return
             # A partially closed gap comes with an explicit remaining delta, so
             # shrink the claim to it and re-audit before paying for another
             # remediation round of paper collection.
@@ -1145,19 +1155,23 @@ def _apply_gap_competition_selection(db, task_id: str, gaps, audit_gap_ids: list
     rewritten subset) and when the set fits within the budget."""
     from app.db.repositories import paper_repo
 
-    if pending_narrowed or len(audit_gap_ids) <= _GAP_COMPETITION_TOP_K:
+    from app.config import settings
+    top_k = (max(settings.max_gaps_to_deep_audit, 1)
+             if settings.gap_audit_budgeted else _GAP_COMPETITION_TOP_K)
+    if pending_narrowed or len(audit_gap_ids) <= top_k:
         return audit_gap_ids
     gap_by_id = {g.id: g for g in gaps}
     ranked = sorted(
         (g for g in gaps if g.id in set(audit_gap_ids)),
         key=lambda g: _cheap_gap_rank_score(db, g), reverse=True)
-    selected = ranked[:_GAP_COMPETITION_TOP_K]
+    selected = ranked[:top_k]
     selected_ids = {g.id for g in selected}
-    deferred = [g for g in ranked[_GAP_COMPETITION_TOP_K:]]
+    deferred = [g for g in ranked[top_k:]]
     trimmed = [gid for gid in audit_gap_ids if gid in selected_ids]
     paper_repo.save_trace(db, task_id, "gap_competition", "decision", output_data={
         "stage": "select_audit_candidates",
-        "top_k": _GAP_COMPETITION_TOP_K,
+        "top_k": top_k,
+        "budgeted": settings.gap_audit_budgeted,
         "candidates": [{"gap_id": g.id,
                         "score": round(_cheap_gap_rank_score(db, g), 4)}
                        for g in ranked],
@@ -1166,7 +1180,7 @@ def _apply_gap_competition_selection(db, task_id: str, gaps, audit_gap_ids: list
     })
     logger.info("Task %s: gap competition — auditing top-%d of %d candidates "
                 "(%d deferred for later rounds)",
-                task_id[:8], _GAP_COMPETITION_TOP_K, len(audit_gap_ids), len(deferred))
+                task_id[:8], top_k, len(audit_gap_ids), len(deferred))
     return trimmed
 
 

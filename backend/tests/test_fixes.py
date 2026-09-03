@@ -217,9 +217,14 @@ def test_recover_no_rounds_resets_to_zero():
 
 # === Fix 5: start_agent atomic check-and-register ===
 
-def test_start_agent_rejects_when_capacity_full():
+def test_start_agent_rejects_when_capacity_full(monkeypatch):
     """start_agent should return False when max_concurrent_agents is reached."""
+    from app.config import settings
     from app.agent.runner import start_agent, _task_registry
+
+    # Pin the cap explicitly: the developer .env may raise it for parallel
+    # eval runs (observed 2026-09-03 with MAX_CONCURRENT_AGENTS=6).
+    monkeypatch.setattr(settings, "max_concurrent_agents", 2)
 
     # Fill registry with fake running tasks
     original = _task_registry.copy()

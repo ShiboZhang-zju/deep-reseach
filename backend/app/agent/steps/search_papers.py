@@ -39,7 +39,9 @@ MIN_SUCCESS_RATE = 0.5
 
 async def search_and_save_papers(db, state: ResearchState,
                                   query_executions: list, task_id: str,
-                                  round_num: int) -> tuple[int, int, list[str]]:
+                                  round_num: int,
+                                  allowed_sources: list[str] | None = None
+                                  ) -> tuple[int, int, list[str]]:
     """Search papers for each query, deduplicate, and save to DB.
 
     Args:
@@ -64,8 +66,13 @@ async def search_and_save_papers(db, state: ResearchState,
         query_id = qe.query_id
 
         try:
+            # Legacy path passes no source restriction (zero signature pressure
+            # on existing callers/fakes); only a budgeted override passes it.
+            search_kwargs = ({"allowed_sources": allowed_sources}
+                             if allowed_sources else {})
             raw_papers = await search_service.search_multiple_queries(
-                [query_text], settings.papers_per_source_per_query
+                [query_text], settings.papers_per_source_per_query,
+                **search_kwargs,
             )
             raw_count = len(raw_papers)
             logger.info("Round %d query '%s': found %d raw papers",
