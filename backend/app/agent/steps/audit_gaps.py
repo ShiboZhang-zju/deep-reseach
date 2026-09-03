@@ -1096,8 +1096,14 @@ def _audit_evidence_delta(db, gap, query_ids: list[str], admission, neighbors: l
 def _record_audit_timeout(db, task_id: str, gap: GapCandidate, audit_round: int) -> GapAuditResult:
     if settings.gap_audit_budgeted:
         # v16: the budget is the budget — a timed-out audit cannot re-enter the
-        # loop. Honest outcome: the gap is closed as unproven, never survived.
-        gap.status = "rejected"
+        # loop, and it must never survive. But the honest terminal status is
+        # `inconclusive`, not `rejected`: rejected asserts the gap was
+        # disproven, which a wall-clock timeout never establishes (runner
+        # semantics: inconclusive = the budget ran out before novelty could be
+        # decided). recommended_action stays "reject" — do not re-enter the
+        # audit loop, do not survive — while the gap status carries the
+        # unproven-vs-refuted distinction for reporting.
+        gap.status = "inconclusive"
         gap_repo.create_gap_audit(
             db, gap_id=gap.id, task_id=task_id, adversarial_queries=[],
             audit_result="uncertain", neighbor_paper_ids=[],
@@ -1105,7 +1111,7 @@ def _record_audit_timeout(db, task_id: str, gap: GapCandidate, audit_round: int)
             rejection_reason=("audit_budget_exhausted: the budgeted adversarial "
                               "audit did not complete within "
                               f"{settings.gap_audit_timeout_seconds:.0f}s; the gap "
-                              "is unproven, not novel"),
+                              "is unproven (inconclusive), not disproven"),
             audit_round=audit_round, search_policy_version=GAP_SEARCH_POLICY_VERSION,
             search_admission_status="AUDIT_TIMEOUT", search_admission_reasons=["AUDIT_TIMEOUT"],
             search_query_ids=[], audited_claimed_delta=gap.claimed_delta or "",
@@ -1114,6 +1120,10 @@ def _record_audit_timeout(db, task_id: str, gap: GapCandidate, audit_round: int)
                 "new_paper_count": 0, "new_evidence_count": 0,
             },
         )
+        paper_repo.save_trace(db, task_id, "gap_audit_timeout", "decision", output_data={
+            "gap_id": gap.id, "timeout_seconds": settings.gap_audit_timeout_seconds,
+            "mode": "budgeted",
+        })
         db.commit()
         return GapAuditResult(gap.id, "uncertain", "reject", "")
     gap.status = "auditing"
@@ -1552,7 +1562,11 @@ async def audit_gap_candidate(
                 search_admission_reasons=admission.reason_codes,
                 search_query_ids=admission.query_ids,
                 audited_claimed_delta=gap.claimed_delta or "",
-                failure_reason_codes=sorted(set(failure_codes + [stop_code])),
+                # stop_code IS the failure reason here: this branch fires
+                # before the evidence-delta computation binds `failure_codes`,
+                # so referencing it would raise UnboundLocalError and take
+                # down the whole task instead of rejecting just this gap.
+                failure_reason_codes=sorted({stop_code}),
                 evidence_delta={"query_count": len(queries),
                                 "candidate_paper_count": len(admission.candidate_paper_ids),
                                 "new_paper_count": 0, "new_evidence_count": 0},
@@ -2366,8 +2380,17 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
         ))
     db.commit()
     try:
+        # The budget's source whitelist must cover the killer search too:
+        # without it the killer round runs every source (benchmark family
+        # included) even in budgeted mode, where the main audit restricts to
+        # the budget's three sources.
+        killer_search_kwargs: dict = {}
+        if settings.gap_audit_budgeted:
+            budget = _audit_budget()
+            if budget["sources"]:
+                killer_search_kwargs["allowed_sources"] = budget["sources"]
         _, _, new_paper_ids = await search_and_save_papers(
-            db, state, executions, task_id, audit_round)
+            db, state, executions, task_id, audit_round, **killer_search_kwargs)
     except Exception as exc:
         logger.warning("Gap %s: killer search degraded: %s", gap.id[:8], exc)
         record["search_degraded"] = True

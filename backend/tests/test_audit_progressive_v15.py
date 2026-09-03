@@ -122,6 +122,37 @@ def test_count_verified_neighbors(temp_db):
     assert _count_verified_neighbors(db, [paper]) == 1
 
 
+@pytest.mark.asyncio
+async def test_pre_fulltext_stop_rejects_gap_without_crashing(temp_db, monkeypatch):
+    """P0 regression: the pre-fulltext stop branch referenced the not-yet-bound
+    `failure_codes` (first bound only after full-text extraction) and raised
+    UnboundLocalError, which escaped audit_gap_candidates (it catches only
+    TimeoutError) and failed the whole task instead of rejecting one gap."""
+    from app.config import settings
+    from app.agent.state import ResearchState
+    from app.agent.steps.audit_gaps import audit_gap_candidates
+    from app.db.repositories import gap_repo
+    from test_audit_gaps import ConfirmingAuditLLM, _pin_admission_and_neighbors
+
+    db = temp_db()
+    task, gap, _ = _seed_gap(db)
+    neighbor = _pin_admission_and_neighbors(monkeypatch, db, gap)
+    # The trigger: the latest PASS audit asked more_search for the same claim,
+    # and this round surfaced none of its neighbors' new siblings.
+    _previous_pass_audit(db, gap, [neighbor.id])
+    monkeypatch.setattr(settings, "gap_audit_progressive", True)
+
+    state = ResearchState(task_id=task.id, contract_id=gap.contract_id, current_round=2)
+    results = await audit_gap_candidates(db, state, ConfirmingAuditLLM(), task.id,
+                                         perform_search=False)
+
+    assert [item.recommended_action for item in results] == ["reject"]
+    assert gap_repo.get_gap(db, gap.id).status == "rejected"
+    audit = gap_repo.list_gap_audits(db, gap.id)[-1]
+    assert "NO_NEW_NEIGHBOR_EVIDENCE" in (audit.failure_reason_codes_json or "")
+    db.close()
+
+
 def _state(gap):
     from app.agent.state import ResearchState
 
