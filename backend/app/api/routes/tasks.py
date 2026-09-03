@@ -6,9 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_session
+from app.config import settings
+from app.db.session import SessionLocal
 from app.db.repositories import task_repo
 from app.db.models import isoformat_utc
-from app.agent.runner import start_agent, stop_agent, run_experiment_generation
+from app.agent.runner import start_agent, stop_agent, run_experiment_generation, capacity_has_room
 from app.schemas.schemas import TaskCreate, TaskOut, ClarifyRequest, FeedbackRequest, IdeaSelectRequest
 
 router = APIRouter()
@@ -17,8 +19,9 @@ router = APIRouter()
 async def _deferred_start_agent(task_id: str):
     """Start agent after yielding control so HTTP response is sent first.
 
-    If start_agent rejects (capacity full), emit an error event so the
-    frontend can surface it instead of waiting indefinitely.
+    If start_agent rejects (capacity full, or no running loop), emit an error
+    event AND mark the task failed: a task left in pending/clarification that
+    will never start would otherwise hang pollers until the driver timeout.
     """
     await asyncio.sleep(0.05)
     started = start_agent(task_id)
@@ -28,6 +31,15 @@ async def _deferred_start_agent(task_id: str):
         emit_event(task_id, "error", {
             "message": f"已达最大并发任务数 ({settings.max_concurrent_agents})，请等待已有任务完成后再启动",
         })
+        db = SessionLocal()
+        try:
+            task = task_repo.get_task(db, task_id)
+            if task is not None and task.status in ("pending", "waiting_for_clarification"):
+                task_repo.update_status(db, task_id, "failed")
+                task_repo.update_stop_reason(db, task_id, "max_concurrent_agents_reached")
+                db.commit()
+        finally:
+            db.close()
 
 
 @router.post("/tasks", response_model=TaskOut)
@@ -56,6 +68,17 @@ async def start_task(task_id: str, db: Session = Depends(get_db_session)):
     task = task_repo.get_task(db, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    # Fail fast on a full registry: silently returning started for a task the
+    # deferred check will drop leaves it pending forever (drivers poll until
+    # their wall-clock timeout and report stopped_timeout for a task that
+    # never ran). The authoritative atomic check still lives in start_agent;
+    # this precheck just makes the common rejection an honest 429, which eval
+    # clients already retry on.
+    if not capacity_has_room():
+        raise HTTPException(
+            429,
+            detail=f"Max concurrent agents ({settings.max_concurrent_agents}) reached",
+        )
     # P1-11: start_agent now does atomic capacity-check-and-register internally,
     # closing the race window. The route just needs to handle the reject case.
     asyncio.create_task(_deferred_start_agent(task_id))

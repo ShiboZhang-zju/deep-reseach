@@ -291,6 +291,81 @@ async def test_contract_invalidation_on_clarification_change(temp_db):
     db.close()
 
 
+# === P0-2: /start must fail fast instead of silently accepting ===
+
+def test_start_returns_429_when_capacity_full(temp_db, monkeypatch):
+    """A full registry must yield an honest 429. A silent 200 left the task
+    pending forever and eval drivers burned their whole wall clock polling a
+    task that never started."""
+    engine, Session = temp_db
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.api.deps import get_db_session
+    from app.api.routes import tasks as tasks_routes
+    from app.db.models import ResearchTask
+
+    db = Session()
+    task = ResearchTask(user_input="capacity probe", status="pending")
+    db.add(task)
+    db.commit()
+    task_id = task.id
+    db.close()
+
+    def _override_db():
+        db = Session()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db_session] = _override_db
+    monkeypatch.setattr(tasks_routes, "capacity_has_room", lambda: False)
+    try:
+        client = TestClient(app)
+        response = client.post(f"/api/tasks/{task_id}/start")
+        assert response.status_code == 429, (
+            f"Expected 429 when capacity is full, got {response.status_code}: {response.text}"
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_deferred_start_marks_task_failed_when_rejected(temp_db, monkeypatch):
+    """When the deferred atomic check rejects (capacity full), the task must
+    land in a terminal state with a stop reason instead of hanging pending."""
+    engine, Session = temp_db
+
+    from app.db.models import ResearchTask
+    from app.api.routes import tasks as tasks_routes
+
+    db = Session()
+    task = ResearchTask(user_input="deferred reject probe", status="pending")
+    db.add(task)
+    db.commit()
+    task_id = task.id
+    db.close()
+
+    def _reject(_task_id):
+        # start_agent is a synchronous function; a fake must be too.
+        return False
+
+    monkeypatch.setattr(tasks_routes, "start_agent", _reject)
+    # _deferred_start_agent opens its own session; point it at the temp DB.
+    monkeypatch.setattr(tasks_routes, "SessionLocal", Session)
+
+    await tasks_routes._deferred_start_agent(task_id)
+
+    db = Session()
+    try:
+        row = db.query(ResearchTask).filter(ResearchTask.id == task_id).one()
+        assert row.status == "failed"
+        assert row.stop_reason == "max_concurrent_agents_reached"
+    finally:
+        db.close()
+
+
 # === #1: Clarification feedback preserves questions ===
 
 @pytest.mark.asyncio

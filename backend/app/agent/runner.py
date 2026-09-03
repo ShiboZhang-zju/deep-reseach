@@ -229,8 +229,16 @@ def start_agent(task_id: str) -> bool:
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # No running event loop: creating a fresh loop and scheduling _run on
+        # it would never execute (nothing ever runs that loop), yet the caller
+        # would see True — a silent no-op. Honest behavior is to refuse; the
+        # HTTP routes always run inside the uvicorn loop, so this only fires
+        # for misuse from sync contexts (tests, scripts).
+        logger.error(
+            "Task %s: start_agent called without a running event loop; "
+            "refusing to start (the coroutine would never execute)",
+            task_id[:8])
+        return False
 
     task = loop.create_task(_run())
     # Synchronous registration — no await, no race window.
@@ -239,6 +247,18 @@ def start_agent(task_id: str) -> bool:
     # call (single-threaded event loop, no await between create_task and assign).
     _task_registry[task_id] = task
     return True
+
+
+def capacity_has_room() -> bool:
+    """Best-effort synchronous capacity precheck for fail-fast HTTP responses.
+
+    The authoritative atomic check-and-register lives in start_agent(); this
+    precheck can race with concurrent starts, but it lets /start return an
+    honest 429 immediately instead of silently accepting a task that the
+    deferred check will then drop on the floor.
+    """
+    running = sum(1 for t in _task_registry.values() if not t.done())
+    return running < settings.max_concurrent_agents
 
 
 async def _safe_mark_failed(task_id: str, reason: str, event_message: str, cleanup: bool = False):
