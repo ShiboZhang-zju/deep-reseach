@@ -51,3 +51,62 @@ def test_token_budget_enforced():
     assert p.total_tokens_used == 150
     with pytest.raises(LLMBudgetExceeded):
         p._track_call()
+
+
+def test_budget_isolated_per_task_context():
+    """Two tasks sharing the singleton provider must not reset each other's
+    spent counters or trip each other's budget (N-way concurrency: task B's
+    set_budget used to zero task A's counters, and an exhausted task A used
+    to raise LLMBudgetExceeded inside task B)."""
+    from app.llm.base import set_task_context
+
+    p = _DummyProvider()
+
+    set_task_context("task-a")
+    p.set_budget(max_calls=3)
+    p._track_call()
+    p._track_call()
+
+    set_task_context("task-b")
+    p.set_budget(max_calls=3)
+    p._track_call()
+
+    # task-a's counters survive task-b's set_budget: one more call reaches
+    # the cap (must not raise), the next one exceeds it.
+    set_task_context("task-a")
+    p._track_call()
+    with pytest.raises(LLMBudgetExceeded):
+        p._track_call()
+
+    # task-b is unaffected by task-a exhausting its own budget.
+    set_task_context("task-b")
+    p._track_call()
+    p._track_call()
+    with pytest.raises(LLMBudgetExceeded):
+        p._track_call()
+
+
+def test_token_budget_isolated_per_task_context():
+    from app.llm.base import set_task_context
+
+    p = _DummyProvider()
+
+    set_task_context("task-a")
+    p.set_budget(max_total_tokens=200)
+    set_task_context("task-b")
+    p.set_budget(max_total_tokens=200)
+
+    p.last_usage = {"total_tokens": 150}
+    p._record_usage()  # task-b spends 150
+
+    set_task_context("task-a")
+    p.last_usage = {"total_tokens": 150}
+    p._record_usage()  # task-a spends its own 150
+    assert p.total_tokens_used == 150
+
+    set_task_context("task-b")
+    p.last_usage = {"total_tokens": 60}
+    p._record_usage()  # task-b accumulates independently: 150 + 60
+    assert p.total_tokens_used == 210
+    with pytest.raises(LLMBudgetExceeded):
+        p._track_call()

@@ -6,19 +6,23 @@ import copy
 import logging
 import re
 import time
-from contextvars import ContextVar
 from typing import Type, TypeVar
 
 import httpx
 from pydantic import BaseModel
 
 from app.config import settings
-from app.llm.base import LLMBudgetExceeded, LLMContextOverflow, LLMProvider
+from app.llm.base import (
+    LLMBudgetExceeded,
+    LLMContextOverflow,
+    LLMProvider,
+    get_task_context,
+    set_task_context,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
-_CURRENT_TASK_ID: ContextVar[str] = ContextVar("llm_observation_task_id", default="global")
 _TRANSIENT_ERROR_RE = re.compile(
     r"(?:failed|error)[^\d]{0,20}(408|425|429|500|502|503|504)\b",
     re.IGNORECASE,
@@ -27,7 +31,7 @@ _TRANSIENT_ERROR_RE = re.compile(
 
 def set_observation_context(task_id: str) -> None:
     """Attribute subsequent calls in this coroutine to one research task."""
-    _CURRENT_TASK_ID.set(task_id or "global")
+    set_task_context(task_id)
 
 
 class _Circuit:
@@ -122,7 +126,7 @@ class FallbackLLMProvider(LLMProvider):
 
     def get_observability(self, task_id: str | None = None) -> dict:
         """Return JSON-safe per-task provider and circuit metrics."""
-        key = task_id or _CURRENT_TASK_ID.get()
+        key = task_id or get_task_context()
         stats = copy.deepcopy(self._stats(key))
         now = time.monotonic()
         for index, name in enumerate(self.provider_names):
@@ -139,7 +143,7 @@ class FallbackLLMProvider(LLMProvider):
         return stats
 
     def reset_observability(self, task_id: str | None = None) -> None:
-        self._stats_by_task.pop(task_id or _CURRENT_TASK_ID.get(), None)
+        self._stats_by_task.pop(task_id or get_task_context(), None)
 
     @staticmethod
     def _is_transient(exc: Exception) -> bool:
@@ -198,7 +202,7 @@ class FallbackLLMProvider(LLMProvider):
 
     async def _run(self, method_name: str, *args, **kwargs):
         self._track_call()
-        task_id = _CURRENT_TASK_ID.get()
+        task_id = get_task_context()
         stats = self._stats(task_id)
         stats["logical_calls"] += 1
         last_error: Exception | None = None
