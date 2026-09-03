@@ -536,6 +536,19 @@ async def run_task(task_id: str):
                 return
 
             if readiness.status == "more_research_required":
+                if settings.gap_audit_budgeted:
+                    # v16 Budgeted Falsification: the budget covers the WHOLE
+                    # pre-idea pipeline. A readiness shortfall does not buy
+                    # another directed search round — proceed to the budgeted
+                    # audit with current material; its killer search IS the
+                    # bounded remediation. (Observed 2026-09-03: readiness
+                    # remediation loops burned 4h wall per topic at 4-way
+                    # concurrency — 3/11 topics hit stopped_timeout.)
+                    logger.warning("Task %s: budgeted mode — readiness "
+                                   "more_research_required accepted as-is, "
+                                   "proceeding to audit (%s)",
+                                   task_id[:8], readiness.reason)
+                    break
                 logger.warning("Task %s: readiness gate — more research required — %s",
                               task_id[:8], readiness.reason)
                 if await _try_remediate(db, state, llm, task_id, "readiness_more_research"):
