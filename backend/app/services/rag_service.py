@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 
 import httpx
@@ -620,7 +621,14 @@ async def download_papers_pdfs(papers: list, max_concurrent: int = MAX_CONCURREN
 # === Phase 2: PDF Parsing (inline figures/tables) ===
 
 async def parse_pdf_to_chunks(pdf_bytes: bytes, paper_id: str, llm) -> list[ParsedChunk]:
-    """Parse PDF to chunks with inline figures and tables."""
+    """Parse PDF to chunks with inline figures and tables.
+
+    Synchronous CPU-heavy work (pdfplumber full-document table extraction,
+    chunk splitting) runs in a worker thread via asyncio.to_thread — executed
+    inline it stalls the event loop for seconds per PDF and freezes every
+    concurrent agent (observed 2026-09-03 at 4-way load: API 90s+
+    unresponsive, topics burning their whole wall clock).
+    """
     import fitz  # PyMuPDF
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -634,18 +642,19 @@ async def parse_pdf_to_chunks(pdf_bytes: bytes, paper_id: str, llm) -> list[Pars
         is_scanned = len(page_text.strip()) < 50
 
         if is_scanned:
-            page_stream = await _paddleocr_page_to_stream(page, paper_id, paper_dir, page_num, llm)
+            page_stream = await _paddleocr_page_to_stream(pdf_bytes, paper_id, paper_dir, page_num)
         else:
             page_stream = await _pymupdf_page_to_stream(doc, page, paper_id, paper_dir, page_num, llm)
 
         full_text_stream += "\n" + page_stream
 
-    # Extract tables with pdfplumber (add to text stream)
-    table_text = _extract_tables_with_pdfplumber(pdf_bytes)
+    # Extract tables with pdfplumber (add to text stream). pdfplumber walks
+    # the whole document synchronously — keep it off the event loop.
+    table_text = await asyncio.to_thread(_extract_tables_with_pdfplumber, pdf_bytes)
     if table_text:
         full_text_stream += "\n" + table_text
 
-    chunks = _split_into_chunks(full_text_stream, paper_id)
+    chunks = await asyncio.to_thread(_split_into_chunks, full_text_stream, paper_id)
     return chunks
 
 
@@ -844,8 +853,18 @@ def _extract_tables_with_pdfplumber(pdf_bytes: bytes) -> str:
     return tables_text
 
 
-async def _paddleocr_page_to_stream(page, paper_id: str, paper_dir: str, page_num: int, llm) -> str:
-    """Fallback: parse scanned page with PaddleOCR PP-Structure."""
+_PADDLEOCR_LOCK = threading.Lock()
+
+
+def _paddleocr_page_sync(pdf_bytes: bytes, paper_dir: str, page_num: int) -> str:
+    """Synchronous PaddleOCR pipeline: model init, page render, inference.
+
+    Runs in a worker thread under a global lock. PPStructure init and
+    inference are heavy and not thread-safe; serializing them keeps concurrent
+    agents from thrashing memory, and keeping the whole pipeline off the event
+    loop keeps the API responsive while it runs. The document is reopened
+    here so no fitz object is ever shared across threads.
+    """
     try:
         from paddleocr import PPStructure
         import cv2
@@ -856,35 +875,46 @@ async def _paddleocr_page_to_stream(page, paper_id: str, paper_dir: str, page_nu
         return ""
 
     try:
-        engine = PPStructure(show_log=False)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-        img = cv2.imdecode(np.frombuffer(pix.tobytes(), np.uint8), cv2.IMREAD_COLOR)
+        with _PADDLEOCR_LOCK:
+            engine = PPStructure(show_log=False)
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                page = doc[page_num]
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                img = cv2.imdecode(np.frombuffer(pix.tobytes(), np.uint8), cv2.IMREAD_COLOR)
 
-        result = engine(img)
-        stream = ""
-        for region in result:
-            rtype = region.get("type", "")
-            if rtype == "text":
-                res = region.get("res", "")
-                if isinstance(res, list):
-                    res = " ".join(item.get("text", "") for item in res if isinstance(item, dict))
-                stream += str(res) + " "
-            elif rtype == "table":
-                html = region.get("res", {}).get("html", "")
-                if html:
-                    stream += f"\n[TABLE]\n{html}\n[/TABLE]\n"
-            elif rtype == "figure":
-                # OCR scanned page figure — skip VLM (low quality, high cost)
-                bbox = region.get("bbox", [0, 0, 0, 0])
-                clip = fitz.Rect(bbox)
-                fig_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
-                img_path = os.path.join(paper_dir, f"ocr_fig_{page_num}.png")
-                fig_pix.save(img_path)
-                stream += f"\n[FIGURE: {img_path}]\n"
-        return stream
+                result = engine(img)
+                stream = ""
+                for region in result:
+                    rtype = region.get("type", "")
+                    if rtype == "text":
+                        res = region.get("res", "")
+                        if isinstance(res, list):
+                            res = " ".join(item.get("text", "") for item in res if isinstance(item, dict))
+                        stream += str(res) + " "
+                    elif rtype == "table":
+                        html = region.get("res", {}).get("html", "")
+                        if html:
+                            stream += f"\n[TABLE]\n{html}\n[/TABLE]\n"
+                    elif rtype == "figure":
+                        # OCR scanned page figure — skip VLM (low quality, high cost)
+                        bbox = region.get("bbox", [0, 0, 0, 0])
+                        clip = fitz.Rect(bbox)
+                        fig_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+                        img_path = os.path.join(paper_dir, f"ocr_fig_{page_num}.png")
+                        fig_pix.save(img_path)
+                        stream += f"\n[FIGURE: {img_path}]\n"
+                return stream
+            finally:
+                doc.close()
     except Exception as e:
         logger.warning("PaddleOCR failed on page %d: %s", page_num, e)
         return ""
+
+
+async def _paddleocr_page_to_stream(pdf_bytes: bytes, paper_id: str, paper_dir: str, page_num: int) -> str:
+    """Fallback: parse scanned page with PaddleOCR PP-Structure."""
+    return await asyncio.to_thread(_paddleocr_page_sync, pdf_bytes, paper_dir, page_num)
 
 
 # === Chunk splitting ===
