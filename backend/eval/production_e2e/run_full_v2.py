@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,71 +60,78 @@ CLARIFY_POLICIES = ("protocol_violation", "auto_answer")
 
 
 class ApiClient:
-    def __init__(self, base: str, timeout: float = 60.0) -> None:
+    def __init__(self, base: str, timeout: float = 300.0) -> None:
         self.base = base.rstrip("/")
         self._client = httpx.Client(base_url=self.base, timeout=timeout)
 
+    # Transient transport failures: under N concurrent agents the backend event
+    # loop stalls in bursts (sync PDF parsing / DB work in async context) and
+    # API reads time out — transient, NOT per-topic-fatal. Retry with linear
+    # backoff; 429/502/503/504 (concurrency reject / gateway) also retry.
+    _RETRY_EXC = (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError,
+                  httpx.ReadError, httpx.RemoteProtocolError)
+    _RETRY_STATUS = (429, 502, 503, 504)
+
+    def _send(self, method: str, path: str, *, retries: int = 5,
+              delay: float = 20.0, **kwargs):
+        last: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                resp = getattr(self._client, method)(path, **kwargs)
+                resp.raise_for_status()
+                return resp
+            except self._RETRY_EXC as exc:
+                last = exc
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in self._RETRY_STATUS:
+                    last = exc
+                else:
+                    raise
+            time.sleep(delay * attempt)
+        assert last is not None
+        raise last
+
     def create_task(self, user_input: str) -> dict:
-        resp = self._client.post("/tasks", json={"user_input": user_input})
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("post", "/tasks", json={"user_input": user_input}).json()
 
     def start_task(self, task_id: str) -> dict:
-        resp = self._client.post(f"/tasks/{task_id}/start")
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("post", f"/tasks/{task_id}/start").json()
 
     def stop_task(self, task_id: str) -> dict:
-        resp = self._client.post(f"/tasks/{task_id}/stop")
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("post", f"/tasks/{task_id}/stop").json()
 
     def get_task(self, task_id: str) -> dict:
-        resp = self._client.get(f"/tasks/{task_id}")
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("get", f"/tasks/{task_id}").json()
 
     def clarify(self, task_id: str, answers: list[str]) -> dict:
-        resp = self._client.post(f"/tasks/{task_id}/clarify", json={"answers": answers})
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("post", f"/tasks/{task_id}/clarify",
+                          json={"answers": answers}).json()
 
     def _get_all(self, path: str) -> list[dict]:
         out: list[dict] = []
         offset = 0
         while True:
-            resp = self._client.get(path, params={"limit": PAPERS_PAGE_LIMIT, "offset": offset})
-            resp.raise_for_status()
-            batch = resp.json()
+            batch = self._send("get", path, params={
+                "limit": PAPERS_PAGE_LIMIT, "offset": offset}).json()
             out.extend(batch)
             if len(batch) < PAPERS_PAGE_LIMIT:
                 return out
             offset += PAPERS_PAGE_LIMIT
 
     def get_ideas(self, task_id: str) -> list[dict]:
-        resp = self._client.get(f"/tasks/{task_id}/ideas")
-        resp.raise_for_status()
-        return resp.json()  # active ideas, already ordered by final_score desc
+        return self._send("get", f"/tasks/{task_id}/ideas").json()
 
     def get_gaps(self, task_id: str) -> list[dict]:
-        resp = self._client.get(f"/tasks/{task_id}/gaps")
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("get", f"/tasks/{task_id}/gaps").json()
 
     def get_interventions(self, task_id: str) -> list[dict]:
-        resp = self._client.get(f"/tasks/{task_id}/interventions")
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("get", f"/tasks/{task_id}/interventions").json()
 
     def get_traces(self, task_id: str) -> list[dict]:
-        resp = self._client.get(f"/tasks/{task_id}/traces")
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("get", f"/tasks/{task_id}/traces").json()
 
     def get_experiments(self, task_id: str) -> list[dict]:
-        resp = self._client.get(f"/tasks/{task_id}/experiments")
-        resp.raise_for_status()
-        return resp.json()
+        return self._send("get", f"/tasks/{task_id}/experiments").json()
 
     def get_papers(self, task_id: str) -> list[dict]:
         return self._get_all(f"/tasks/{task_id}/papers")
@@ -362,12 +371,15 @@ def _run(args) -> None:
             "poll_interval_s": args.poll_interval,
             "timeout_s": args.timeout_seconds,
             "clarify_policy": args.clarify_policy,
+            "concurrency": args.concurrency,
             "strata": strata_counts(topics),
             "fairness": "production pipeline unmodified; same provider/temperature "
                         "as baselines; one final idea per topic (top final_score); "
                         "clarification protocol: topics are pre-registered specific, "
                         "a clarification request is flagged protocol_violation and "
-                        "gets no auto-generated extra info",
+                        "gets no auto-generated extra info; topic-level driver "
+                        "concurrency is an ops knob (backend max_concurrent_agents=2), "
+                        "per-topic protocol unchanged",
         },
     )
     run.write_config(cfg, overwrite=True)
@@ -378,40 +390,54 @@ def _run(args) -> None:
     api = ApiClient(args.api_base, timeout=120.0)
     papers_path = run.dir / "papers_export.jsonl"
     gaps_path = run.dir / "gaps_export.jsonl"
-    try:
-        for idx, sample in enumerate(topics):
-            if sample["topic_id"] in done:
-                print(f"[{idx+1}/{len(topics)}] {sample['topic_id']}: SKIP (resume)")
-                continue
-            print(f"[{idx+1}/{len(topics)}] {sample['topic_id']}: running "
-                  f"({sample['stratum']}) -> {sample['topic'][:70]}")
-            record = None
-            try:
-                collected = run_one_topic(api, sample, args.poll_interval,
-                                          args.timeout_seconds, args.clarify_policy)
-                record = to_prediction_record(sample, collected)
+    concurrency = max(1, int(args.concurrency or 1))
+    file_lock = threading.Lock()
+    pending = [s for s in topics if s["topic_id"] not in done]
+    print(f"[run_full_v2] topics={len(topics)} done={len(done)} "
+          f"pending={len(pending)} concurrency={concurrency}")
+
+    def drive_topic(sample: dict) -> dict:
+        record = None
+        try:
+            collected = run_one_topic(api, sample, args.poll_interval,
+                                      args.timeout_seconds, args.clarify_policy)
+            record = to_prediction_record(sample, collected)
+            with file_lock:
                 with papers_path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(export_papers(sample, collected),
                                         ensure_ascii=False, default=str) + "\n")
                 with gaps_path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(export_gaps(sample, collected),
                                         ensure_ascii=False, default=str) + "\n")
-            except Exception as exc:  # per-topic isolation
-                record = {
-                    "sample_id": sample["topic_id"],
-                    "topic_id": sample["topic_id"],
-                    "system": "full_v2",
-                    "parse_status": "error",
-                    "error": f"{type(exc).__name__}: {exc}"[:2000],
-                }
-            record.setdefault("parse_status", "ok")
-            record.setdefault("error", None)
+        except Exception as exc:  # per-topic isolation
+            record = {
+                "sample_id": sample["topic_id"],
+                "topic_id": sample["topic_id"],
+                "system": "full_v2",
+                "parse_status": "error",
+                "error": f"{type(exc).__name__}: {exc}"[:2000],
+            }
+        record.setdefault("parse_status", "ok")
+        record.setdefault("error", None)
+        with file_lock:
             with (run.dir / "attempts.jsonl").open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
             # Keep predictions.jsonl exactly-once per topic: rewrite from attempts.
             _rewrite_predictions(run)
-            print(f"    -> {record.get('decision') or record.get('parse_status')} "
-                  f"({record.get('final_status', '')})")
+        print(f"    -> {sample['topic_id']}: "
+              f"{record.get('decision') or record.get('parse_status')} "
+              f"({record.get('final_status', '')})")
+        return record
+
+    try:
+        if concurrency == 1:
+            for sample in pending:
+                drive_topic(sample)
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = {pool.submit(drive_topic, s): s["topic_id"] for s in pending}
+                for fut in as_completed(futures):
+                    fut.result()
     finally:
         api.close()
 
@@ -446,6 +472,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL_S)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_S)
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="topics driven in parallel (ops knob; per-topic "
+                             "protocol unchanged; backend must allow "
+                             "max_concurrent_agents >= this)")
     parser.add_argument("--clarify-policy", choices=list(CLARIFY_POLICIES),
                         default="protocol_violation",
                         help="protocol_violation (frozen): a clarification request "
