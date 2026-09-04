@@ -93,6 +93,11 @@ class FallbackLLMProvider(LLMProvider):
             # A failover attempt must not get a second independent task budget.
             provider.set_budget(max_calls=0, max_total_tokens=0)
 
+    def forget_budget(self, context: str | None = None) -> None:
+        super().forget_budget(context)
+        for provider in self.providers:
+            provider.forget_budget(context)
+
     def _stats(self, task_id: str) -> dict:
         stats = self._stats_by_task.get(task_id)
         if stats is None:
@@ -225,6 +230,12 @@ class FallbackLLMProvider(LLMProvider):
                 self._record_success(i)
                 self._active_index = i
                 self._sync_state(provider)
+                # Attribute the call's token usage to the current task's
+                # budget bucket. Regression guard (91a1f2e): _sync_state only
+                # mirrors instance fields, so without this the wrapper's
+                # per-task total_tokens_used stayed at zero and
+                # max_total_tokens never fired.
+                self._record_usage()
                 stats["successful_calls"] += 1
                 stats["fallback_calls"] += int(i > 0)
                 stats["last_call_provider"] = name

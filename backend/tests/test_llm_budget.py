@@ -110,3 +110,52 @@ def test_token_budget_isolated_per_task_context():
     assert p.total_tokens_used == 210
     with pytest.raises(LLMBudgetExceeded):
         p._track_call()
+
+
+@pytest.mark.asyncio
+async def test_fallback_wrapper_enforces_token_budget_per_task():
+    """Regression (91a1f2e): FallbackLLMProvider._run never called
+    _record_usage, so the wrapper's per-task token bucket stayed at zero and
+    max_total_tokens silently never fired."""
+    from app.llm.base import LLMProvider, set_task_context
+    from app.llm.fallback_provider import FallbackLLMProvider
+
+    class _UsageProvider(LLMProvider):
+        async def chat(self, messages, temperature=0.7):
+            self.last_usage = {"prompt_tokens": 10, "completion_tokens": 10,
+                               "total_tokens": 80}
+            self._track_call()
+            self._record_usage()
+            return "ok"
+
+        async def chat_json(self, messages, schema, temperature=0.3):
+            return None
+
+    wrapper = FallbackLLMProvider([_UsageProvider()])
+    set_task_context("task-tok")
+    wrapper.set_budget(max_calls=10, max_total_tokens=200)
+
+    await wrapper.chat([], 0.1)
+    await wrapper.chat([], 0.1)
+    await wrapper.chat([], 0.1)
+    assert wrapper._budget_for().total_tokens_used == 240
+    with pytest.raises(LLMBudgetExceeded):
+        await wrapper.chat([], 0.1)
+
+    # Another task sharing the singleton is unaffected.
+    set_task_context("other-task")
+    wrapper.set_budget(max_calls=10, max_total_tokens=200)
+    await wrapper.chat([], 0.1)
+
+
+def test_forget_budget_drops_task_bucket():
+    from app.llm.base import set_task_context
+
+    p = _DummyProvider()
+    set_task_context("task-gone")
+    p.set_budget(max_calls=5)
+    p._track_call()
+    p.forget_budget("task-gone")
+    # The bucket is gone: an access recreates a fresh unlimited one.
+    assert p._budget_for().max_calls == 0
+    assert p._budget_for().call_count == 0

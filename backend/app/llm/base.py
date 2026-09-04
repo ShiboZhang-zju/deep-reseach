@@ -153,6 +153,14 @@ class LLMProvider(ABC):
             self._task_budgets[get_task_context()] = budget
         return budget
 
+    def forget_budget(self, context: str | None = None) -> None:
+        """Drop the budget bucket of a finished task (housekeeping).
+
+        Buckets are tiny but only ever grow; the runner calls this in the
+        same cleanup pass that resets observability.
+        """
+        self._task_budgets.pop(context or get_task_context(), None)
+
     def _track_call(self) -> None:
         """Increment the call counter and enforce the budget. Call at chat entry."""
         budget = self._budget_for()

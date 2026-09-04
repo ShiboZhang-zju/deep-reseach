@@ -662,6 +662,8 @@ async def run_task(task_id: str):
                            task_id[:8], observability_error)
         if llm is not None and hasattr(llm, "reset_observability"):
             llm.reset_observability(task_id)
+        if llm is not None and hasattr(llm, "forget_budget"):
+            llm.forget_budget(task_id)
         db.close()
 
 
@@ -791,7 +793,13 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                 and g.status == "candidate"]
         if ((undetermined_gaps or deferred_gaps)
                 and int(state.remediation_round or 0) > 0
-                and pending_audit_gap_ids is None):
+                and pending_audit_gap_ids is None
+                and not settings.gap_audit_budgeted):
+            # budgeted v16 declares "one audit per gap — no remediation
+            # re-audit" (see the no-surviving-gap termination below): a timed-
+            # out or inconclusive gap must stay terminal instead of being
+            # re-opened here to burn another 600s audit timeout. Fresh mining
+            # below keeps supplying complementary candidates.
             for _g in undetermined_gaps:
                 _g.status = "candidate"
             db.commit()
@@ -1335,6 +1343,8 @@ async def run_experiment_generation(task_id: str, idea_ids: list[str]):
                            task_id[:8], observability_error)
         if llm is not None and hasattr(llm, "reset_observability"):
             llm.reset_observability(task_id)
+        if llm is not None and hasattr(llm, "forget_budget"):
+            llm.forget_budget(task_id)
         db.close()
 
 

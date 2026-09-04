@@ -632,30 +632,35 @@ async def parse_pdf_to_chunks(pdf_bytes: bytes, paper_id: str, llm) -> list[Pars
     import fitz  # PyMuPDF
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    paper_dir = os.path.join(ASSETS_DIR, paper_id)
-    os.makedirs(paper_dir, exist_ok=True)
+    try:
+        paper_dir = os.path.join(ASSETS_DIR, paper_id)
+        os.makedirs(paper_dir, exist_ok=True)
 
-    full_text_stream = ""
+        full_text_stream = ""
 
-    for page_num, page in enumerate(doc):
-        page_text = page.get_text("text")
-        is_scanned = len(page_text.strip()) < 50
+        for page_num, page in enumerate(doc):
+            page_text = page.get_text("text")
+            is_scanned = len(page_text.strip()) < 50
 
-        if is_scanned:
-            page_stream = await _paddleocr_page_to_stream(pdf_bytes, paper_id, paper_dir, page_num)
-        else:
-            page_stream = await _pymupdf_page_to_stream(doc, page, paper_id, paper_dir, page_num, llm)
+            if is_scanned:
+                page_stream = await _paddleocr_page_to_stream(pdf_bytes, paper_id, paper_dir, page_num)
+            else:
+                page_stream = await _pymupdf_page_to_stream(doc, page, paper_id, paper_dir, page_num, llm)
 
-        full_text_stream += "\n" + page_stream
+            full_text_stream += "\n" + page_stream
 
-    # Extract tables with pdfplumber (add to text stream). pdfplumber walks
-    # the whole document synchronously — keep it off the event loop.
-    table_text = await asyncio.to_thread(_extract_tables_with_pdfplumber, pdf_bytes)
-    if table_text:
-        full_text_stream += "\n" + table_text
+        # Extract tables with pdfplumber (add to text stream). pdfplumber walks
+        # the whole document synchronously — keep it off the event loop.
+        table_text = await asyncio.to_thread(_extract_tables_with_pdfplumber, pdf_bytes)
+        if table_text:
+            full_text_stream += "\n" + table_text
 
-    chunks = await asyncio.to_thread(_split_into_chunks, full_text_stream, paper_id)
-    return chunks
+        chunks = await asyncio.to_thread(_split_into_chunks, full_text_stream, paper_id)
+        return chunks
+    finally:
+        # A mupdf document is a C resource; without an explicit close it leaks
+        # until GC (or forever, if a downstream to_thread call raised).
+        doc.close()
 
 
 async def _pymupdf_page_to_stream(doc, page, paper_id: str, paper_dir: str, page_num: int, llm) -> str:
