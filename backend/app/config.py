@@ -353,6 +353,15 @@ class Settings(BaseSettings):
     budgeted_killer_search_max_queries: int = 3
     budgeted_audit_sources: str = "semantic_scholar,openalex,arxiv"
     max_gaps_to_deep_audit: int = 1
+    # 低证据补搜（2026-09-04，用户选项 A：目的是产出可用 Idea，证据不足先补证据）。
+    # v16 budgeted 快进快出：低证据主题（冷门/检索面窄）带着很薄的证据池进入
+    # mining，只产出 1 个薄 gap，被审计拒绝后直接 abstain（task 0eca528a：
+    # 30 证据 / 1 gap / 15min 弃权）。开启后：readiness 通过、进入 mining 之前，
+    # 若证据池低于 min_evidence_units_for_idea，先做一次有界定向补搜
+    # （low_evidence_topup playbook，limitation 意图）再继续。
+    # 默认 off 保持 v16 语义；每任务至多一次，受 remediation 全局预算约束。
+    low_evidence_remediation_enabled: bool = False
+    min_evidence_units_for_idea: int = 100
     # Evidence-funnel repair (E2E 2026-08-26: audit-recalled papers stayed
     # priority=NULL and never entered evidence extraction, so 94/94 round-3
     # papers were invisible downstream and NO_FULLTEXT_EVIDENCE was structural).

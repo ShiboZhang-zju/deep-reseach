@@ -379,6 +379,8 @@ async def run_task(task_id: str):
     """
     db = SessionLocal()
     llm = None
+    # Low-evidence topup (option A): fires at most once per task, before mining.
+    low_evidence_topup_done = False
     set_observation_context(task_id)
     try:
         state = task_repo.get_state(db, task_id)
@@ -582,6 +584,35 @@ async def run_task(task_id: str):
             break  # readiness ready — exit the remediation loop
 
         logger.info("Task %s: readiness gate PASSED — proceeding to analysis", task_id[:8])
+
+        # Low-evidence topup (opt-in, 2026-09-04 option A): budgeted mode exits
+        # fast, so a topic whose search surfaced few papers reaches mining with
+        # a thin evidence pool, mines ~1 thin gap, and abstains after the audit
+        # rejects it (task 0eca528a: 30 evidence / 1 gap / 15min abstain). When
+        # enabled and the pool is below the floor, run ONE bounded directed
+        # search round before mining so the pool can support more gap
+        # candidates. Triggered at most once per task and still bounded by the
+        # global remediation budget via can_remediate.
+        if (settings.gap_audit_budgeted
+                and settings.low_evidence_remediation_enabled
+                and not low_evidence_topup_done):
+            from app.db.models import EvidenceUnit as _EU
+            ev_count = db.query(_EU.id).filter(_EU.task_id == task_id).count()
+            if ev_count < settings.min_evidence_units_for_idea:
+                low_evidence_topup_done = True
+                logger.warning(
+                    "Task %s: low evidence pool (%d < %d) — one bounded topup "
+                    "round before mining", task_id[:8], ev_count,
+                    settings.min_evidence_units_for_idea)
+                emit_event(task_id, "status", {
+                    "status": "low_evidence_topup",
+                    "evidence_count": ev_count,
+                    "floor": settings.min_evidence_units_for_idea})
+                if await _try_remediate(db, state, llm, task_id,
+                                        "low_evidence_topup"):
+                    state = task_repo.get_state(db, task_id)
+            else:
+                low_evidence_topup_done = True
 
         # === 2.5. RAG: Download PDFs and index high-priority papers ===
         # O5a: RAG indexing re-enabled via the pluggable embedding backend

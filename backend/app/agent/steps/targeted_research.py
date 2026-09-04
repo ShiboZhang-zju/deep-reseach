@@ -55,6 +55,18 @@ _REASON_PLAYBOOK: dict[str, tuple[str, list[str]]] = {
             "challenges open problems {topic}",
         ],
     ),
+    # Evidence pool below the idea floor before mining (low_evidence_topup) —
+    # the pool cannot support a meaningful number of gap candidates yet, so
+    # broaden with limitation-style material first (2026-09-04, option A).
+    "low_evidence_topup": (
+        "limitation",
+        [
+            "limitations of {topic}",
+            "{topic} challenges open problems",
+            "{topic} failure modes",
+            "{topic} benchmark shortcomings",
+        ],
+    ),
     # Gap survived mining but audit could not confirm — we lack external neighbors.
     # Seed phrases target *method-level* comparisons (the direct neighbors the
     # audit needs), not a broad "recent advances" sweep that recalls mostly
