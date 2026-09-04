@@ -1839,7 +1839,15 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
                                             failed_attempts=total_failed_rounds)
 
                 if round_attempts < MAX_ATTEMPTS_PER_ROUND:
-                    await asyncio.sleep(5)
+                    # Lock contention scales with task concurrency; a fixed 5s
+                    # retry re-enters the same congestion window (observed:
+                    # attempts 1 and 2 both died on "database is locked"). Back
+                    # off proportionally on lock errors so the congestion has
+                    # time to drain before the next attempt.
+                    backoff = 5.0
+                    if "database is locked" in str(round_err):
+                        backoff = min(60.0, 10.0 * round_attempts)
+                    await asyncio.sleep(backoff)
 
         if not round_succeeded:
             logger.error("Task %s: Round %d failed after %d attempts", task_id[:8], round_num, round_attempts)

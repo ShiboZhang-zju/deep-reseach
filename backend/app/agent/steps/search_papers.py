@@ -110,6 +110,12 @@ async def search_and_save_papers(db, state: ResearchState,
                     )
                     db.add(row)
                     raw_result_rows[(src, rk)] = row
+                # Flush the raw snapshot and RELEASE THE WRITE LOCK before the
+                # similarity pre-filter below: the prefilter makes embedding
+                # network calls, and holding the SQLite write lock across them
+                # starves every concurrent task's writers until busy_timeout
+                # gives up ("database is locked" at 3-way task concurrency).
+                db.commit()
 
             # O7: prefilter by topic similarity before persisting, to keep
             # off-topic noise out of the evidence/gap pipeline.
@@ -160,6 +166,11 @@ async def search_and_save_papers(db, state: ResearchState,
                 status="completed",
             )
             completed_query_ids.append(query_id)
+            # Per-query commit: without it the write lock spans ALL queries of
+            # this round (dozens of seconds across 3 tasks) and concurrent
+            # writers pile up past busy_timeout. Committing per query keeps
+            # each write transaction sub-second.
+            db.commit()
             logger.info("Round %d query '%s': %d new papers (total %d)",
                         round_num, query_text[:40], new_paper_count_for_query, raw_count)
 
@@ -173,6 +184,9 @@ async def search_and_save_papers(db, state: ResearchState,
                 error=str(e)[:500],
             )
             failed_query_ids.append(query_id)
+            # Release the write lock promptly so a failed query cannot extend
+            # the starvation window for the other concurrent tasks.
+            db.commit()
 
     db.flush()
 
