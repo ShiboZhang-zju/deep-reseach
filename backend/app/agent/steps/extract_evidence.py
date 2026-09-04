@@ -334,8 +334,17 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
     # 12 research questions were then rejected for NO_LIMITATION_SIGNAL.
     candidates = interleave_section_chunks(by_section, max_chunks, section_priority)
     if not candidates:
-        db.flush()
+        db.commit()
         return 0
+
+    # Release the WAL read snapshot BEFORE the (minutes-long) LLM extraction.
+    # The dedup SELECTs above opened a read transaction that used to be held
+    # across `await gather(...)`: committing a write on top of a stale snapshot
+    # raises SQLITE_BUSY_SNAPSHOT, which does NOT honor busy_timeout and
+    # silently discarded the whole paper's evidence on commit ("database is
+    # locked", observed 2026-08-26 and 2026-09-04). All reads are done; the
+    # write transaction opened below is short, so busy_timeout applies.
+    db.commit()
 
     # 2) Extract chunks concurrently (bounded), then persist results in the
     #    caller's session serially (SQLAlchemy sessions are not thread-safe, but
@@ -425,6 +434,11 @@ async def _extract_from_abstract(db, llm, task_id, paper, abstract, round_number
     if existing > 0:
         logger.debug("Paper %s: abstract already extracted, skipping", paper.id[:8])
         return 0
+
+    # Same read/write split as _extract_from_sections: drop the dedup read
+    # snapshot before the LLM call so the eventual write commit opens a fresh
+    # short transaction instead of upgrading a minutes-old stale one.
+    db.commit()
 
     try:
         result = await _llm_extract_evidence(llm, paper, abstract, "abstract")

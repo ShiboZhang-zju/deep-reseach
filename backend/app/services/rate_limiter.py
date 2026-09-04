@@ -34,34 +34,28 @@ class TokenBucket:
 
     async def acquire(self):
         """Acquire one token, blocking if necessary."""
-        async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self.last_refill
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate_per_sec)
-            self.last_refill = now
+        wait_time = 0.0
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self.last_refill
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate_per_sec)
+                self.last_refill = now
 
-            if self.tokens >= 1.0:
-                self.tokens -= 1.0
-                return
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
 
-            # Need to wait for a token
-            wait_time = (1.0 - self.tokens) / self.rate_per_sec
-            logger.debug("Rate limit: waiting %.2fs for token (tokens=%.1f)",
-                        wait_time, self.tokens)
+                # Need to wait for a token
+                wait_time = (1.0 - self.tokens) / self.rate_per_sec
+                logger.debug("Rate limit: waiting %.2fs for token (tokens=%.1f)",
+                            wait_time, self.tokens)
 
-        # Release lock while waiting
-        await asyncio.sleep(wait_time)
-
-        async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self.last_refill
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate_per_sec)
-            self.last_refill = now
-            if self.tokens >= 1.0:
-                self.tokens -= 1.0
-                return
-            # Edge case: another coroutine took the token — try again
-            self.tokens -= 1.0  # go slightly negative, will refill
+            # Release lock while waiting, then RE-CHECK under the lock: when N
+            # waiters wake simultaneously only one may take the refilled token.
+            # The old code let every loser go negative — instant N-1 extra
+            # requests over the quota, right at the 429 boundary.
+            await asyncio.sleep(wait_time)
 
 
 class RateLimiterRegistry:

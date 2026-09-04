@@ -21,6 +21,7 @@ import httpx
 
 from app.db.models import Paper
 from app.db.session import SessionLocal
+from app.services.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +56,15 @@ async def _s2_lookup_single(doi: str = "", title: str = "") -> dict | None:
         return None
 
     try:
+        # P1-2: enrichment used to bypass the shared token buckets entirely —
+        # its bursts stacked on top of the search path's traffic and blew the
+        # S2 quota, dragging the search path into 60s cooldowns ("multiple 429
+        # cooldown" observations). Go through the same limiter as search.
+        await rate_limiter.acquire("semantic_scholar")
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(url)
             if resp.status_code == 429:
-                logger.debug("S2 enrich rate limited")
+                logger.warning("S2 enrich rate limited (after limiter)")
                 return None
             if resp.status_code != 200:
                 return None
@@ -84,9 +90,11 @@ async def _openalex_lookup(doi: str = "") -> dict | None:
 
     url = f"https://api.openalex.org/works/doi:{doi}?select=cited_by_count,publication_year,primary_location,locations,abstract_inverted_index"
     try:
+        await rate_limiter.acquire("openalex")
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url, headers={"User-Agent": "DeepResearch/1.0 (mailto:research@example.com)"})
             if resp.status_code != 200:
+                logger.debug("OpenAlex enrich lookup failed: HTTP %d", resp.status_code)
                 return None
             data = resp.json()
             result = {

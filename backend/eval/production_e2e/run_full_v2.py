@@ -30,6 +30,7 @@ from pathlib import Path
 
 import httpx
 
+from app.config import settings as backend_settings
 from eval.common import EvalRun
 from eval.config import DEFAULT_RESULTS_DIR, build_run_config
 from eval.production_e2e.baseline_direct import load_topics, strata_counts
@@ -85,6 +86,14 @@ class ApiClient:
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code in self._RETRY_STATUS:
                     last = exc
+                    if exc.response.status_code == 429:
+                        # 429 = the backend is at agent capacity: a slot frees
+                        # on the order of minutes (one topic runs 20-60 min),
+                        # so the 5x300s linear backoff gave up mid-congestion
+                        # and burned the topic as an error with the task row
+                        # left pending. Wait a full minute per retry (~15 min
+                        # total) — still far below the per-topic deadline.
+                        delay = 60.0
                 else:
                     raise
             time.sleep(delay * attempt)
@@ -378,7 +387,8 @@ def _run(args) -> None:
                         "clarification protocol: topics are pre-registered specific, "
                         "a clarification request is flagged protocol_violation and "
                         "gets no auto-generated extra info; topic-level driver "
-                        "concurrency is an ops knob (backend max_concurrent_agents=2), "
+                        f"concurrency is an ops knob (backend max_concurrent_agents="
+                        f"{backend_settings.max_concurrent_agents}), "
                         "per-topic protocol unchanged",
         },
     )
