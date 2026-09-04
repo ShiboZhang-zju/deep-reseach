@@ -57,8 +57,14 @@ def cleanup_task_events(task_id: str):
         logger.debug("Cleaned up event queue for task %s", task_id[:8])
 
 
-# Terminal statuses that trigger cleanup
-_TERMINAL_STATUSES = {"done", "stopped", "failed"}
+# Terminal statuses that trigger cleanup. Beyond the obvious three this also
+# covers the newer honest terminal states — without them a task ending in
+# waiting_for_user_review / insufficient_evidence / more_research_required /
+# abstained left its queue (up to 200 events) resident until process exit.
+_TERMINAL_STATUSES = {
+    "done", "stopped", "failed", "abstained", "insufficient_evidence",
+    "more_research_required", "waiting_for_user_review",
+}
 
 
 def emit_event_with_cleanup(task_id: str, event_type: str, data: dict):

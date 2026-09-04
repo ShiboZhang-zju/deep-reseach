@@ -87,8 +87,11 @@ class Paper(Base):
 
     task_papers = relationship("TaskPaper", back_populates="paper")
     chunks = relationship("PaperChunk", back_populates="paper", cascade="all, delete-orphan")
-    citation_sources = relationship("PaperCitation", foreign_keys="PaperCitation.source_paper_id", cascade="all, delete-orphan")
-    citation_targets = relationship("PaperCitation", foreign_keys="PaperCitation.target_paper_id", cascade="all, delete-orphan")
+    # Write path is PaperCitation.source_paper/target_paper; these stay for
+    # the delete-orphan cascade. overlaps= tells SQLAlchemy the shared-column
+    # overlap with those relationships is intentional (silences SAWarning).
+    citation_sources = relationship("PaperCitation", foreign_keys="PaperCitation.source_paper_id", cascade="all, delete-orphan", overlaps="source_paper")
+    citation_targets = relationship("PaperCitation", foreign_keys="PaperCitation.target_paper_id", cascade="all, delete-orphan", overlaps="target_paper")
 
     __table_args__ = (
         Index("idx_papers_doi", "doi", unique=True, sqlite_where=text("doi IS NOT NULL")),

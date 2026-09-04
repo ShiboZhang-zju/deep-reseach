@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import threading
 import time
@@ -139,8 +140,12 @@ class EvalRun:
         # Resume: an explicitly reused run dir keeps its original config.
         if self.config_path.exists() and not overwrite:
             return
-        self.config_path.write_text(
+        # Atomic replace: a driver killed mid-write used to leave a truncated
+        # config.json (provenance gone) behind.
+        tmp_path = self.config_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
             json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, self.config_path)
 
     def existing_sample_ids(self) -> set[str]:
         if not self.predictions_path.exists():

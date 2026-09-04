@@ -643,7 +643,14 @@ async def _validate_and_regenerate_variants(llm, intent, budget: int) -> list[st
                 accepted = True
                 break
             regenerated = await _regenerate_variant(llm, intent, text)
-            if not regenerated or regenerated == text:
+            if not regenerated:
+                # A transient malformed response (JSON parse failure) burns
+                # another budget slot and retries instead of dropping the
+                # variant outright (2026-08-26: two parse failures discarded
+                # otherwise-valid variants with budget left unused).
+                continue
+            if regenerated == text:
+                # No progress across a full regeneration: give up on it.
                 break
             text = regenerated
         if not accepted:
@@ -2365,9 +2372,13 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
     record["query_source_distribution"] = _killer_query_source_distribution(
         gap, terms, expansion_meta)
     executions = []
-    for term in expanded_terms[:(settings.budgeted_killer_search_max_queries
-                                 if settings.gap_audit_budgeted
-                                 else settings.killer_search_max_queries)]:
+    if settings.gap_audit_budgeted:
+        # One source of truth for the killer query cap: the budget dict (its
+        # max(...,1) clamp also keeps a 0-config from producing zero queries).
+        killer_max = _audit_budget()["killer_queries"]
+    else:
+        killer_max = settings.killer_search_max_queries
+    for term in expanded_terms[:max(killer_max, 0)]:
         query_record = save_search_query(
             db, task_id, term, "gap_killer", None, None, audit_round,
             target_gap_id=gap.id, query_family="killer",
@@ -2378,6 +2389,12 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
             target_question_id=None, expected_evidence_type=None,
             target_gap_id=gap.id,
         ))
+    if not executions:
+        # A configured-zero killer budget must not look like "searched and
+        # found nothing": without this marker the caller reads the missing
+        # killer_hits as vacuous recall and wrongly demotes a confirmed gap.
+        record["skipped"] = "no_killer_queries"
+        return record
     db.commit()
     try:
         # The budget's source whitelist must cover the killer search too:

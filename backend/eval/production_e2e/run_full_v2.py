@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -392,10 +393,42 @@ def _run(args) -> None:
                         "per-topic protocol unchanged",
         },
     )
-    run.write_config(cfg, overwrite=True)
+    # Resume keeps the original config (and its provenance); a fresh run
+    # writes it. Either way the write is atomic.
+    run.write_config(cfg, overwrite=not args.resume)
 
-    # Resume: skip topics already present (parse_status=ok) in predictions.jsonl.
-    done = run.existing_sample_ids()
+    # Cross-process double-start guard: two drivers appending to the same
+    # run dir interleave jsonl lines and re-run finished topics (the
+    # thread-scoped file_lock only protects within one process).
+    run_lock = run.dir / ".driver.lock"
+    try:
+        _lock_fd = os.open(run_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(_lock_fd, str(os.getpid()).encode("ascii"))
+    except FileExistsError:
+        raise SystemExit(
+            f"[run_full_v2] refusing to start: {run_lock} already exists — "
+            "another driver is (or was) driving this run dir. Remove the "
+            "stale lock only after confirming no driver process is alive.")
+
+    # Resume: a topic counts as done only if its LATEST attempt succeeded —
+    # attempts.jsonl keeps failed attempts for cost accounting, so skipping
+    # by sample_id alone silently shrank eval coverage after a topic was
+    # burned as an error (e.g. 429 exhaustion before the 60s backoff fix).
+    latest_status: dict[str, str] = {}
+    attempts_path = run.dir / "attempts.jsonl"
+    if attempts_path.exists():
+        for line in attempts_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = str(rec.get("sample_id") or "")
+            if sid:
+                latest_status[sid] = str(rec.get("parse_status") or "error")
+    done = {sid for sid, status in latest_status.items() if status == "ok"}
 
     api = ApiClient(args.api_base, timeout=120.0)
     papers_path = run.dir / "papers_export.jsonl"
@@ -450,6 +483,11 @@ def _run(args) -> None:
                     fut.result()
     finally:
         api.close()
+        try:
+            os.close(_lock_fd)
+        except OSError:
+            pass
+        run_lock.unlink(missing_ok=True)
 
     print(f"[run_full_v2] run dir: {run.dir}")
 
