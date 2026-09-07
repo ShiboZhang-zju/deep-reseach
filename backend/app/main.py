@@ -1,5 +1,6 @@
 """FastAPI application entry point."""
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -37,6 +38,18 @@ async def lifespan(_app: FastAPI):
     phases as interrupted.
     """
     try:
+        # Widen the default asyncio thread pool. asyncio.to_thread users include
+        # slow NETWORK calls (embedding pre-filters, PDF downloads, OCR): at
+        # multi-task concurrency they occupy every default worker (cpu_count+4)
+        # and further to_thread calls — e.g. audit's _variant_is_invariant —
+        # queue indefinitely, freezing whole phases while the event loop itself
+        # sits idle (diagnosed 2026-09-07 via /api/debug/asyncio: the coroutine
+        # was parked on threads.py:25 in to_thread with a pending FutureIter).
+        from concurrent.futures import ThreadPoolExecutor
+
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(
+            ThreadPoolExecutor(max_workers=64, thread_name_prefix="agent_t"))
         recover_interrupted_tasks()
     except Exception as e:
         logger.error("Failed to recover interrupted tasks on startup: %s", e)
