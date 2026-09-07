@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import logging
 import re
 from dataclasses import dataclass, replace
@@ -2023,6 +2024,16 @@ async def audit_gap_candidate(
         "candidate_pool_size": int(original_candidate_count or 0),
         "search_admission_status": admission.status,
     }
+    # Defensive field hygiene (2026-09-07, task 407b0359): the model
+    # occasionally fills rejection_reason with a bare number (0.4 = the
+    # novelty score) instead of prose. A numeric reason carries no
+    # information for the post-mortem; label it instead of storing garbage.
+    rejection_reason = (decision.rejection_reason or "").strip()
+    if rejection_reason and re.fullmatch(r"[-+0-9.eE]+", rejection_reason):
+        rejection_reason = (
+            "invalid_audit_decision: model put a bare number "
+            f"({rejection_reason}) into rejection_reason instead of a "
+            "human-readable explanation")
     gap_repo.create_gap_audit(
         db,
         gap_id=gap.id,
@@ -2038,7 +2049,7 @@ async def audit_gap_candidate(
         novelty_confidence=decision.novelty_confidence,
         audit_confidence=decision.audit_confidence,
         recommended_action=action,
-        rejection_reason=decision.rejection_reason or None,
+        rejection_reason=rejection_reason or None,
         audit_round=audit_round,
         search_policy_version=GAP_SEARCH_POLICY_VERSION,
         search_admission_status=admission.status,
