@@ -16,6 +16,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 
@@ -870,29 +871,57 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                 return await mine_gap_candidates(
                     db, state, llm, task_id, input_version=gap_input_version)
 
-            try:
-                gaps = await phase_service.execute_phase(
-                    db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
-                )
-            except LLMBudgetExceeded:
-                raise
-            except Exception as mining_err:
-                # Mining is a single LLM call over an evidence pool that grows with
-                # every round, so it is where a prompt first outgrows the context
-                # window. Failing the task discarded several rounds of retrieval,
-                # evidence and coverage — hours of work — over a recoverable
-                # input-size problem. Keep the output and let the task be resumed.
-                reason = ("gap_mining_prompt_too_large"
-                          if isinstance(mining_err, LLMContextOverflow)
-                          else f"gap_mining_failed: {str(mining_err)[:160]}")
-                logger.error("Task %s: gap mining failed (%s); degrading to "
-                             "more_research_required instead of discarding the run",
-                             task_id[:8], mining_err)
-                db.rollback()
-                state = task_repo.get_state(db, task_id)
-                await _terminate_more_research(db, state, task_id,
-                                              "more_research_required", reason)
-                return
+            mining_gaps = None
+            for mining_attempt in range(1, 4):
+                try:
+                    mining_gaps = await phase_service.execute_phase(
+                        db, task_id, "mine_gaps", _mine_gaps_op, input_version=gap_input_version
+                    )
+                    break
+                except LLMBudgetExceeded:
+                    raise
+                except Exception as mining_err:
+                    # Mining is a single LLM call over an evidence pool that grows
+                    # with every round, so it is where a prompt first outgrows the
+                    # context window. Failing the task discarded several rounds of
+                    # retrieval, evidence and coverage — hours of work — over a
+                    # recoverable input-size problem. Keep the output and let the
+                    # task be resumed.
+                    #
+                    # An LLM-endpoint outage (502 from the proxy, circuit-open
+                    # after transient failures, connect refused) is recoverable
+                    # too: the endpoint typically comes back in minutes, and
+                    # degrading mining immediately lands the task in a terminal
+                    # more_research_required state over a blip (observed
+                    # 2026-09-07: both batch tasks degraded while the endpoint
+                    # was down for ~10 minutes). Wait it out, bounded.
+                    err_str = str(mining_err)
+                    endpoint_down = (
+                        "circuit-open" in err_str
+                        or re.search(r"LLM call failed: 5\d\d", err_str) is not None
+                        or "ConnectError" in err_str
+                        or "Connection refused" in err_str
+                    )
+                    if endpoint_down and mining_attempt < 3:
+                        wait_s = 60.0 * mining_attempt
+                        logger.warning(
+                            "Task %s: LLM endpoint unavailable (%s); mining "
+                            "retry %d/3 in %.0fs", task_id[:8], err_str[:140],
+                            mining_attempt + 1, wait_s)
+                        await asyncio.sleep(wait_s)
+                        continue
+                    reason = ("gap_mining_prompt_too_large"
+                              if isinstance(mining_err, LLMContextOverflow)
+                              else f"gap_mining_failed: {err_str[:160]}")
+                    logger.error("Task %s: gap mining failed (%s); degrading to "
+                                 "more_research_required instead of discarding the run",
+                                 task_id[:8], mining_err)
+                    db.rollback()
+                    state = task_repo.get_state(db, task_id)
+                    await _terminate_more_research(db, state, task_id,
+                                                  "more_research_required", reason)
+                    return
+            gaps = mining_gaps
             if gaps is None:
                 gaps = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
                         if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]

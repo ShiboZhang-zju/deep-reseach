@@ -78,11 +78,51 @@ async def start_task(task_id: str, db: Session = Depends(get_db_session)):
         raise HTTPException(
             429,
             detail=f"Max concurrent agents ({settings.max_concurrent_agents}) reached",
-        )
-    # P1-11: start_agent now does atomic capacity-check-and-register internally,
+        )    # P1-11: start_agent now does atomic capacity-check-and-register internally,
     # closing the race window. The route just needs to handle the reject case.
     asyncio.create_task(_deferred_start_agent(task_id))
     return {"status": "started"}
+
+
+@router.get("/debug/asyncio")
+async def debug_asyncio(limit: int = 60):
+    """Dump the await chain of every pending asyncio task (local debugging aid).
+
+    get_stack() alone stops at the outermost coroutine; walking cr_await to
+    the deepest frame shows where each coroutine is REALLY parked.
+    Read-only: stack frames and coroutine reprs only.
+    """
+    import types
+
+    def _chain(coro, max_depth=18):
+        frames = []
+        c = coro
+        depth = 0
+        while c is not None and depth < max_depth:
+            frame = getattr(c, "cr_frame", None)
+            if frame is None:
+                fut = getattr(c, "_asyncio_future_blocking", None)
+                if fut is not None or asyncio.isfuture(c):
+                    frames.append(f"<future {type(c).__name__}>")
+                else:
+                    frames.append(f"<{type(c).__name__}>")
+                break
+            fn = frame.f_code.co_filename.replace("\\", "/").split("/")[-1]
+            frames.append(f"{fn}:{frame.f_lineno} in {frame.f_code.co_name}")
+            c = getattr(c, "cr_await", None)
+            depth += 1
+        return frames
+
+    current = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+    out = []
+    for t in pending[:limit]:
+        try:
+            frames = _chain(t.get_coro())
+        except Exception as exc:  # noqa: BLE001
+            frames = [f"<chain error: {exc}>"]
+        out.append({"task": repr(t.get_coro())[:160], "await_chain": frames})
+    return {"n_pending": len(pending), "tasks": out}
 
 
 @router.post("/tasks/{task_id}/stop")

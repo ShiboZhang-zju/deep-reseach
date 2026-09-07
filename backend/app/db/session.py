@@ -9,6 +9,14 @@ engine = create_engine(
     settings.database_url,
     connect_args={"check_same_thread": False, "timeout": 10},
     pool_pre_ping=True,
+    # N-task concurrency needs N x (main session + extract batch sessions +
+    # enrichment session) at once. The SQLAlchemy defaults (5 + 10 overflow)
+    # exhaust at ~3 tasks, and SessionLocal() then queues for a pooled
+    # connection with pool_timeout — a SYNCHRONOUS wait that freezes the event
+    # loop and with it every HTTP request (observed 2026-09-04: GET /tasks
+    # timing out for ~10 minutes at 3-way concurrency).
+    pool_size=20,
+    max_overflow=20,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

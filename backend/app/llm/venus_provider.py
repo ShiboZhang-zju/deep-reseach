@@ -48,6 +48,11 @@ class VenusProvider(LLMProvider):
         token = settings.env_venus_openapi_secret_id
         self.token = f"{token}@4083" if token else ""
         self.model = model or settings.venus_llm_model
+        # Reusable AsyncClient: a fresh client per call re-runs the SSL
+        # context setup on the event loop every time (py-spy 2026-09-07
+        # caught create_default_context blocking MainThread), and it also
+        # drops HTTP keep-alive, multiplying connection setup.
+        self._client: httpx.AsyncClient | None = None
         # Extra sampling / template params forwarded to OpenAI-compatible
         # backends that accept them (e.g. local Qwen: top_k, repetition_penalty,
         # chat_template_kwargs.enable_thinking). Configurable so switching model
@@ -225,6 +230,12 @@ class VenusProvider(LLMProvider):
             data2 = json.loads(self._content_of(resp2))
             return schema.model_validate(data2)
 
+    async def _get_client(self) -> httpx.AsyncClient:
+        """The process-wide reusable AsyncClient (keep-alive, no per-call SSL)."""
+        if self._client is None or getattr(self._client, "is_closed", False):
+            self._client = httpx.AsyncClient(timeout=120, follow_redirects=True)
+        return self._client
+
     async def _post(self, payload: dict, _output_floor_retry: bool = False) -> dict:
         # Budget enforcement (raises LLMBudgetExceeded if over budget).
         self._track_call()
@@ -233,57 +244,57 @@ class VenusProvider(LLMProvider):
         # compatible backends without auth reject/ignore a bogus bearer.
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
+        client = await self._get_client()
+        resp = await client.post(
+            f"{self.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        if resp.status_code != 200:
+            body = resp.text or ""
+            # Log enough of the body to be diagnosable: this backend wraps
+            # the real reason inside a `forward bad request` envelope, and a
+            # 500-char cut left only `{"error":{"message":` visible, which
+            # made an oversize prompt indistinguishable from a broken
+            # service in the logs.
+            logger.error("Venus LLM error %d: %s", resp.status_code, body[:1500])
+            if resp.status_code == 400 and (
+                "context length" in body or "input_tokens" in body
+            ):
+                # The rejection carries the measured prompt size. Feeding it
+                # back is the only ground truth available for the estimate,
+                # and it makes the guard stricter for the next call of the
+                # same shape instead of failing the same way again.
+                measured = _PASSED_TOKENS_RE.search(body)
+                if measured:
+                    self.calibrate_token_estimate(
+                        estimate_messages_tokens(payload.get("messages") or []),
+                        int(measured.group(1)))
+                # "input + max_tokens > context" is not the same failure as
+                # "the prompt does not fit". If we asked for more output than
+                # the window can spare, shrink the request to the reserved
+                # floor — which admission already guaranteed fits — instead
+                # of failing a phase over an output allowance we chose.
+                if not _output_floor_retry and (
+                        payload.get("max_tokens") or 0) > self.max_output_tokens:
+                    logger.warning("Retrying with the reserved output floor (%d tokens)",
+                                   self.max_output_tokens)
+                    retry_payload = dict(payload)
+                    retry_payload["max_tokens"] = self.max_output_tokens
+                    return await self._post(retry_payload, _output_floor_retry=True)
+                raise LLMContextOverflow(
+                    f"backend rejected the prompt as too long: {body[:400]}")
+            raise RuntimeError(f"LLM call failed: {resp.status_code} - {body[:300]}")
+        data = resp.json()
+        # Record token usage for cost tracking
+        usage = data.get("usage")
+        if usage:
+            self.last_usage = usage
+            self._record_usage()
+            # Teach the size guard what this backend's tokenizer actually
+            # charges for the prompt we just sent.
+            self.calibrate_token_estimate(
+                estimate_messages_tokens(payload.get("messages") or []),
+                int(usage.get("prompt_tokens") or 0),
             )
-            if resp.status_code != 200:
-                body = resp.text or ""
-                # Log enough of the body to be diagnosable: this backend wraps
-                # the real reason inside a `forward bad request` envelope, and a
-                # 500-char cut left only `{"error":{"message":` visible, which
-                # made an oversize prompt indistinguishable from a broken
-                # service in the logs.
-                logger.error("Venus LLM error %d: %s", resp.status_code, body[:1500])
-                if resp.status_code == 400 and (
-                    "context length" in body or "input_tokens" in body
-                ):
-                    # The rejection carries the measured prompt size. Feeding it
-                    # back is the only ground truth available for the estimate,
-                    # and it makes the guard stricter for the next call of the
-                    # same shape instead of failing the same way again.
-                    measured = _PASSED_TOKENS_RE.search(body)
-                    if measured:
-                        self.calibrate_token_estimate(
-                            estimate_messages_tokens(payload.get("messages") or []),
-                            int(measured.group(1)))
-                    # "input + max_tokens > context" is not the same failure as
-                    # "the prompt does not fit". If we asked for more output than
-                    # the window can spare, shrink the request to the reserved
-                    # floor — which admission already guaranteed fits — instead
-                    # of failing a phase over an output allowance we chose.
-                    if not _output_floor_retry and (
-                            payload.get("max_tokens") or 0) > self.max_output_tokens:
-                        logger.warning("Retrying with the reserved output floor (%d tokens)",
-                                       self.max_output_tokens)
-                        retry_payload = dict(payload)
-                        retry_payload["max_tokens"] = self.max_output_tokens
-                        return await self._post(retry_payload, _output_floor_retry=True)
-                    raise LLMContextOverflow(
-                        f"backend rejected the prompt as too long: {body[:400]}")
-                raise RuntimeError(f"LLM call failed: {resp.status_code} - {body[:300]}")
-            data = resp.json()
-            # Record token usage for cost tracking
-            usage = data.get("usage")
-            if usage:
-                self.last_usage = usage
-                self._record_usage()
-                # Teach the size guard what this backend's tokenizer actually
-                # charges for the prompt we just sent.
-                self.calibrate_token_estimate(
-                    estimate_messages_tokens(payload.get("messages") or []),
-                    int(usage.get("prompt_tokens") or 0),
-                )
-            return data
+        return data
