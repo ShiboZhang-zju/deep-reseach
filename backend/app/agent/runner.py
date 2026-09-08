@@ -719,6 +719,90 @@ async def _generate_landscape_brief_phase(db, state: ResearchState, task_id: str
                        task_id[:8], exc)
 
 
+def _record_direction_candidates(db, task_id: str) -> int:
+    """Persist undecided gaps as research_direction_only idea records.
+
+    Runs right after _finalize_inconclusive_gaps flips auditing→inconclusive.
+    An inconclusive gap is "unproven, NOT disproven" — abstaining used to drop
+    it from every user-visible artifact (only the raw gap row survived, with
+    no audit context), so a 30-minute run could end with the user seeing only
+    "abstained" while a fully-audited candidate direction evaporated.
+
+    Mechanical construction, deliberately NO LLM call: this is bookkeeping,
+    not generation — it must not burn budget or fabricate content. Idempotent:
+    one record per (task_id, gap_id), safe across the multiple
+    _finalize_inconclusive_gaps call sites.
+    """
+    from app.db.models import GapCandidate, GapAudit, ResearchIdea
+
+    gaps = db.query(GapCandidate).filter(
+        GapCandidate.task_id == task_id,
+        GapCandidate.status == "inconclusive",
+    ).all()
+    if not gaps:
+        return 0
+    existing = {row[0] for row in db.query(ResearchIdea.gap_id).filter(
+        ResearchIdea.task_id == task_id,
+        ResearchIdea.decision == "research_direction_only",
+        ResearchIdea.gap_id.isnot(None),
+    ).all()}
+    saved = 0
+    for gap in gaps:
+        if gap.id in existing:
+            continue
+        audit = (db.query(GapAudit)
+                 .filter(GapAudit.gap_id == gap.id)
+                 .order_by(GapAudit.created_at.desc())
+                 .first())
+        claimed = (gap.claimed_delta or "").strip()
+        base = claimed[:80] if claimed else (gap.gap_type or "undecided gap")
+        title = f"Research direction (unverified novelty): {base}"
+        why_parts = []
+        if audit is not None:
+            if audit.differentiation_summary:
+                why_parts.append(
+                    f"Audit differentiation: {audit.differentiation_summary}")
+            if audit.nearest_neighbor_summary:
+                why_parts.append(
+                    f"Nearest prior art: {audit.nearest_neighbor_summary}")
+            if audit.rejection_reason:
+                why_parts.append(f"Undecided because: {audit.rejection_reason}")
+        motivation = (
+            "The adversarial audit could not decide this gap's novelty before "
+            "the search budget ran out — unproven, NOT disproven. Retained as "
+            "a manual starting point, not an executable idea."
+        )
+        if why_parts:
+            motivation += "\n" + "\n".join(why_parts)
+        db.add(ResearchIdea(
+            task_id=task_id,
+            gap_id=gap.id,
+            contract_id=getattr(gap, "contract_id", None),
+            title=title[:300],
+            description=claimed[:500] or None,
+            motivation=motivation[:2000],
+            decision="research_direction_only",
+            confidence_tier="C",
+            score_status="unscored",
+            idea_status="active",
+            quality_reason_codes_json=json.dumps(
+                ["UNDECIDED_NOVELTY_AT_BUDGET_EXHAUSTION"], ensure_ascii=False),
+        ))
+        saved += 1
+    if saved:
+        paper_repo.save_trace(db, task_id, "abstained_gap_directions_recorded",
+                              "decision", output_data={
+                                  "count": saved,
+                                  "policy": "inconclusive gaps are unproven, "
+                                            "not disproven — kept as visible "
+                                            "research_direction_only records",
+                              })
+        db.flush()
+        logger.info("Task %s: recorded %d inconclusive gap(s) as "
+                    "research_direction_only candidates", task_id[:8], saved)
+    return saved
+
+
 def _finalize_inconclusive_gaps(db, task_id: str) -> int:
     """Close auditing gaps whose last decided audit asked for more search.
 
@@ -746,6 +830,16 @@ def _finalize_inconclusive_gaps(db, task_id: str) -> int:
     if closed:
         logger.info("Task %s: finalized %d auditing gap(s) as inconclusive "
                     "(search budget exhausted)", task_id[:8], closed)
+    # Unproven ≠ disproven: keep every undecided gap visible as a
+    # research_direction_only record instead of letting it evaporate with the
+    # abstention (covers gaps finalized here AND ones the audit already marked
+    # inconclusive, e.g. via the verdict ceiling).
+    try:
+        _record_direction_candidates(db, task_id)
+    except Exception as exc:  # non-fatal bookkeeping must never break termination
+        db.rollback()
+        logger.error("Task %s: direction-record persistence failed: %s",
+                     task_id[:8], exc)
     return closed
 
 
