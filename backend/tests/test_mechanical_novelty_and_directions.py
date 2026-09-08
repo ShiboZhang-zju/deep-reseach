@@ -129,6 +129,53 @@ def test_direction_records_idempotent(temp_db):
     db.close()
 
 
+def test_finalize_records_under_production_autoflush_off(temp_db):
+    """Regression (task 25c8edf4): SessionLocal uses autoflush=False, so the
+    status="inconclusive" flips inside _finalize_inconclusive_gaps used to be
+    invisible to the very next query and no direction record was written on
+    real runs (the first test passed only because this fixture's session
+    autoflushes). Reproduce the production session config exactly."""
+    import tempfile as _tf
+
+    from alembic import command
+    from alembic.config import Config as _Cfg
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.agent.runner import _finalize_inconclusive_gaps
+    from app.db.models import ResearchIdea
+
+    fd, db_path = _tf.mkstemp(suffix=".db")
+    os.close(fd)
+    config = _Cfg()
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    config.set_main_option("script_location", os.path.join(
+        os.path.dirname(__file__), "..", "alembic_migrations"))
+    command.upgrade(config, "head")
+    engine = create_engine(f"sqlite:///{db_path}")
+    ProdSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    try:
+        db = ProdSession()
+        db, task, gap, paper = _seed_inconclusive_gap(db)
+
+        _finalize_inconclusive_gaps(db, task.id)
+        db.commit()
+
+        ideas = db.query(ResearchIdea).filter(
+            ResearchIdea.task_id == task.id).all()
+        assert len(ideas) == 1, (
+            "direction record must be written even when the session does not "
+            "autoflush the status flips")
+        db.close()
+    finally:
+        engine.dispose()
+        try:
+            os.unlink(db_path)
+        except PermissionError:
+            pass
+
+
 def test_ceiling_killed_gap_also_recorded(temp_db):
     """A gap the audit's verdict ceiling already marked inconclusive (not via
     _finalize_inconclusive_gaps' more_search path) must also be recorded."""

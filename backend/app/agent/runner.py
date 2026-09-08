@@ -830,6 +830,13 @@ def _finalize_inconclusive_gaps(db, task_id: str) -> int:
     if closed:
         logger.info("Task %s: finalized %d auditing gap(s) as inconclusive "
                     "(search budget exhausted)", task_id[:8], closed)
+    # SessionLocal runs with autoflush=False: without this flush the status
+    # changes above live only in memory, and _record_direction_candidates'
+    # query for status=="inconclusive" reads STALE rows and silently records
+    # nothing (observed on task 25c8edf4: the gap was finalized but the
+    # direction record never appeared).
+    if closed:
+        db.flush()
     # Unproven ≠ disproven: keep every undecided gap visible as a
     # research_direction_only record instead of letting it evaporate with the
     # abstention (covers gaps finalized here AND ones the audit already marked
