@@ -48,6 +48,12 @@ _HIGH_NOVELTY = 0.8
 # later round retrries with better retrieval instead of stamping a hollow
 # "novel".
 _LOW_NOVELTY_CONFIRMED = 0.4
+# Mechanical backing floor (2026-09-08, option B): gated_novelty at or above
+# this means the coverage matrix VERIFIED (full-text neighbors, explicit
+# judgments) that the claims are uncovered territory. threshold_origin:
+# initial heuristic — revisit against accumulated (self_report, mechanical)
+# pairs before treating it as calibrated truth (P3).
+_MECHANICAL_NOVELTY_FLOOR = 0.5
 # E2E 2026-08-26: the surviving gap's audit output had structured fields
 # confirmed/continue while its own remaining_delta concluded verbatim
 # "Therefore, the decision is uncertain." Match only unambiguous
@@ -1968,30 +1974,58 @@ async def audit_gap_candidate(
             logger.warning("Gap %s: downgrading confirmed->uncertain (remaining_delta "
                            "text contradicts the structured verdict)", gap.id[:8])
         elif (decision.novelty_confidence is not None
-              and decision.novelty_confidence <= _LOW_NOVELTY_CONFIRMED
-              and not (settings.gap_audit_budgeted
-                       and settings.audit_low_novelty_provisional_survive)):
+              and decision.novelty_confidence <= _LOW_NOVELTY_CONFIRMED):
             # P0-1b (task d6f64087): confirmed but the auditor itself reports
             # novelty_confidence <= 0.4 — "no neighbor covered the claim" by
             # search absence, not by evidence. Promoting this to surviving
             # lets a hollow-novelty gap reach tier-A interventions (observed:
             # surviving gap confirmed at 0.3 → 3 tier-A interventions →
-            # experiment plans built on an unconfirmed premise). Send it back
-            # for retrieval instead.
+            # experiment plans built on an unconfirmed premise).
             #
-            # 2026-09-08 (provisional survive, opt-in): under budgeted mode
-            # this downgrade became a FALSE-NEGATIVE FACTORY — "search too
-            # weak to establish novelty" fell straight to inconclusive and
-            # abstention, because budgeted has no re-entry for more_search.
-            # The downstream intervention novelty gate ALREADY tiers on the
-            # same number (< 0.3 → FAIL, 0.3..0.5 → WARN/tier-B, >= 0.5 →
-            # tier A), so letting the confirmed verdict survive here no
-            # longer risks hollow tier-A: the gate caps it at tier B and the
-            # four-level idea system does exactly what the user designed it
-            # for. Mechanical claim coverage is recorded for analysis but
-            # does NOT gate (it informs, the LLM gate tiers).
+            # 2026-09-08 (three-way rework of the provisional-survive patch):
+            # the self-reported number conflates "my search was too weak to
+            # establish novelty" with "not novel" — and it swings 0.3..0.85
+            # across runs on identical evidence (tasks 8b212c34 vs 692f97ea).
+            # The persisted claim-coverage matrix is the structural fact the
+            # verdict should rest on:
+            #   - mechanical BACKING (verified claims explicitly uncovered)
+            #     → survive with the score corrected upward: the self-report
+            #     was search noise, the matrix is the evidence;
+            #   - budgeted + provisional flag (no backing available) →
+            #     survive as before; the downstream intervention novelty gate
+            #     (novel < 0.3 FAIL, 0.3..0.5 WARN → tier-B) caps the ideas;
+            #   - otherwise → the original downgrade to uncertain.
             original_novelty = decision.novelty_confidence
-            if settings.gap_audit_budgeted:
+            mech = (_mechanical_novelty_score(db, gap)
+                    if settings.audit_mechanical_novelty_gate_enabled else None)
+            if mech is not None and mech["novelty"] >= _MECHANICAL_NOVELTY_FLOOR:
+                backed = mech["novelty"]
+                decision.novelty_confidence = max(original_novelty, backed)
+                failure_codes.append(
+                    f"MECHANICAL_NOVELTY_BACKED(mech={backed:.2f},"
+                    f"decided={mech['decided_ratio']:.2f})")
+                paper_repo.save_trace(
+                    db, task_id, "gap_audit_mechanical_novelty_backed",
+                    "decision", output_data={
+                        "gap_id": gap.id,
+                        "self_reported_novelty": original_novelty,
+                        "mechanical_novelty": backed,
+                        "uncovered_ratio": mech["uncovered_ratio"],
+                        "decided_ratio": mech["decided_ratio"],
+                        "n_claims": mech["n_claims"],
+                        "policy": "verified coverage matrix says unchecked "
+                                  "territory — the low self-report was "
+                                  "search noise, score corrected upward",
+                    })
+                gap.status = "surviving"
+                _record_nearest_prior_art(db, gap, decision)
+                logger.warning(
+                    "Gap %s: mechanical backing overrides low self-report "
+                    "%.2f (mech=%.2f decided=%.2f) — surviving",
+                    gap.id[:8], original_novelty, backed,
+                    mech["decided_ratio"])
+            elif (settings.gap_audit_budgeted
+                  and settings.audit_low_novelty_provisional_survive):
                 mech_cov = _mechanical_claim_coverage(gap, neighbors)
                 paper_repo.save_trace(
                     db, task_id, "gap_audit_low_novelty_provisional_survive",
@@ -1999,34 +2033,39 @@ async def audit_gap_candidate(
                         "gap_id": gap.id,
                         "novelty_confidence": original_novelty,
                         "mechanical_claim_coverage": round(mech_cov, 3),
-                        "policy": "provisional survive — downstream novelty "
-                                  "gate tiers the ideas",
+                        "mechanical_matrix": mech,
+                        "policy": "no mechanical backing — provisional "
+                                  "survive, downstream gate caps ideas at "
+                                  "tier B",
                     })
                 failure_codes.append(
                     f"LOW_NOVELTY_PROVISIONAL_SURVIVE(mech_cov={mech_cov:.2f})")
+                gap.status = "surviving"
+                _record_nearest_prior_art(db, gap, decision)
                 logger.warning(
                     "Gap %s: provisional survive on low novelty_confidence "
                     "%.2f (mech_cov=%.2f) — downstream gate will cap at tier B",
                     gap.id[:8], original_novelty, mech_cov)
-            decision.audit_result = "uncertain"
-            decision.recommended_action = "more_search"
-            action = "more_search"
-            gap.status = "auditing"
-            decision.rejection_reason = (
-                f"confirmed verdict carries novelty_confidence={original_novelty:.2f} "
-                f"(<= {_LOW_NOVELTY_CONFIRMED}): the audit's own search was too weak "
-                f"to establish novelty; retry with better retrieval"
-            )
-            failure_codes.append("LOW_NOVELTY_CONFIDENCE_CONFIRMED")
-            paper_repo.save_trace(db, task_id, "gap_audit_low_novelty_downgrade",
-                                  "decision", output_data={
-                                      "gap_id": gap.id,
-                                      "novelty_confidence": original_novelty,
-                                      "downgraded_to": "uncertain",
-                                  })
-            logger.warning("Gap %s: downgrading confirmed->uncertain "
-                           "(novelty_confidence %.2f <= %.2f)",
-                           gap.id[:8], original_novelty, _LOW_NOVELTY_CONFIRMED)
+            else:
+                decision.audit_result = "uncertain"
+                decision.recommended_action = "more_search"
+                action = "more_search"
+                gap.status = "auditing"
+                decision.rejection_reason = (
+                    f"confirmed verdict carries novelty_confidence={original_novelty:.2f} "
+                    f"(<= {_LOW_NOVELTY_CONFIRMED}): the audit's own search was too weak "
+                    f"to establish novelty; retry with better retrieval"
+                )
+                failure_codes.append("LOW_NOVELTY_CONFIDENCE_CONFIRMED")
+                paper_repo.save_trace(db, task_id, "gap_audit_low_novelty_downgrade",
+                                      "decision", output_data={
+                                          "gap_id": gap.id,
+                                          "novelty_confidence": original_novelty,
+                                          "downgraded_to": "uncertain",
+                                      })
+                logger.warning("Gap %s: downgrading confirmed->uncertain "
+                               "(novelty_confidence %.2f <= %.2f)",
+                               gap.id[:8], original_novelty, _LOW_NOVELTY_CONFIRMED)
         else:
             gap.status = "surviving"
             _record_nearest_prior_art(db, gap, decision)
@@ -3032,6 +3071,81 @@ def _mechanical_claim_coverage(gap, neighbors) -> float:
         hit = sum(1 for w in words if w in text)
         best = max(best, hit / len(words))
     return best
+
+
+def _mechanical_novelty_score(db, gap: GapCandidate) -> dict | None:
+    """Aggregate the PERSISTED per-neighbor × per-claim coverage matrix into a
+    mechanical novelty signal (option B, 2026-09-08).
+
+    The audit LLM's self-reported novelty_confidence conflates two failure
+    modes:
+      a) neighbors were verified and explicitly do NOT cover the claims —
+         genuinely unchecked territory (mechanically novel);
+      b) the audit's own search was too weak to decide — NOT novelty, yet a
+         low self-report lands there too.
+
+    This signal separates them. Per claim:
+      - FULL/PARTIAL judgments count as coverage (1.0 / 0.5), discounted by the
+        judging neighbor's evidence factor (full-text-verified = 1.0, else
+        0.6 — an abstract-only "it's not there" is weak);
+      - NONE is a definitive judgment (coverage 0) and counts the claim as
+        decided;
+      - UNCERTAIN or no judgment = insufficient evidence, NOT uncovered — the
+        claim contributes nothing to the numerator and lowers decided_ratio.
+    gated_novelty = uncovered_ratio × decided_ratio, so search absence cannot
+    masquerade as novelty (the d6f64087 hollow-novelty mode fails closed).
+
+    Returns None when no atomic claims or no coverage rows exist (fail-open to
+    the legacy gate).
+    """
+    from collections import defaultdict
+
+    claims = gap_repo.list_atomic_claims(db, gap.id)
+    if not claims:
+        return None
+    coverages = gap_repo.list_neighbor_claim_coverage(db, gap.id)
+    if not coverages:
+        return None
+    fulltext_ids = {row[0] for row in db.query(EvidenceUnit.paper_id).filter(
+        EvidenceUnit.paper_id.in_({c.neighbor_paper_id for c in coverages}),
+        EvidenceUnit.verification_status.in_(("verified", "upgraded")),
+    ).distinct().all()}
+
+    by_claim: dict = defaultdict(list)
+    for cov in coverages:
+        by_claim[cov.claim_id].append(cov)
+
+    uncovered_total = 0.0
+    decided = 0
+    for claim in claims:
+        best = 0.0
+        judged = False
+        for cov in by_claim.get(claim.id, []):
+            coverage = (cov.coverage or "").upper()
+            if coverage in ("FULL", "PARTIAL"):
+                judged = True
+                factor = 1.0 if cov.neighbor_paper_id in fulltext_ids else 0.6
+                best = max(best, {"FULL": 1.0, "PARTIAL": 0.5}[coverage] * factor)
+            elif coverage == "NONE":
+                # Definitive "clearly does not cover": coverage 0, claim decided.
+                judged = True
+            # UNCERTAIN: insufficient evidence — neither covered nor uncovered.
+        if not judged:
+            continue
+        uncovered_total += 1.0 - best
+        decided += 1
+
+    n = len(claims)
+    if decided == 0:
+        return None
+    uncovered_ratio = uncovered_total / n
+    decided_ratio = decided / n
+    return {
+        "novelty": uncovered_ratio * decided_ratio,
+        "uncovered_ratio": round(uncovered_ratio, 3),
+        "decided_ratio": round(decided_ratio, 3),
+        "n_claims": n,
+    }
 
 
 def _record_nearest_prior_art(db, gap: GapCandidate, decision,

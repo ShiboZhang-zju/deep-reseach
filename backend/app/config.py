@@ -379,6 +379,14 @@ class Settings(BaseSettings):
     # 仅分析用不参与门禁——替代 LLM 自报分数作为判据的实验数据）。
     audit_low_novelty_provisional_survive: bool = False
     audit_low_novelty_coverage_floor: float = 0.25
+    # 机械新颖性门禁（2026-09-08，选项 B）：自报 novelty_confidence 波动大
+    # （同主题同证据量跨轮 0.3..0.85），≤0.4 一刀切把"审计搜索弱"当成"不新颖"。
+    # 开启后：低自报分分支先聚合持久化的 claim 覆盖矩阵（LLM 结构化事实，
+    # 每邻居×每原子主张 FULL/PARTIAL/NONE/UNCERTAIN），gated_novelty =
+    # 未覆盖主张比例 × 已决定主张比例——搜索不弱且明确未覆盖（decided 高、
+    # uncovered 高）才背书 survive 并单调上修自报分；全 UNCERTAIN（搜索弱）
+    # 的 gated=0，不会假阳性。矩阵缺失时 fail-open 回退旧行为。默认关。
+    audit_mechanical_novelty_gate_enabled: bool = False
     # Idea 多样性门禁（2026-09-08）：同一 surviving gap 的多个 intervention idea
     # 常为同一机制的词面变体（watermarking 实测：5 idea 中 4 个 entropy 变体，
     # 高度重叠不构成独立贡献）。embedding 相似度 >= idea_diversity_sim_threshold
