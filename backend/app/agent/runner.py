@@ -382,9 +382,6 @@ async def run_task(task_id: str):
     llm = None
     # Low-evidence topup (option A): fires at most once per task, before mining.
     low_evidence_topup_done = False
-    # Verdict remediation: one directed search round + one re-audit for
-    # uncertain verdicts — at most once per task.
-    verdict_remediation_used = False
     set_observation_context(task_id)
     try:
         state = task_repo.get_state(db, task_id)
@@ -773,6 +770,9 @@ async def _terminate_more_research(db, state: ResearchState, task_id: str,
 
 
 async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str):
+    # Verdict remediation: one directed search round + one re-audit for
+    # uncertain verdicts — at most once per task (this function's scope).
+    verdict_remediation_used = False
     """Pipeline V2 opportunity discovery with O2 targeted remediation.
 
     Sequence: mine_gaps -> audit_gaps -> interventions -> minimal experiments.
@@ -1051,8 +1051,6 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                             db, state, llm, task_id,
                             "audit_verdict_remediation")):
                     verdict_remediation_used = True
-                    state = task_repo.get_state(db, task_id)
-                    gaps = state.gap_candidates
                     pending_audit_gap_ids = None
                     logger.warning(
                         "Task %s: verdict remediation — directed search done, "
