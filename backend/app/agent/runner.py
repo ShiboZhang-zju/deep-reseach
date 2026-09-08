@@ -1057,15 +1057,50 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                         "re-auditing %d auditing gap(s) once",
                         task_id[:8], len(auditing_gaps))
                     continue
-                # v16 Budgeted Falsification: one audit per gap — no narrowing
-                # and no remediation re-audit. The top-ranked gap was audited
-                # within its budget and did not survive; the honest outcome is a
-                # task-level abstention, not another round of spending.
-                _finalize_inconclusive_gaps(db, task_id)
-                await _terminate_more_research(db, state, task_id,
-                                               "insufficient_evidence",
-                                               "budgeted_audit_no_surviving_gap")
-                return
+                # Provisional survive after remediation (opt-in, user-approved
+                # 2026-09-08): the one verdict-remediation round has been spent
+                # and the re-audit STILL says uncertain — the gap is "unproven,
+                # not disproven" (the audit texts themselves say neighbors did
+                # NOT directly cover the claim; only the audit's own search
+                # confidence is low). Abstaining here throws away hours of work
+                # over an unresolvable self-reported score. Instead let these
+                # gaps flow to the idea pipeline — the downstream intervention
+                # novelty gate (novel_conf < 0.3 FAIL, 0.3..0.5 WARN → tier-B)
+                # caps their ideas at conditional_review. Uncertain ≠ disproven.
+                provisional_survive = (
+                    settings.audit_verdict_remediation_enabled
+                    and verdict_remediation_used)
+                provisional = [
+                    g for g in gaps
+                    if g.status in ("auditing", "inconclusive")
+                ] if provisional_survive else []
+                if not provisional:
+                    # Nothing left to promote — same abstention as before.
+                    _finalize_inconclusive_gaps(db, task_id)
+                    await _terminate_more_research(db, state, task_id,
+                                                   "insufficient_evidence",
+                                                   "budgeted_audit_no_surviving_gap")
+                    return
+                for g in provisional:
+                    g.status = "surviving"
+                db.commit()
+                for g in provisional:
+                    paper_repo.save_trace(
+                        db, task_id, "gap_provisional_survive_after_remediation",
+                        "decision", output_data={
+                            "gap_id": g.id,
+                            "policy": "remediation spent + still uncertain = "
+                                      "unproven, not disproven; ideas capped at "
+                                      "conditional_review by the intervention "
+                                      "novelty gate",
+                        })
+                logger.warning(
+                    "Task %s: provisional survive for %d uncertain gap(s) after "
+                    "verdict remediation — ideas will be capped at tier B",
+                    task_id[:8], len(provisional))
+                state.surviving_gap_ids = [g.id for g in provisional]
+                task_repo.save_state(db, task_id, state)
+                db.commit()
             # A partially closed gap comes with an explicit remaining delta, so
             # shrink the claim to it and re-audit before paying for another
             # remediation round of paper collection.
