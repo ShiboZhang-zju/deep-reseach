@@ -370,6 +370,15 @@ class Settings(BaseSettings):
     # 重审（remediation_round 变化使 audit input_version 更新，PhaseRun 真正
     # 重判而非重放），仍无存活才弃权。每任务至多一次，受全局补救预算约束。
     audit_verdict_remediation_enabled: bool = False
+    # 低新颖性暂缓弃权（2026-09-08，A+B 方案）：budgeted 审计 confirmed 但
+    # novelty_confidence <= 0.4 时，不再降级 uncertain（budgeted 下无补搜入口，
+    # 降级=直接弃权=假阴性工厂），而是让 confirmed 原样 survive——下游
+    # intervention 的 novelty gate（<0.3 FAIL / 0.3..0.5 WARN tier-B）自动把
+    # 这类 gap 的 Idea 限制在 conditional_review，四级体系接管分层。同时记录
+    # 机械主张覆盖度（claimed_delta 内容词 vs 近邻 title+abstract 的覆盖率，
+    # 仅分析用不参与门禁——替代 LLM 自报分数作为判据的实验数据）。
+    audit_low_novelty_provisional_survive: bool = False
+    audit_low_novelty_coverage_floor: float = 0.25
     # Evidence-funnel repair (E2E 2026-08-26: audit-recalled papers stayed
     # priority=NULL and never entered evidence extraction, so 94/94 round-3
     # papers were invisible downstream and NO_FULLTEXT_EVIDENCE was structural).

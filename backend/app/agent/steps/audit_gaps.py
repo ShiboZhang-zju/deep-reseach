@@ -1968,7 +1968,9 @@ async def audit_gap_candidate(
             logger.warning("Gap %s: downgrading confirmed->uncertain (remaining_delta "
                            "text contradicts the structured verdict)", gap.id[:8])
         elif (decision.novelty_confidence is not None
-              and decision.novelty_confidence <= _LOW_NOVELTY_CONFIRMED):
+              and decision.novelty_confidence <= _LOW_NOVELTY_CONFIRMED
+              and not (settings.gap_audit_budgeted
+                       and settings.audit_low_novelty_provisional_survive)):
             # P0-1b (task d6f64087): confirmed but the auditor itself reports
             # novelty_confidence <= 0.4 — "no neighbor covered the claim" by
             # search absence, not by evidence. Promoting this to surviving
@@ -1976,7 +1978,36 @@ async def audit_gap_candidate(
             # surviving gap confirmed at 0.3 → 3 tier-A interventions →
             # experiment plans built on an unconfirmed premise). Send it back
             # for retrieval instead.
+            #
+            # 2026-09-08 (provisional survive, opt-in): under budgeted mode
+            # this downgrade became a FALSE-NEGATIVE FACTORY — "search too
+            # weak to establish novelty" fell straight to inconclusive and
+            # abstention, because budgeted has no re-entry for more_search.
+            # The downstream intervention novelty gate ALREADY tiers on the
+            # same number (< 0.3 → FAIL, 0.3..0.5 → WARN/tier-B, >= 0.5 →
+            # tier A), so letting the confirmed verdict survive here no
+            # longer risks hollow tier-A: the gate caps it at tier B and the
+            # four-level idea system does exactly what the user designed it
+            # for. Mechanical claim coverage is recorded for analysis but
+            # does NOT gate (it informs, the LLM gate tiers).
             original_novelty = decision.novelty_confidence
+            if settings.gap_audit_budgeted:
+                mech_cov = _mechanical_claim_coverage(gap, neighbors)
+                paper_repo.save_trace(
+                    db, task_id, "gap_audit_low_novelty_provisional_survive",
+                    "decision", output_data={
+                        "gap_id": gap.id,
+                        "novelty_confidence": original_novelty,
+                        "mechanical_claim_coverage": round(mech_cov, 3),
+                        "policy": "provisional survive — downstream novelty "
+                                  "gate tiers the ideas",
+                    })
+                failure_codes.append(
+                    f"LOW_NOVELTY_PROVISIONAL_SURVIVE(mech_cov={mech_cov:.2f})")
+                logger.warning(
+                    "Gap %s: provisional survive on low novelty_confidence "
+                    "%.2f (mech_cov=%.2f) — downstream gate will cap at tier B",
+                    gap.id[:8], original_novelty, mech_cov)
             decision.audit_result = "uncertain"
             decision.recommended_action = "more_search"
             action = "more_search"
@@ -2962,6 +2993,45 @@ def _compute_npa_diagnostics(db, gap) -> NPADiagnostics:
         instable_families=instable_families,
         cumulative_convergence=cumulative_convergence,
     )
+
+
+_STOPWORDS = {
+    "the", "a", "an", "of", "in", "on", "for", "and", "or", "to", "is", "are",
+    "with", "under", "over", "at", "by", "from", "this", "that", "than",
+    "vs", "be", "been", "as", "it", "its", "into", "when", "while", "per",
+    "less", "more", "than", "no", "not", "absent", "without", "within",
+}
+
+
+def _mechanical_claim_coverage(gap, neighbors) -> float:
+    """Lexical coverage of the gap's claimed_delta across the audited
+    neighbors' title+abstract (0..1, max over neighbors).
+
+    Rationale (A+B, 2026-09-08): the audit LLM's self-reported
+    novelty_confidence is noisy and currently gates with a hard 0.4 cutoff,
+    turning "my search was too weak to establish novelty" into "not novel".
+    This mechanical overlap is recorded alongside so post-mortems can see
+    whether a rejected gap's claim was lexically close to (covered) or far
+    from (uncovered) the neighbors. It does NOT gate.
+    """
+    import re as _re
+
+    claim = (gap.claimed_delta or "").lower()
+    words = [w for w in _re.findall(r"[a-z0-9]+", claim) if len(w) > 3
+             and w not in _STOPWORDS]
+    if not words or not neighbors:
+        return 0.0
+    best = 0.0
+    for paper in neighbors:
+        text = " ".join(filter(None, [
+            getattr(paper, "title", "") or "",
+            getattr(paper, "abstract", "") or "",
+        ])).lower()
+        if not text:
+            continue
+        hit = sum(1 for w in words if w in text)
+        best = max(best, hit / len(words))
+    return best
 
 
 def _record_nearest_prior_art(db, gap: GapCandidate, decision,
