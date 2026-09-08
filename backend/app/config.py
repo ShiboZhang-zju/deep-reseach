@@ -362,6 +362,14 @@ class Settings(BaseSettings):
     # 默认 off 保持 v16 语义；每任务至多一次，受 remediation 全局预算约束。
     low_evidence_remediation_enabled: bool = False
     min_evidence_units_for_idea: int = 100
+    # 审计判决补救（2026-09-08，用户批准）：budgeted 审计 verdict=more_search 时，
+    # gap 直接落入 inconclusive 弃权——审计的 killer 预算只服务 confirmed 判决，
+    # uncertain gap 一次定向补搜的机会都没有（task 407b0359 watermarking 实测：
+    # 差的就是一次 bigram 边界验证）。开启后：budgeted 无存活时，对 auditing
+    # 状态的 gap 先做一次 claim 锚定的定向补搜（复用 O2 机制），再做一轮
+    # 重审（remediation_round 变化使 audit input_version 更新，PhaseRun 真正
+    # 重判而非重放），仍无存活才弃权。每任务至多一次，受全局补救预算约束。
+    audit_verdict_remediation_enabled: bool = False
     # Evidence-funnel repair (E2E 2026-08-26: audit-recalled papers stayed
     # priority=NULL and never entered evidence extraction, so 94/94 round-3
     # papers were invisible downstream and NO_FULLTEXT_EVIDENCE was structural).

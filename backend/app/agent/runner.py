@@ -382,6 +382,9 @@ async def run_task(task_id: str):
     llm = None
     # Low-evidence topup (option A): fires at most once per task, before mining.
     low_evidence_topup_done = False
+    # Verdict remediation: one directed search round + one re-audit for
+    # uncertain verdicts — at most once per task.
+    verdict_remediation_used = False
     set_observation_context(task_id)
     try:
         state = task_repo.get_state(db, task_id)
@@ -1029,6 +1032,33 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         state = task_repo.get_state(db, task_id)
         if not state.surviving_gap_ids:
             if settings.gap_audit_budgeted:
+                # Verdict remediation (opt-in, 2026-09-08): a budgeted audit
+                # whose verdict was uncertain/more_search used to land in
+                # inconclusive with ZERO follow-up search — the audit's killer
+                # budget only serves confirmed verdicts, so the uncertain gap
+                # never got one directed round aimed at its claim (task
+                # 407b0359: the watermarking gap was exactly one bigram-boundary
+                # check short). One bounded directed round via the existing O2
+                # mechanism, then ONE re-audit (remediation_round bump updates
+                # the audit input_version so PhaseRun re-judges instead of
+                # replaying), then the honest abstention as before. At most
+                # once per task, still bounded by the global remediation budget.
+                auditing_gaps = [g for g in gaps if g.status == "auditing"]
+                if (settings.audit_verdict_remediation_enabled
+                        and not verdict_remediation_used
+                        and auditing_gaps
+                        and await _try_remediate(
+                            db, state, llm, task_id,
+                            "audit_verdict_remediation")):
+                    verdict_remediation_used = True
+                    state = task_repo.get_state(db, task_id)
+                    gaps = state.gap_candidates
+                    pending_audit_gap_ids = None
+                    logger.warning(
+                        "Task %s: verdict remediation — directed search done, "
+                        "re-auditing %d auditing gap(s) once",
+                        task_id[:8], len(auditing_gaps))
+                    continue
                 # v16 Budgeted Falsification: one audit per gap — no narrowing
                 # and no remediation re-audit. The top-ranked gap was audited
                 # within its budget and did not survive; the honest outcome is a

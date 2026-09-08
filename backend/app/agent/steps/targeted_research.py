@@ -67,6 +67,18 @@ _REASON_PLAYBOOK: dict[str, tuple[str, list[str]]] = {
             "{topic} benchmark shortcomings",
         ],
     ),
+    # Audit verdict was uncertain/more_search and the budgeted path wants one
+    # directed round aimed at the gap claim before abstaining
+    # (audit_verdict_remediation, 2026-09-08): quantified-boundary material is
+    # what an uncertain "needs one more check" verdict is short of.
+    "audit_verdict_remediation": (
+        "direct_neighbor",
+        [
+            "{topic} limitations",
+            "{topic} quantitative evaluation",
+            "{topic} boundary conditions",
+        ],
+    ),
     # Gap survived mining but audit could not confirm — we lack external neighbors.
     # Seed phrases target *method-level* comparisons (the direct neighbors the
     # audit needs), not a broad "recent advances" sweep that recalls mostly
