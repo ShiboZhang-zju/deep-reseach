@@ -1,5 +1,6 @@
 """Step: Turn gate-approved interventions into minimal decisive experiments."""
 
+import asyncio
 import json
 import logging
 import re
@@ -1320,6 +1321,91 @@ def _build_idea_motivation(gap: GapCandidate, intervention: InterventionCandidat
     return "\n\n".join(parts)
 
 
+async def _apply_idea_diversity_gate(db, task_id: str) -> int:
+    """Demote near-duplicate ideas to conditional_review (diversity gate).
+
+    One surviving gap can fan out into several interventions whose ideas end
+    up as lexical variants of one mechanism (2026-09-07 watermarking: 5 ideas
+    from 1 surviving gap, 4 entropy-adaptive variants). Keep the highest
+    final_score of each embedding-similarity cluster as the representative and
+    demote the rest to conditional_review with an explicit DUPLICATE_VARIANT_OF
+    marker — highly overlapping ideas are not packaged as independent
+    contributions. Demoted ideas stay visible for manual review; nothing is
+    deleted.
+    """
+    if not settings.idea_diversity_gate_enabled:
+        return 0
+    from app.db.models import ResearchIdea
+    from app.services import embedding_service
+
+    ideas = db.query(ResearchIdea).filter(
+        ResearchIdea.task_id == task_id,
+        ResearchIdea.idea_status == "active",
+        ResearchIdea.decision.in_(("executable_candidate", "conditional_review")),
+    ).all()
+    if len(ideas) < 2:
+        return 0
+
+    def _embed_all():
+        texts = []
+        for i in ideas:
+            texts.append(" ".join(filter(None, [
+                i.title or "", (i.method_sketch or "")[:800],
+                (i.expected_contribution or "")[:400],
+            ])))
+        return embedding_service.embed_texts(texts)
+
+    vectors = await asyncio.to_thread(_embed_all)
+
+    order = sorted(range(len(ideas)), key=lambda k: -(ideas[k].final_score or 0.0))
+    kept: list[int] = []
+    demoted: list[tuple[int, int, float]] = []
+    for a in order:
+        best_sim, best_k = 0.0, None
+        for k in kept:
+            sim = embedding_service.cosine_similarity(vectors[a], vectors[k])
+            if sim > best_sim:
+                best_sim, best_k = sim, k
+        if best_k is not None and best_sim >= settings.idea_diversity_sim_threshold:
+            demoted.append((a, best_k, best_sim))
+        else:
+            kept.append(a)
+
+    demoted_count = 0
+    demoted_records = []
+    for a, rep_k, sim in demoted:
+        idea, rep = ideas[a], ideas[rep_k]
+        idea.decision = "conditional_review"
+        try:
+            codes = json.loads(idea.quality_reason_codes_json or "[]")
+        except Exception:
+            codes = []
+        codes.append(f"DUPLICATE_VARIANT_OF:{rep.id}(cosine={sim:.2f})")
+        idea.quality_reason_codes_json = json.dumps(codes, ensure_ascii=False)
+        note = ("[Diversity gate] Lexically near-duplicate of '"
+                + (rep.title or "")[:60] + f"' (cosine {sim:.2f} >= "
+                + str(settings.idea_diversity_sim_threshold)
+                + ") - kept as a variant, not an independent contribution.")
+        idea.motivation = (idea.motivation or "") + "\n\n" + note
+        demoted_records.append({
+            "idea_id": idea.id, "representative_id": rep.id,
+            "cosine": round(sim, 3), "title": (idea.title or "")[:80],
+        })
+        demoted_count += 1
+    if demoted_count:
+        db.commit()
+        paper_repo.save_trace(db, task_id, "idea_diversity_gate", "decision",
+                              output_data={
+                                  "threshold": settings.idea_diversity_sim_threshold,
+                                  "kept_ids": [ideas[k].id for k in kept],
+                                  "demoted": demoted_records,
+                              })
+        logger.info("Task %s: diversity gate demoted %d near-duplicate idea(s) "
+                    "(kept %d representative(s))", task_id[:8], demoted_count,
+                    len(kept))
+    return demoted_count
+
+
 async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: str) -> MinimalExperimentResult:
     """Persist conditional ideas and small falsifiable experiments from passed interventions."""
     from app.db.models import ResearchContract
@@ -1873,6 +1959,7 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
         "idea_count": len(idea_ids),
         "experiment_count": len(experiment_ids),
     })
+    await _apply_idea_diversity_gate(db, task_id)
     db.commit()
     return MinimalExperimentResult(idea_ids, experiment_ids, direction_only_idea_ids)
 

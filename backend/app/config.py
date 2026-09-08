@@ -379,6 +379,13 @@ class Settings(BaseSettings):
     # 仅分析用不参与门禁——替代 LLM 自报分数作为判据的实验数据）。
     audit_low_novelty_provisional_survive: bool = False
     audit_low_novelty_coverage_floor: float = 0.25
+    # Idea 多样性门禁（2026-09-08）：同一 surviving gap 的多个 intervention idea
+    # 常为同一机制的词面变体（watermarking 实测：5 idea 中 4 个 entropy 变体，
+    # 高度重叠不构成独立贡献）。embedding 相似度 >= idea_diversity_sim_threshold
+    # 的近重复 idea 按 final_score 保留代表，其余降 conditional_review 并标
+    # DUPLICATE_VARIANT_OF（不删除，人工可复核）。默认开（确定性降档而非硬拒）。
+    idea_diversity_gate_enabled: bool = True
+    idea_diversity_sim_threshold: float = 0.80
     # Evidence-funnel repair (E2E 2026-08-26: audit-recalled papers stayed
     # priority=NULL and never entered evidence extraction, so 94/94 round-3
     # papers were invisible downstream and NO_FULLTEXT_EVIDENCE was structural).
