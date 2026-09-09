@@ -269,7 +269,7 @@ async def _safe_mark_failed(task_id: str, reason: str, event_message: str, clean
         cleanup: If True, clean up the SSE event queue after marking failed.
     """
     from app.services.event_service import cleanup_task_events
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             db = SessionLocal()
             try:
@@ -281,8 +281,14 @@ async def _safe_mark_failed(task_id: str, reason: str, event_message: str, clean
                 db.close()
             break
         except Exception:
-            if attempt < 2:
-                await asyncio.sleep(1)
+            if attempt < 3:
+                # Exponential backoff: the terminal-status write most often
+                # fails during the same lock storm that killed the task
+                # (observed 2026-09-09: 3x1s retries all landed inside the
+                # window and the task row was left in a mid-pipeline status —
+                # a dangling task the driver polls forever). 1/5/15s spans
+                # ~21s, enough for a busy_timeout(10s) holder to release.
+                await asyncio.sleep([1, 5, 15][attempt])
             else:
                 logger.error("Failed to update task status after 3 retries")
     if cleanup:

@@ -233,6 +233,26 @@ async def enrich_papers_metadata(paper_ids: list[str], db_session=None) -> dict:
         if not to_enrich:
             return {"enriched": 0, "skipped": len(papers), "failed": 0}
 
+        # Fields under partial UNIQUE indexes in the papers table (defined
+        # before the occupancy preflight which reads it).
+        _unique_fields = ("doi", "arxiv_id", "semantic_scholar_id", "openalex_id")
+        enriched = 0
+
+        # Batch-preflight the UNIQUE-index values (2026-09-09): the clash check
+        # used to run INSIDE write_lock as 4 synchronous db.query calls per
+        # paper - under multi-task load each query could wait out the full
+        # busy_timeout(10s) on a held write lock, freezing the event loop and
+        # stretching the lock hold past 40s (the 3-way retest lock storm).
+        # One prefetched occupancy map replaces them; the lock now only guards
+        # in-memory setattr + commit. Same-batch pending conflicts remain
+        # covered by the flush IntegrityError handler below (unchanged).
+        occupied = {f: {} for f in _unique_fields}
+        for field in _unique_fields:
+            attr = getattr(Paper, field)
+            for value, owner_id in db.query(attr, Paper.id).filter(
+                    attr.isnot(None)).all():
+                occupied[field][value] = owner_id
+
         logger.info("Enriching metadata for %d papers (of %d total)", len(to_enrich), len(papers))
 
         semaphore = asyncio.Semaphore(3)  # limit concurrent API calls
@@ -244,8 +264,6 @@ async def enrich_papers_metadata(paper_ids: list[str], db_session=None) -> dict:
         # pending attribute writes, so without serialization two papers can
         # both take the same external ID and blow up on flush.
         write_lock = asyncio.Lock()
-        # Fields under partial UNIQUE indexes in the papers table.
-        _unique_fields = ("doi", "arxiv_id", "semantic_scholar_id", "openalex_id")
         enriched = 0
         failed = 0
 
@@ -264,22 +282,22 @@ async def enrich_papers_metadata(paper_ids: list[str], db_session=None) -> dict:
                         # session and failing the whole audit phase (task
                         # 23ec8f20: IntegrityError papers.doi). Values already
                         # owned by another row are dropped, not copied.
+                        # Drop values already owned by another row using the
+                        # prefetched occupancy map (no DB queries under the
+                        # lock - see the preflight note above).
+                        for field in _unique_fields:
+                            value = updates.get(field)
+                            if not value:
+                                continue
+                            owner = occupied[field].get(value)
+                            if owner is not None and owner != paper.id:
+                                logger.debug(
+                                    "Enrichment for paper %s: dropping %s=%s "
+                                    "(already owned by paper %s)",
+                                    paper.id[:8], field, str(value)[:40],
+                                    owner[:8])
+                                updates.pop(field)
                         async with write_lock:
-                            with db.no_autoflush:
-                                for field in _unique_fields:
-                                    value = updates.get(field)
-                                    if not value:
-                                        continue
-                                    attr = getattr(Paper, field)
-                                    clash = db.query(Paper.id).filter(
-                                        attr == value, Paper.id != paper.id).first()
-                                    if clash is not None:
-                                        logger.debug(
-                                            "Enrichment for paper %s: dropping %s=%s "
-                                            "(already owned by paper %s)",
-                                            paper.id[:8], field, str(value)[:40],
-                                            clash[0][:8])
-                                        updates.pop(field)
                             for field, value in updates.items():
                                 setattr(paper, field, value)
                             # Commit per paper as a short transaction, serialized

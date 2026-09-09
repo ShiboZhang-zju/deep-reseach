@@ -133,6 +133,16 @@ async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
                 total_evidence += r
             elif isinstance(r, Exception):
                 logger.error("Evidence extraction task failed: %s", r)
+        # Per-batch commit — CRITICAL for multi-task concurrency. The per-paper
+        # flushes above open a WRITE transaction on the shared session; without
+        # this commit that transaction stays open across every later batch's
+        # minutes-long LLM calls until the phase-tail commit, starving the
+        # other concurrent tasks' writers past busy_timeout (2026-09-09 3-way
+        # retest: two of three tasks died "database is locked" in round 1
+        # because a sibling held the write lock across its whole extract
+        # phase). Committing per batch bounds the write transaction to the
+        # flush→commit span (milliseconds, no awaits inside).
+        db.commit()
         logger.info("Task %s: evidence batch %d-%d done, cumulative=%d",
                     task_id[:8], batch_start, batch_start + len(batch), total_evidence)
 
