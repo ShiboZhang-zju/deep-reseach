@@ -1,5 +1,6 @@
 """Venus LLM Proxy provider (OpenAI-compatible API)."""
 
+import asyncio
 import json
 import logging
 import re
@@ -13,6 +14,12 @@ from app.llm.base import (
     LLMProvider,
     estimate_messages_tokens,
 )
+
+# Outer hard cap for a single chat request. httpx's own 120s timeout failed
+# to fire once (lost IO completion on the proactor loop — 2026-09-09), so a
+# loop-level timer is the guaranteed backstop. Slightly above the httpx
+# timeout so the library-level path wins when it works.
+_HARD_TIMEOUT_S = 150
 
 logger = logging.getLogger(__name__)
 
@@ -245,11 +252,32 @@ class VenusProvider(LLMProvider):
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         client = await self._get_client()
-        resp = await client.post(
-            f"{self.base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-        )
+        try:
+            resp = await asyncio.wait_for(
+                client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                ),
+                timeout=_HARD_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as exc:
+            # Hard outer guard, independent of httpx's own timeout machinery:
+            # on 2026-09-09, requests issued during a taiji endpoint outage
+            # hung in `client.post` for 2.5+ HOURS with neither the 120s
+            # httpx timeout nor any exception firing (Windows proactor lost
+            # the IO completion notification — the await simply never woke
+            # up), dead-waiting the whole extract pipeline on one slot.
+            # asyncio.wait_for uses a loop-level timer that does not depend
+            # on the IO completion path, so it always fires. httpx's 120s
+            # stays as the first line; this is the never-hang guarantee.
+            logger.error(
+                "Venus request exceeded the %ss hard timeout (httpx timeout "
+                "did not fire - likely lost IO completion); raising for "
+                "failover", _HARD_TIMEOUT_S)
+            raise RuntimeError(
+                f"venus hard timeout after {_HARD_TIMEOUT_S}s"
+            ) from exc
         if resp.status_code != 200:
             body = resp.text or ""
             # Log enough of the body to be diagnosable: this backend wraps
