@@ -1936,6 +1936,10 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 })
                 logger.warning("Task %s: idea scoring failed; withholding executable Idea '%s': %s",
                                task_id[:8], idea.title[:40], e)
+                # Per-idea commit (see the save_idea commit note): the failure
+                # writebacks must not ride a transaction into the next
+                # cluster's plan-generation LLM call.
+                db.commit()
                 continue
             steps = [
                 *plan.steps,
@@ -1984,6 +1988,11 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 "expected_signature": plan.expected_signature,
                 "mechanism": plan.mechanism_being_tested,
             })
+            # Per-idea commit: the idea/experiment/gate writebacks must not
+            # ride a transaction into the NEXT cluster's minutes-long
+            # plan-generation LLM call (2026-09-10: pe2e-006's evidence
+            # writes all starved while a sibling task sat inside this loop).
+            db.commit()
 
     paper_repo.save_trace(db, task_id, "generate_minimal_experiments", "action", output_data={
         "idea_count": len(idea_ids),

@@ -63,7 +63,13 @@ def _standalone_status_write(task_id: str, **fields) -> None:
             session.rollback()
             if "database is locked" not in str(exc) or attempt == 3:
                 raise
-            time.sleep(0.5 * attempt)
+            # Lock storms last minutes (a sibling task's long write
+            # transaction), so 0.5/1/2s retries all landed inside the same
+            # window (2026-09-10: pe2e-006's state write died even WITH this
+            # fallback). 5/15/30s spans ~50s — enough for a storm wave to
+            # drain — and this path only runs for a task that is already
+            # being torn down, so the wait costs nothing.
+            time.sleep((5, 15, 30)[attempt - 1])
         finally:
             session.close()
 
