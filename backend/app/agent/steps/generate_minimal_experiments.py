@@ -1128,7 +1128,37 @@ def _validate_experiment_plan(
     failures.extend(_check_model_scope(gap_text, plan.model_spec))
     failures.extend(_check_statistical_method(plan))
     oracle_text = plan.oracle.lower()
-    if "llm" in oracle_text and not any(term in oracle_text for term in ("execution", "test", "static", "formal", "human", "hidden")):
+    # LLM-judgement detection (2026-09-10 false-positive fix, tasks
+    # aaa34d46/77610c15): the naive `"llm" in oracle_text` fired on the word
+    # LLM naming the EXPERIMENT SUBJECT ("Run two PPO-aligned LLMs ..."),
+    # and the old exemption list missed the mechanical-computation signals
+    # the model actually used ("calculated analytically from the softmax
+    # probabilities", "held-out prompts" - note "hidden" != "held-out").
+    # Two RLHF tasks each had a purely analytic entropy oracle (which
+    # explicitly said "No LLM judging") rejected twice, burning two tier-A
+    # ideas. Now: mechanical-computation phrases exempt the plan outright,
+    # and "llm" only flags the oracle when it co-occurs with a JUDGEMENT
+    # verb in the same sentence (the judge semantics), not merely anywhere
+    # in the text.
+    _MECHANICAL_ORACLE_TERMS = (
+        "analytically", "analytic", "calculated", "calculation", "computed",
+        "computationally", "computed from", "formula", "deterministic",
+        "logits", "softmax", "programmatic", "regex", "string match",
+        "token probabilities", "held-out", "held out", "log likelihood",
+        "perplexity",
+    )
+    _JUDGEMENT_TERMS = (
+        "judge", "judging", "judgement", "judgment", "assess", "evaluat",
+        "rate", "rated", "scoring", "scores", "grade", "label", "labels",
+        "preference", "adjudicat",
+    )
+    has_mechanical_signal = any(
+        term in oracle_text for term in _MECHANICAL_ORACLE_TERMS)
+    llm_judgement_in_text = any(
+        "llm" in sentence and any(term in sentence for term in _JUDGEMENT_TERMS)
+        for sentence in re.split(r"[.;\n]", oracle_text)
+    )
+    if llm_judgement_in_text and not has_mechanical_signal:
         failures.append(
             "LLM_ONLY_ORACLE: the oracle relies on an LLM's own judgement "
             f"(oracle = \"{(plan.oracle or '')[:120]}\") — ground it in "

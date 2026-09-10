@@ -29,7 +29,17 @@ def test_audit_budget_legacy_values(temp_db, monkeypatch):
 def test_audit_budget_hard_caps(temp_db, monkeypatch):
     from app.agent.steps.audit_gaps import _audit_budget
 
+    # Pin the caps explicitly: the deployment .env may legitimately raise
+    # them (e.g. GAP_AUDIT_TIMEOUT_SECONDS/BUDGETED_AUDIT_FULLTEXT_MAX_PAPERS
+    # experiments), and this test is about the defaults the code ships with.
     monkeypatch.setattr("app.config.settings.gap_audit_budgeted", True)
+    monkeypatch.setattr("app.config.settings.budgeted_audit_max_queries", 4)
+    monkeypatch.setattr("app.config.settings.budgeted_audit_max_candidate_papers", 10)
+    monkeypatch.setattr("app.config.settings.budgeted_audit_neighbors", 3)
+    monkeypatch.setattr("app.config.settings.budgeted_audit_fulltext_max_papers", 2)
+    monkeypatch.setattr("app.config.settings.budgeted_killer_search_max_queries", 3)
+    monkeypatch.setattr("app.config.settings.budgeted_audit_sources",
+                        "semantic_scholar,openalex,arxiv")
     budget = _audit_budget()
     assert budget["queries"] == 4 and budget["candidates"] == 10
     assert budget["neighbors"] == 3 and budget["fulltext"] == 2
