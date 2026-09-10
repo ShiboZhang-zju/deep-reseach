@@ -109,9 +109,27 @@ def get_state(db: Session, task_id: str) -> ResearchState:
 def save_state(db: Session, task_id: str, state: ResearchState):
     task = db.get(ResearchTask, task_id)
     if task:
-        task.state_json = state.to_json()
-        task.current_round = state.current_round
-        db.flush()
+        # Capture BEFORE any rollback: rollback expires `task`, so re-reading
+        # task.state_json afterwards would return the stale pre-write state.
+        new_json = state.to_json()
+        new_round = state.current_round
+        task.state_json = new_json
+        task.current_round = new_round
+        try:
+            db.flush()
+        except OperationalError as exc:
+            # The big UPDATE (state_json can be ~10KB) losing the lock race
+            # used to fail the whole task (observed 2026-09-09/10: two batch
+            # topics died on exactly this UPDATE at 24/18 min into their
+            # runs). Same fallback as update_status: rollback the session and
+            # retry the state write standalone - the state blob is
+            # self-contained, so a standalone transaction is semantically
+            # identical.
+            if "database is locked" not in str(exc):
+                raise
+            db.rollback()
+            _standalone_status_write(
+                task_id, state_json=new_json, current_round=new_round)
 
 
 def update_normalized_topic(db: Session, task_id: str, topic: str):

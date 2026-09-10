@@ -876,6 +876,31 @@ async def _terminate_more_research(db, state: ResearchState, task_id: str,
     db.commit()
 
 
+def _is_endpoint_error(err_str: str) -> bool:
+    """Whether an LLM-call failure looks like a transient endpoint outage
+    (proxy 5xx, gateway HTML error page, circuit open, connect refused) rather
+    than a permanent input problem."""
+    return ("circuit-open" in err_str
+            or re.search(r"LLM call failed: 5\d\d", err_str) is not None
+            or "ConnectError" in err_str
+            or "Connection refused" in err_str)
+
+
+async def _wait_out_endpoint(mining_err: Exception, attempt: int,
+                             task_id: str, what: str) -> bool:
+    """Wait-and-retry helper for LLM-endpoint outages between phases.
+
+    Returns True when the caller should retry (attempt budget remaining),
+    False when the budget is exhausted and the caller should degrade.
+    """
+    wait_s = 60.0 * attempt
+    logger.warning(
+        "Task %s: LLM endpoint unavailable (%s); %s retry %d/3 in %.0fs",
+        task_id[:8], str(mining_err)[:140], what, attempt + 1, wait_s)
+    await asyncio.sleep(wait_s)
+    return attempt < 3
+
+
 async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str):
     # Verdict remediation: one directed search round + one re-audit for
     # uncertain verdicts — at most once per task (this function's scope).
@@ -1323,10 +1348,27 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             # old output (task 23ec8f20: idea_ids=[] replayed on resume).
             "experiment_generation_policy_version": EXPERIMENT_GENERATION_POLICY_VERSION,
         }, sort_keys=True).encode()).hexdigest()
-        experiment_result = await phase_service.execute_phase(
-            db, task_id, "generate_minimal_experiments", _minimal_experiments_op,
-            input_version=experiment_input_version
-        )
+        # Endpoint-outage retry: this phase is the LAST step — a transient
+        # 502 here used to fail a task that had already spent ~1h on search,
+        # evidence, mining and audits (task 0cd09cdc: 768 good calls, then
+        # one 502 at the final step). Same wait-out policy as mining.
+        experiment_result = None
+        for _exp_attempt in range(1, 4):
+            try:
+                experiment_result = await phase_service.execute_phase(
+                    db, task_id, "generate_minimal_experiments",
+                    _minimal_experiments_op,
+                    input_version=experiment_input_version
+                )
+                break
+            except LLMBudgetExceeded:
+                raise
+            except Exception as exp_err:
+                if (_is_endpoint_error(str(exp_err))
+                        and await _wait_out_endpoint(
+                            exp_err, _exp_attempt, task_id, "experiments")):
+                    continue
+                raise
         if experiment_result is None:
             idea_ids = [idea.id for idea in db.query(ResearchIdea).filter(
                 ResearchIdea.task_id == task_id,
