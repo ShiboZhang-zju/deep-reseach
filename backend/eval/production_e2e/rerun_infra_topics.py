@@ -103,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--statuses", nargs="+", default=list(DEFAULT_INFRA_STATUSES),
                    help="final_status values to treat as infrastructure-contaminated")
     p.add_argument("--api-base", default=DEFAULT_API_BASE)
+    p.add_argument("--api-timeout", type=float, default=300.0,
+                   help="HTTP read timeout for backend polls. Keep >= the "
+                        "backend's worst per-poll latency: at concurrency>1 a "
+                        "burst of sync work can stall a response past 120s, "
+                        "which is NOT a task failure (the task keeps running).")
     p.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL_S)
     p.add_argument("--timeout-seconds", type=float, default=14400)
     p.add_argument("--concurrency", type=int, default=2)
@@ -167,7 +172,14 @@ def _run(args: argparse.Namespace) -> None:
             f"[rerun] refusing to start: {run_lock} already exists — another "
             "driver may be driving this run dir.")
 
-    api = ApiClient(args.api_base, timeout=120.0)
+    # 300s, not the 120s used by run_full_v2's own driver: at concurrency>1 the
+    # backend event loop stalls in bursts (sync PDF/DB work inside async code)
+    # and a single poll read can exceed 120s. That is not a task failure — the
+    # task keeps running server-side — so a short client timeout burns the topic
+    # as an error while its task row is still alive (observed 2026-09-14:
+    # 13/15 topics recorded ReadTimeout at --concurrency 3, yet 7 of their tasks
+    # were still in extracting_evidence/searching afterwards).
+    api = ApiClient(args.api_base, timeout=args.api_timeout)
     papers_path = run.dir / "papers_export.jsonl"
     gaps_path = run.dir / "gaps_export.jsonl"
     file_lock = threading.Lock()
