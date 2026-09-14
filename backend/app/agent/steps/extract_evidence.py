@@ -17,6 +17,7 @@ import json
 import logging
 import os
 
+from sqlalchemy.exc import OperationalError
 from app.agent.state import ResearchState
 from app.agent.prompts import EVIDENCE_EXTRACT_SYSTEM, EVIDENCE_EXTRACT_USER
 from app.db.models import (
@@ -380,6 +381,7 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
     )
 
     evidence_count = 0
+    _pending_evidence = []
     for (prio, sec_name, chunk_text, chunk_hash), evidence_list in zip(candidates, extraction_results):
         page_num = _find_page_for_text(chunk_text, page_texts, sec_name)
         for ev in evidence_list:
@@ -424,10 +426,26 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
                 verification_status="verified",
                 discovered_round=round_number,
             )
-            db.add(eu)
+            _pending_evidence.append(eu)
             evidence_count += 1
 
-    db.flush()
+    # Lock retry (2026-09-10, task ea57b3c0): a sibling task's long write
+    # transaction (or a filesystem scanner on the DB file) can hold the write
+    # lock past busy_timeout — the old code lost the WHOLE paper's evidence
+    # to one locked flush (five papers dropped in one extract phase). The
+    # multi-row INSERT is milliseconds once the lock frees, so rollback +
+    # re-add + retry almost always succeeds.
+    for attempt in range(3):
+        try:
+            for eu in _pending_evidence:
+                db.add(eu)
+            db.flush()
+            break
+        except OperationalError as exc:
+            if "database is locked" not in str(exc) or attempt == 2:
+                raise
+            db.rollback()
+            await asyncio.sleep((2, 5, 10)[attempt])
     return evidence_count
 
 
