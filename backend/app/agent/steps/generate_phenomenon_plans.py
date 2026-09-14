@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from app.agent.state import ResearchState
 from app.db.models import GapCandidate, GapPhenomenonPlan, ResearchContract
 from app.db.repositories import paper_repo
+from app.db.lock_retry import flush_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ async def generate_phenomenon_plans(
             pipeline_version=state.pipeline_version,
         )
         db.add(row)
-        db.flush()
+        flush_with_retry(db)
         created_ids.append(row.id)
 
     paper_repo.save_trace(db, task_id, "generate_phenomenon_plans", "decision",

@@ -13,6 +13,7 @@ import time
 from pydantic import BaseModel
 
 from app.db.session import SessionLocal
+from app.db.lock_retry import commit_with_retry
 from app.db.repositories import paper_repo, phase_repo
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ async def execute_phase(db, task_id: str, phase_name: str, operation,
         return None
 
     pr = phase_repo.start_phase(db, task_id, phase_name, input_version, round_number)
-    db.commit()
+    commit_with_retry(db)
 
     started = time.perf_counter()
     try:
@@ -109,7 +110,7 @@ async def execute_phase(db, task_id: str, phase_name: str, operation,
         # left no structured way to see how long each phase actually took.
         paper_repo.save_trace(db, task_id, phase_name, "phase_duration",
                               round_number=round_number, duration_ms=duration_ms)
-        db.commit()
+        commit_with_retry(db)
         return result
     except Exception as e:
         duration_ms = int((time.perf_counter() - started) * 1000)
@@ -120,11 +121,17 @@ async def execute_phase(db, task_id: str, phase_name: str, operation,
         # original exception and leaves the control plane stuck in running.
         db.rollback()
         try:
+            # fail_phase and the trace write both hit the same lock environment
+            # that just broke the operation, so an unretried write here is
+            # exactly how a PhaseRun stays `running` forever: the outer
+            # `except Exception` swallows the lock error and the control plane
+            # silently disagrees with the task status (observed 2026-09-14,
+            # task 60607a47 failed while search_round_2 still read `running`).
             phase_repo.fail_phase(db, pr.id, error_message)
             paper_repo.save_trace(db, task_id, phase_name, "phase_duration",
                                   round_number=round_number, duration_ms=duration_ms,
                                   output_data={"error": error_message[:500]})
-            db.commit()
+            commit_with_retry(db)
         except Exception:
             db.rollback()
             logger.exception("Failed to persist failed PhaseRun %s for task %s",

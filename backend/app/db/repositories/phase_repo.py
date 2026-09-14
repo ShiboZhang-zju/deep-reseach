@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.db.lock_retry import flush_with_retry
 from app.db.models import PhaseRun
 
 
@@ -60,7 +61,7 @@ def complete_phase(db: Session, phase_run_id: str, output_version: str = "",
         pr.output_version = output_version
         pr.output_summary = output_summary
         pr.output_json = output_json
-        db.flush()
+        flush_with_retry(db)
 
 
 def fail_phase(db: Session, phase_run_id: str, error_message: str):
@@ -125,7 +126,33 @@ def mark_interrupted_phases(db: Session, task_id: str):
         pr.status = "failed"
         pr.error_message = "interrupted_by_restart"
         pr.completed_at = _utcnow()
-    db.flush()
+    flush_with_retry(db)
+    return len(running)
+
+
+def mark_running_phases_failed(db: Session, task_id: str, error_message: str,
+                               round_number: int | None = None) -> int:
+    """Mark still-'running' phases as failed and return how many were updated.
+
+    Scoped to a single task, and optionally to a single round. Callers use this
+    when they have already given up on a unit of work (a failed round) so the
+    control plane stops advertising that unit as in flight. Phases whose
+    ``round_number`` is NULL (task-level phases such as clarify or mine_gaps)
+    are only touched when ``round_number`` is None, so a round rollback cannot
+    clobber an unrelated task-level phase.
+    """
+    query = db.query(PhaseRun).filter(
+        PhaseRun.task_id == task_id,
+        PhaseRun.status == "running",
+    )
+    if round_number is not None:
+        query = query.filter(PhaseRun.round_number == round_number)
+    running = query.all()
+    for pr in running:
+        pr.status = "failed"
+        pr.error_message = error_message[:2000]
+        pr.completed_at = _utcnow()
+    flush_with_retry(db)
     return len(running)
 
 

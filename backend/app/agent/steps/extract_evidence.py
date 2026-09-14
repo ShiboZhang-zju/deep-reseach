@@ -24,6 +24,9 @@ from app.db.models import (
     Paper, TaskPaper, EvidenceUnit, PaperRole, ResearchQuestion,
 )
 from app.db.session import SessionLocal
+from app.db.lock_retry import (
+    ASYNC_BACKOFF, _sleep_for, commit_with_retry, flush_with_retry, is_lock_error,
+)
 from app.db.repositories import paper_repo
 from app.schemas.schemas import EvidenceExtractionList
 from app.services.event_service import emit_event
@@ -435,17 +438,21 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
     # to one locked flush (five papers dropped in one extract phase). The
     # multi-row INSERT is milliseconds once the lock frees, so rollback +
     # re-add + retry almost always succeeds.
-    for attempt in range(3):
+    #
+    # Retries are async (asyncio.sleep) rather than the sync helper's
+    # time.sleep: this runs on the event loop, so a blocking wait would stall
+    # every other task and HTTP request for the whole backoff.
+    for attempt in range(len(ASYNC_BACKOFF) + 1):
         try:
             for eu in _pending_evidence:
                 db.add(eu)
             db.flush()
             break
         except OperationalError as exc:
-            if "database is locked" not in str(exc) or attempt == 2:
+            if not is_lock_error(exc) or attempt == len(ASYNC_BACKOFF):
                 raise
             db.rollback()
-            await asyncio.sleep((2, 5, 10)[attempt])
+            await asyncio.sleep(_sleep_for(ASYNC_BACKOFF, attempt))
     return evidence_count
 
 
@@ -716,5 +723,5 @@ async def _classify_paper_roles_safe(db, task_id, papers):
             )
             db.add(pr)
 
-    db.flush()
-    db.commit()
+    flush_with_retry(db)
+    commit_with_retry(db)

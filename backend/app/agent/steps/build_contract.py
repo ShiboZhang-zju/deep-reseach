@@ -15,6 +15,7 @@ from app.agent.state import ResearchState
 from app.agent.prompts import BUILD_CONTRACT_SYSTEM, BUILD_CONTRACT_USER
 from app.db.models import ResearchContract, ResearchTask, ResearchQuestion, UserFeedback
 from app.db.repositories import paper_repo, task_repo
+from app.db.lock_retry import flush_with_retry
 from app.schemas.schemas import ResearchContractSchema
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,7 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
         for q in old_questions:
             q.status = "superseded"
             q.superseded_at = now
-        db.flush()
+        flush_with_retry(db)
         logger.info("Task %s: superseded contract v%d and %d questions",
                     task_id[:8], existing.version, len(old_questions))
 
@@ -211,7 +212,7 @@ async def build_research_contract(db, state: ResearchState, llm, task_id: str) -
         input_hash=current_hash,
     )
     db.add(contract)
-    db.flush()
+    flush_with_retry(db)
 
     # Phase 2.2A: Clear active_question_ids on new Contract
     state.contract_id = contract.id

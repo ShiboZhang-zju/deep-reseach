@@ -6,8 +6,13 @@ import time
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from app.db.lock_retry import _sleep_for, flush_with_retry, is_lock_error
 from app.db.models import ResearchTask
 from app.agent.state import ResearchState
+
+# status writes sit on the teardown path, where waiting is free and a false
+# failure is expensive — see `_standalone_status_write`.
+STANDALONE_BACKOFF = (1.0, 3.0, 8.0, 15.0, 25.0, 40.0)
 
 
 def create_task(db: Session, user_input: str, max_rounds: int | None = None) -> ResearchTask:
@@ -38,7 +43,7 @@ def list_tasks(db: Session, limit: int = 50) -> list[ResearchTask]:
 
 def _standalone_status_write(task_id: str, **fields) -> None:
     """Write status fields through a dedicated short transaction, with lock
-    retries (0.5s/1s/2s backoff).
+    retries.
 
     Fallback for `flush` raising OperationalError(database is locked) inside
     the caller's session: after such a failure the session needs rollback()
@@ -47,10 +52,15 @@ def _standalone_status_write(task_id: str, **fields) -> None:
     `UPDATE research_tasks` while another task held the write lock. A status
     flip is independent bookkeeping, so a standalone write is semantically
     safe and keeps the task alive.
+
+    Retry budget is deliberately wider than the generic contract: this path
+    only runs while a task is already being torn down, so waiting out a
+    multi-second storm costs nothing and a false `failed` status is worse than
+    a slow one (2026-09-10 pe2e-006 died here even with a 5/15/30s fallback).
     """
     from app.db.session import SessionLocal
 
-    for attempt in range(1, 4):
+    for attempt in range(len(STANDALONE_BACKOFF) + 1):
         session = SessionLocal()
         try:
             task = session.get(ResearchTask, task_id)
@@ -61,15 +71,9 @@ def _standalone_status_write(task_id: str, **fields) -> None:
             return
         except OperationalError as exc:
             session.rollback()
-            if "database is locked" not in str(exc) or attempt == 3:
+            if not is_lock_error(exc) or attempt == len(STANDALONE_BACKOFF):
                 raise
-            # Lock storms last minutes (a sibling task's long write
-            # transaction), so 0.5/1/2s retries all landed inside the same
-            # window (2026-09-10: pe2e-006's state write died even WITH this
-            # fallback). 5/15/30s spans ~50s — enough for a storm wave to
-            # drain — and this path only runs for a task that is already
-            # being torn down, so the wait costs nothing.
-            time.sleep((5, 15, 30)[attempt - 1])
+            time.sleep(_sleep_for(STANDALONE_BACKOFF, attempt))
         finally:
             session.close()
 
@@ -89,7 +93,7 @@ def _flush_with_lock_fallback(db: Session, task_id: str, **fields) -> None:
     try:
         db.flush()
     except OperationalError as exc:
-        if "database is locked" not in str(exc):
+        if not is_lock_error(exc):
             raise
         db.rollback()
         _standalone_status_write(task_id, **fields)
@@ -131,7 +135,7 @@ def save_state(db: Session, task_id: str, state: ResearchState):
             # retry the state write standalone - the state blob is
             # self-contained, so a standalone transaction is semantically
             # identical.
-            if "database is locked" not in str(exc):
+            if not is_lock_error(exc):
                 raise
             db.rollback()
             _standalone_status_write(
@@ -142,4 +146,4 @@ def update_normalized_topic(db: Session, task_id: str, topic: str):
     task = db.get(ResearchTask, task_id)
     if task:
         task.normalized_topic = topic
-        db.flush()
+        flush_with_retry(db)

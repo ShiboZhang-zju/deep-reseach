@@ -21,6 +21,7 @@ from app.db.models import (
     QuestionEvidenceLink, Paper, TaskPaper,
 )
 from app.db.repositories import paper_repo
+from app.db.lock_retry import flush_with_retry
 from sqlalchemy import func
 
 logger = logging.getLogger(__name__)
@@ -205,7 +206,7 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
             "distinct_contradicting_papers": distinct_contradicting,
         })
 
-    db.flush()
+    flush_with_retry(db)
     db.commit()
 
     logger.info("Task %s: coverage updated for %d questions (round %d)",

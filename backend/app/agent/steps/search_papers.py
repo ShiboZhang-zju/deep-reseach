@@ -15,6 +15,7 @@ from app.config import settings
 from app.agent.state import ResearchState
 from app.db.repositories import paper_repo
 from app.db.repositories.search_query_repo import update_query_results
+from app.db.lock_retry import flush_with_retry
 from app.services.search_service import search_service
 from app.services.scoring_service import normalize_paper, deduplicate_papers
 from app.services.event_service import emit_event
@@ -188,7 +189,7 @@ async def search_and_save_papers(db, state: ResearchState,
             # the starvation window for the other concurrent tasks.
             db.commit()
 
-    db.flush()
+    flush_with_retry(db)
 
     # Save SearchQueryPaper mappings
     # NOTE: the same (query_id, paper_id, source) can appear multiple times in

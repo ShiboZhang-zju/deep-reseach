@@ -2096,6 +2096,27 @@ async def _run_search_loop(db, state: ResearchState, llm, task_id: str) -> Searc
             task_repo.save_state(db, task_id, state)
             db.commit()
 
+            # Converge the control plane with the rollback above: the failed
+            # phase for this round is left in `running` when its own failure
+            # bookkeeping could not be persisted (lock contention at exactly
+            # the moment it gives up). should_skip_phase only trusts
+            # `completed`, so this never causes a wrong skip — but a stale
+            # `running` row makes the UI and diagnostics claim a round is still
+            # in flight while the task has already moved on (observed
+            # 2026-09-14: task 60607a47 failed with search_round_2 `running`).
+            try:
+                stale = phase_repo.mark_running_phases_failed(
+                    db, task_id, f"round_{round_num}_failed: {str(round_err)[:200]}",
+                    round_number=round_num)
+                if stale:
+                    db.commit()
+                    logger.info("Task %s: converged %d stale running phase(s) for round %d",
+                                task_id[:8], stale, round_num)
+            except Exception as converge_err:
+                db.rollback()
+                logger.warning("Task %s: failed to converge stale phases for round %d: %s",
+                               task_id[:8], round_num, converge_err)
+
             if total_failed_rounds >= TOTAL_FAILED_ROUND_BUDGET:
                 return SearchLoopResult(status="failed", reason="failed_round_budget_exhausted",
                                         completed_rounds=completed_rounds,

@@ -4,6 +4,7 @@ import re
 import json
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
+from app.db.lock_retry import flush_with_retry
 from app.db.models import SearchQueryRecord
 
 
@@ -65,7 +66,11 @@ def save_search_query(db: Session, task_id: str, query_text: str, intent: str,
         search_policy_version=search_policy_version,
     )
     db.add(record)
-    db.flush()
+    # Lock retry (2026-09-14): this bare flush killed batch tasks 60607a47 and
+    # 10c75f49 on `INSERT INTO search_query_records` while a sibling task held
+    # the write lock — three round-level retries all landed inside the same
+    # storm. The INSERT is milliseconds once the lock frees.
+    flush_with_retry(db)
     return record
 
 
@@ -81,7 +86,7 @@ def update_query_results(db: Session, query_id: str, result_count: int,
         record.status = status
         record.execution_error = error
         record.completed_at = _utcnow()
-        db.flush()
+        flush_with_retry(db)
 
 
 def get_queries_for_round(db: Session, task_id: str, round_number: int) -> list[SearchQueryRecord]:

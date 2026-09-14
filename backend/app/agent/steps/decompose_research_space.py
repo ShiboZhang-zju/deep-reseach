@@ -13,6 +13,7 @@ from app.agent.state import ResearchState
 from app.agent.prompts import DECOMPOSE_SYSTEM, DECOMPOSE_USER
 from app.db.models import ResearchContract, ResearchQuestion
 from app.db.repositories import paper_repo, task_repo
+from app.db.lock_retry import flush_with_retry
 from app.schemas.schemas import ResearchDecompositionSchema
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ async def decompose_research_space(db, state: ResearchState, llm, task_id: str) 
         db.add(rq)
         saved_questions.append(rq)
 
-    db.flush()
+    flush_with_retry(db)
 
     # Phase 1.5: Persist active_question_ids to state
     state.active_question_ids = [q.id for q in saved_questions]
@@ -138,7 +139,7 @@ async def _decompose_fallback(db, state: ResearchState, llm, task_id: str) -> li
         db.add(rq)
         saved_questions.append(rq)
 
-    db.flush()
+    flush_with_retry(db)
     state.active_question_ids = [q.id for q in saved_questions]
     state.research_questions = [q.question for q in result.questions]
     task_repo.save_state(db, task_id, state)
