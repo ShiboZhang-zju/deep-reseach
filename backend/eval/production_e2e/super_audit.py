@@ -128,14 +128,27 @@ async def gen_queries(llm, topic: str, claim: str, stats: CallStats) -> AuditQue
 async def search_candidates(queries: list[str]) -> list[dict]:
     """Multi-source retrieval with per-source failure isolation."""
     from app.paper_sources.arxiv import ArxivSource
+    from app.paper_sources.local_corpus import LocalCorpusSource
     from app.paper_sources.openalex import OpenAlexSource
     from app.paper_sources.semantic_scholar import SemanticScholarSource
 
+    # `local_corpus` searches papers we already downloaded and indexed, including
+    # 5k full-text chunks. It is the one source that keeps the audit multi-source
+    # when the public APIs are down (on 2026-09-15 S2 and arXiv were fully
+    # rate-limited, leaving OpenAlex alone), and it can surface prior art that
+    # production itself retrieved -- the most likely place for a killer paper to
+    # hide, and invisible to a public-API-only audit.
     sources = [("openalex", OpenAlexSource()),
+               ("local_corpus", LocalCorpusSource()),
                ("semantic_scholar", SemanticScholarSource()),
                ("arxiv", ArxivSource())]
     seen_titles: set[str] = set()
-    candidates: list[dict] = []
+    # Per-source buckets, then round-robin. Concatenating per source and
+    # truncating at CANDIDATES_PER_TARGET made the first healthy source eat the
+    # entire quota, collapsing "multi-source" into one source — observed
+    # 2026-09-15 when 12/12 candidates came from OpenAlex. Multi-source
+    # independence is a property of the CAP, so the cap must be filled evenly.
+    per_source: dict[str, list[dict]] = {name: [] for name, _ in sources}
     for source_name, source in sources:
         for query in queries:
             try:
@@ -152,19 +165,40 @@ async def search_candidates(queries: list[str]) -> list[dict]:
                 if key in seen_titles:
                     continue
                 seen_titles.add(key)
-                candidates.append({
+                raw = getattr(paper, "raw_data", None) or {}
+                per_source[source_name].append({
                     "title": title,
                     "year": getattr(paper, "year", None),
                     "venue": getattr(paper, "venue", None) or None,
                     "url": getattr(paper, "url", None) or None,
                     "source": source_name,
                     "query": query,
+                    # local_corpus can quote the sentence that matched; that is
+                    # what lets a reviewer adjudicate FULL/PARTIAL/NONE instead of
+                    # guessing from a title. Empty for the public sources.
+                    "match_type": raw.get("match_type"),
+                    "snippet": raw.get("snippet"),
+                    "section": raw.get("section"),
                 })
-    return candidates[:CANDIDATES_PER_TARGET]
+    candidates: list[dict] = []
+    cursor = 0
+    while len(candidates) < CANDIDATES_PER_TARGET:
+        progressed = False
+        for source_name, _ in sources:
+            bucket = per_source[source_name]
+            if cursor < len(bucket):
+                candidates.append(bucket[cursor])
+                progressed = True
+                if len(candidates) >= CANDIDATES_PER_TARGET:
+                    break
+        if not progressed:
+            break
+        cursor += 1
+    return candidates
 
 
 def blind_review_section(submission_id: str, topic: str, claim: str,
-                         candidates: list[dict]) -> str:
+                         candidates: list[dict], query_failure: str | None = None) -> str:
     """Blind sheet: NO system identity, NO target_type, NO internal scores."""
     lines = [
         f"## Submission {submission_id}",
@@ -178,13 +212,30 @@ def blind_review_section(submission_id: str, topic: str, claim: str,
         "PARTIAL (overlapping but not the same) / NONE.",
         "",
     ]
-    if not candidates:
+    if query_failure:
+        # A target we could not even query is NOT evidence of novelty. Say so
+        # explicitly, otherwise an empty candidate list reads as "we searched
+        # and prior art genuinely does not exist".
+        lines.append(
+            f"- (RETRIEVAL FAILED for this submission: {query_failure})")
+        lines.append(
+            "- Do NOT read the empty list as absence of prior art. Judge from "
+            "your own knowledge and mark the verdict accordingly.")
+        lines.append("")
+    elif not candidates:
         lines.append("- (no candidates found — control sample: judge from your "
                      "own knowledge)")
     for idx, cand in enumerate(candidates, 1):
         lines.append(
             f"- [ ] {idx}. {cand['title']} ({cand.get('year') or 'n.d.'}, "
             f"{cand.get('venue') or cand['source']}) — FULL / PARTIAL / NONE: ____")
+        # Quote the matched passage when the local corpus supplied one. A title
+        # alone often cannot settle whether prior art implements the SAME
+        # mechanism for the SAME purpose; the sentence can.
+        if cand.get("snippet"):
+            snippet = " ".join(str(cand["snippet"]).split())
+            where = cand.get("section") or cand.get("match_type") or "local corpus"
+            lines.append(f"      - matched ({where}): \"{snippet[:300]}\"")
     lines += [
         "",
         "Overall: does prior art already cover this claim (false-open)? [ ] yes [ ] no",
@@ -263,20 +314,32 @@ async def _run(args) -> None:
     for idx, sub in enumerate(submissions):
         stats = CallStats()
         print(f"[{idx+1}/{len(submissions)}] {sub['submission_id']}")
+        failure = None
         try:
             queries = await gen_queries(llm, sub["_topic"], sub["claim"], stats)
             candidates = await search_candidates(queries.queries)
         except Exception as exc:  # per-target isolation
             print(f"    FAILED: {type(exc).__name__}: {exc}")
             candidates = []
-            queries = AuditQueries(queries=[])
-        sub["queries"] = queries.queries
+            queries = []
+            # Record why, so a target that produced no candidates is
+            # distinguishable from one where the search genuinely found
+            # nothing. Auditing a claim we could not even query is NOT
+            # evidence of novelty.
+            failure = f"{type(exc).__name__}: {exc}"[:500]
+        # NOTE: never construct AuditQueries() on the failure path. Its
+        # min_length=4 constraint exists to validate LLM output; feeding it an
+        # empty list raises ValidationError INSIDE the except block, which
+        # escapes the per-target isolation and kills the whole run (observed
+        # 2026-09-15: 3 of 91 targets done, then the process died outright).
+        sub["queries"] = queries
+        sub["query_failure"] = failure
         sub["candidate_papers"] = candidates
         sub["llm"] = stats.as_dict()
         with candidates_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(sub, ensure_ascii=False, default=str) + "\n")
         review_md.append(blind_review_section(
-            sub["submission_id"], sub["_topic"], sub["claim"], candidates))
+            sub["submission_id"], sub["_topic"], sub["claim"], candidates, failure))
         # Fill-in template: reviewer edits the nulls, keyed by submission_id only.
         with template_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({
