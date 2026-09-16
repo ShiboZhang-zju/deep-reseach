@@ -52,11 +52,45 @@ def _terms(text: str, max_terms: int = 12) -> list[str]:
     return out
 
 
+# A bibliography line, a citation entry, or a table row. Showing one of these
+# as "the passage that matches your claim" is actively misleading: a reviewer
+# reads it as evidence about the claim when it is only a coincidental keyword
+# overlap. Measured before this filter: 11% of snippets were bibliography or
+# table content, one of them literally
+# `arXiv preprint arXiv:2308.08155. 12 Zhihong Xu, ...`.
+_CITATION = re.compile(
+    r'(arxiv preprint|doi:\s*10\.|\bet al\.,?\s*\d{4}|'
+    r'\bpp\.\s*\d+\s*[-–]\s*\d+|\bvol\.\s*\d+|\bno\.\s*\d+)', re.I)
+_TABLE_ROW = re.compile(r'(\d+[.:%]\s*){4,}')
+# Sections that never contain the prose a reviewer needs.
+_NON_BODY_SECTIONS = {"references", "bibliography", "acknowledgments",
+                      "acknowledgements", "appendix"}
+
+
+def _looks_like_body(text: str) -> bool:
+    """Reject snippets that are not continuous prose."""
+    stripped = text.strip()
+    if len(stripped.split()) < 15:
+        return False
+    if _TABLE_ROW.search(stripped):
+        return False
+    if _CITATION.search(stripped) and len(_CITATION.findall(stripped)) >= 2:
+        return False
+    # A passage that is mostly numerals/symbols is a table, not a sentence.
+    letters = sum(1 for c in stripped if c.isalpha())
+    if letters / max(len(stripped), 1) < 0.6:
+        return False
+    return True
+
+
 def _pick_snippet(db, paper_id: str, claim: str, max_chars: int = 300) -> dict | None:
     """Best matching chunk for `claim`, or None.
 
     Scored in SQL by counting distinct claim terms present, so a long chunk
-    cannot win merely by being long.
+    cannot win merely by being long. Candidate chunks are filtered for prose
+    quality in Python, because "matches the most claim terms" and "is worth
+    showing a reviewer" are different questions — a bibliography entry dense
+    with the claim's topic words scores highly on the first and fails the second.
     """
     from sqlalchemy import text
 
@@ -73,16 +107,25 @@ def _pick_snippet(db, paper_id: str, claim: str, max_chars: int = 300) -> dict |
     # not evidence the passage is about the claim.
     min_hits = 2 if len(terms) >= 3 else 1
 
-    row = db.execute(text(f"""
+    # Fetch a few, not just the top one: the best-scoring chunk is often a
+    # bibliography, and the next-best may be clean prose.
+    rows = db.execute(text(f"""
         SELECT pc.section, substr(pc.text, 1, :n) AS snippet, ({expr}) AS n_hits
         FROM paper_chunks pc
         WHERE pc.paper_id = :pid AND ({expr}) >= :min_hits
         ORDER BY n_hits DESC
-        LIMIT 1
-    """), {**params, "n": max_chars, "min_hits": min_hits}).fetchone()
-    if not row:
-        return None
-    return {"section": row.section, "snippet": " ".join(row.snippet.split())}
+        LIMIT 6
+    """), {**params, "n": max_chars, "min_hits": min_hits}).fetchall()
+
+    for row in rows:
+        section = (row.section or "").strip().lower()
+        if section in _NON_BODY_SECTIONS:
+            continue
+        snippet = " ".join(row.snippet.split())
+        if not _looks_like_body(snippet):
+            continue
+        return {"section": row.section, "snippet": snippet}
+    return None
 
 
 def _run(args) -> None:
