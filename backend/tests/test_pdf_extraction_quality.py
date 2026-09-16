@@ -155,3 +155,32 @@ class TestSnippetBodyFilter:
                  "activation sensitivity measure improve 4-bit quantization "
                  "accuracy across four benchmarks without added inference cost.")
         assert _looks_like_body(prose)
+
+    def test_rejects_proceedings_frontmatter(self):
+        """Real leftover: a proceedings header matched a RAG claim by title words.
+
+        It repeated the paper's own title ("Retrieval Augmented Generation or
+        Long-Context LLMs?") so it scored highly on claim terms while containing
+        no evidence about the claim at all.
+        """
+        from eval.production_e2e.enrich_audit_snippets import _looks_like_body
+        front = ("Proceedings of the 2024 Conference on Empirical Methods in "
+                 "Natural Language Processing: Industry Track, pages 881-893 "
+                 "November 12-16, 2024 (c)2024 Association for Computational "
+                 "Linguistics Retrieval Augmented Generation or Long-Context LLMs?")
+        assert not _looks_like_body(front)
+
+    def test_rejects_copyright_and_page_range_lines(self):
+        from eval.production_e2e.enrich_audit_snippets import _looks_like_body
+        assert not _looks_like_body(
+            "Published as a conference paper at ICLR 2024. Volume 12, pages "
+            "4401-4417. ISBN 978-1-4503-1234-5. All content in this area was "
+            "uploaded by the contributing author.")
+
+    def test_rejects_text_without_sentence_punctuation(self):
+        """Headers and front-matter rarely contain a real sentence."""
+        from eval.production_e2e.enrich_audit_snippets import _looks_like_body
+        assert not _looks_like_body(
+            "Retrieval Augmented Generation Long Context Language Models "
+            "Efficient Inference Attention Dilution Benchmark Evaluation "
+            "Empirical Study Results Analysis Discussion Conclusion")

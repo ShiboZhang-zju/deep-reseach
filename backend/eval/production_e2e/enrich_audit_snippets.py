@@ -62,23 +62,44 @@ _CITATION = re.compile(
     r'(arxiv preprint|doi:\s*10\.|\bet al\.,?\s*\d{4}|'
     r'\bpp\.\s*\d+\s*[-–]\s*\d+|\bvol\.\s*\d+|\bno\.\s*\d+)', re.I)
 _TABLE_ROW = re.compile(r'(\d+[.:%]\s*){4,}')
+# Publication front-matter: proceedings headers, copyright lines, page ranges.
+# These repeat the paper's own title, so they match the claim's topic words
+# perfectly while containing no evidence about it. Measured leftover after the
+# first filter: a snippet reading "Proceedings of the 2024 Conference on
+# Empirical Methods in Natural Language Processing: Industry Track, pages
+# 881-893 November 12-16, 2024 (c)2024 Association for Computational
+# Linguistics" was shown for a RAG long-context claim.
+_FRONTMATTER = re.compile(
+    r'(proceedings of the|conference on empirical methods|'
+    r'association for computational linguistics|©\s*\d{4}|\(c\)\s*\d{4}|'
+    r'pages\s+\d+\s*[-–]\s*\d+|workshop on|volume\s+\d+,\s*pages|'
+    r'isbn|issn|published as a conference paper)', re.I)
+# A month-day-year or month-year range typical of proceedings front-matter.
+_DATE_RANGE = re.compile(
+    r'\b(january|february|march|april|may|june|july|august|september|'
+    r'october|november|december)\s+\d{1,2}\s*[-–]\s*\d{1,2},?\s*\d{4}', re.I)
 # Sections that never contain the prose a reviewer needs.
 _NON_BODY_SECTIONS = {"references", "bibliography", "acknowledgments",
                       "acknowledgements", "appendix"}
 
 
 def _looks_like_body(text: str) -> bool:
-    """Reject snippets that are not continuous prose."""
+    """Reject snippets that are not continuous prose about the claim."""
     stripped = text.strip()
     if len(stripped.split()) < 15:
         return False
     if _TABLE_ROW.search(stripped):
+        return False
+    if _FRONTMATTER.search(stripped) or _DATE_RANGE.search(stripped):
         return False
     if _CITATION.search(stripped) and len(_CITATION.findall(stripped)) >= 2:
         return False
     # A passage that is mostly numerals/symbols is a table, not a sentence.
     letters = sum(1 for c in stripped if c.isalpha())
     if letters / max(len(stripped), 1) < 0.6:
+        return False
+    # Prose has sentence punctuation; front-matter and headers usually do not.
+    if not re.search(r'[.!?]\s', stripped + " "):
         return False
     return True
 
@@ -161,7 +182,12 @@ def _run(args) -> None:
         for rec in records:
             claim = rec.get("claim") or ""
             for cand in (rec.get("candidate_papers") or []):
-                if cand.get("snippet"):
+                if cand.get("snippet") and not args.refresh:
+                    # Existing snippets are kept by default so a resumed run does
+                    # not discard work. But they may have been derived from
+                    # lower-quality chunks — after a PDF re-parse they MUST be
+                    # regenerated, otherwise the sheet still shows text produced
+                    # by the degraded extractor (bibliography entries, fragments).
                     skipped += 1
                     continue
                 pid = cand.get("local_paper_id")
@@ -217,6 +243,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--rebuild-sheet", action="store_true",
                    help="also regenerate human_review_blind.md from the records")
+    p.add_argument("--refresh", action="store_true",
+                   help="recompute snippets that already exist. Required after a PDF "
+                        "re-parse, since old snippets came from the old chunk text.")
     return p
 
 

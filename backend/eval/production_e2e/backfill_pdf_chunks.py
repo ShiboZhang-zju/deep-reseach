@@ -45,6 +45,11 @@ from pathlib import Path
 
 logger = logging.getLogger("backfill_pdf")
 
+# Mean chunk length below this marks a paper as still carrying output from the
+# pre-fix extractor (~65 words/chunk) rather than a re-parsed one (~200). Used to
+# resume an interrupted --reparse without needing a migration marker column.
+DEGRADED_AVG_WORDS = 120.0
+
 
 def _collect_audit_candidates(audit_dir: Path) -> tuple[set[str], set[str]]:
     """Paper ids and normalised titles referenced by an audit run's records.
@@ -389,25 +394,45 @@ def _drop_reference_chunks(chunks: list) -> list:
     return kept
 
 
-def _select_reparse_targets(db, limit: int | None) -> list:
+def _select_reparse_targets(db, limit: int | None,
+                            degraded_only: bool = False) -> list:
     """Papers we previously parsed with the degraded extractor.
 
     Identified by having `pymupdf_inline` chunks AND a PDF URL. Re-parsing is
     needed because the extraction fix (paragraph re-joining, heading splitting,
     boilerplate stripping) changes the output text, so existing chunks stay
     degraded until rebuilt.
+
+    `degraded_only` narrows this to papers whose chunks still look like the old
+    output. That makes an interrupted run resumable: the extractor's fixes raise
+    average chunk length from ~65 to ~200 words, so mean length cleanly separates
+    re-parsed papers from not-yet-done ones without a migration marker.
     """
     from sqlalchemy import text
 
-    sql = """
-        SELECT DISTINCT p.id, p.title, p.pdf_url
-        FROM papers p
-        JOIN paper_chunks pc ON pc.paper_id = p.id
-        WHERE pc.extraction_method = 'pymupdf_inline'
-          AND p.pdf_url IS NOT NULL AND p.pdf_url != ''
-        ORDER BY p.citation_count DESC NULLS LAST
-    """
-    rows = db.execute(text(sql)).fetchall()
+    if degraded_only:
+        sql = """
+            SELECT p.id, p.title, p.pdf_url
+            FROM papers p
+            JOIN (
+                SELECT paper_id, AVG(word_count) avg_w, COUNT(*) n
+                FROM paper_chunks GROUP BY paper_id
+            ) c ON c.paper_id = p.id
+            WHERE p.pdf_url IS NOT NULL AND p.pdf_url != ''
+              AND c.avg_w < :threshold
+            ORDER BY p.citation_count DESC NULLS LAST
+        """
+        rows = db.execute(text(sql), {"threshold": DEGRADED_AVG_WORDS}).fetchall()
+    else:
+        sql = """
+            SELECT DISTINCT p.id, p.title, p.pdf_url
+            FROM papers p
+            JOIN paper_chunks pc ON pc.paper_id = p.id
+            WHERE pc.extraction_method = 'pymupdf_inline'
+              AND p.pdf_url IS NOT NULL AND p.pdf_url != ''
+            ORDER BY p.citation_count DESC NULLS LAST
+        """
+        rows = db.execute(text(sql)).fetchall()
     return rows[:limit] if limit else rows
 
 
@@ -430,7 +455,8 @@ async def _run(args) -> None:
     db = SessionLocal()
     try:
         if args.reparse:
-            targets = _select_reparse_targets(db, args.limit)
+            targets = _select_reparse_targets(db, args.limit,
+                                              degraded_only=args.degraded_only)
         else:
             targets = _select_targets(db, ids, titles, args.limit)
     finally:
@@ -503,6 +529,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="re-extract papers that already have chunks, replacing them "
                         "with output from the current extractor. Old chunks are only "
                         "deleted after the replacement parses successfully.")
+    p.add_argument("--degraded-only", action="store_true",
+                   help="with --reparse, target only papers whose chunks still look "
+                        "like pre-fix output, so an interrupted run can resume.")
     return p
 
 
