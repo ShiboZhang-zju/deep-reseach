@@ -98,22 +98,29 @@ class LocalCorpusSource(PaperSource):
         db = SessionLocal()
         try:
             hits: dict[str, RawPaper] = {}
-            # Tier order matters and was arrived at empirically (2026-09-15).
+            # Which tier may ADMIT a paper is the load-bearing decision here, and
+            # it was arrived at empirically (2026-09-15). Metadata/title is the
+            # admitting tier: matching freely against 5k full-text chunks admits
+            # any paper that happens to use a few common words anywhere in 40
+            # pages, and long surveys own the most chunks so they dominated every
+            # query regardless of topic (three unrelated queries all returned the
+            # same surveys).
             #
-            # Scoring metadata/title FIRST is deliberate, though it feels
-            # backwards for a full-text corpus. Matching freely against 5k
-            # full-text chunks admits any paper that happens to use three common
-            # words anywhere in 40 pages, and because long survey papers have the
-            # most chunks they dominated every query regardless of topic (three
-            # different queries all returned the same surveys). Title/abstract
-            # are short and topical, so requiring a strong match there first
-            # gives precision; the chunk/evidence tiers then only supply the
-            # quotable snippet for papers already selected as on-topic.
+            # BUT the later tiers must still RUN even once the cap is full — that
+            # is the whole point of holding a full-text corpus. Gating them behind
+            # `len(hits) < limit` starved them completely: on 2026-09-15's audit
+            # all 392 local_corpus candidates were metadata-only, because a topic
+            # with hundreds of papers fills the 12 slots in tier 1 and the
+            # chunk/evidence tiers never executed. Result: every candidate reached
+            # the blind review sheet with `snippet: null`, leaving the reviewer to
+            # judge FULL/PARTIAL/NONE from a title alone.
+            #
+            # So: tier 1 admits, tiers 2-3 upgrade-in-place. `_collect_*` already
+            # refuses to add papers absent from `hits`, so running them
+            # unconditionally cannot loosen precision.
             self._collect_paper_hits(db, terms, hits, limit)
-            if len(hits) < limit:
-                self._collect_evidence_hits(db, terms, hits, limit)
-            if len(hits) < limit:
-                self._collect_chunk_hits(db, terms, hits, limit)
+            self._collect_evidence_hits(db, terms, hits, limit)
+            self._collect_chunk_hits(db, terms, hits, limit)
             # Order by evidential strength: a full-text match beats an extracted
             # evidence span, which beats a metadata-only match; within a tier the
             # paper matching more distinct query terms comes first.
@@ -168,8 +175,19 @@ class LocalCorpusSource(PaperSource):
         if not hits:
             return
         expr, params = self._match_expr("pc.text", terms, "c")
+        # Restrict to the papers already selected. Fetching the globally
+        # best-matching chunks and filtering afterwards does not work: the top-N
+        # chunks come from arbitrary papers (long surveys produce the most), so
+        # the chunks belonging to our candidates get cut off by LIMIT before the
+        # admit=False guard ever sees them. Observed as a seeded paper that
+        # matched terms in its own chunk yet never upgraded past `metadata`.
         params["min_hits"] = self._min_hits(terms)
         params["lim"] = max(limit * 6, 30)
+        id_keys = []
+        for i, pid in enumerate(hits):
+            key = f"pid{i}"
+            params[key] = pid
+            id_keys.append(f":{key}")
         rows = db.execute(text(
             f"""
             SELECT p.id, p.title, p.year, p.venue, p.abstract, p.citation_count,
@@ -178,16 +196,16 @@ class LocalCorpusSource(PaperSource):
                    ({expr}) AS n_hits
             FROM paper_chunks pc
             JOIN papers p ON p.id = pc.paper_id
-            WHERE ({expr}) >= :min_hits
+            WHERE p.id IN ({', '.join(id_keys)})
+              AND ({expr}) >= :min_hits
             ORDER BY n_hits DESC, p.citation_count DESC
             LIMIT :lim
             """
         ), params).fetchall()
         for r in rows:
-            if r.id not in hits:
-                continue  # never admit a new paper from this tier
             self._add_hit(hits, r, match_type="full_text", section=r.section,
-                          snippet=r.snippet, limit=limit, n_hits=r.n_hits)
+                          snippet=r.snippet, limit=limit, n_hits=r.n_hits,
+                          admit=False)
 
     def _collect_evidence_hits(self, db, terms, hits: dict, limit: int) -> None:
         # evidence_units has no `evidence_text` column: the quotable span lives in
@@ -198,6 +216,14 @@ class LocalCorpusSource(PaperSource):
             terms, "e")
         params["min_hits"] = self._min_hits(terms)
         params["lim"] = max(limit * 3, 15)
+        # Restricted to already-selected papers, same reasoning as the chunk
+        # tier: filtering after a global ORDER BY ... LIMIT silently drops the
+        # rows belonging to our candidates.
+        id_keys = []
+        for i, pid in enumerate(hits):
+            key = f"eid{i}"
+            params[key] = pid
+            id_keys.append(f":{key}")
         rows = db.execute(text(
             f"""
             SELECT p.id, p.title, p.year, p.venue, p.abstract, p.citation_count,
@@ -206,14 +232,16 @@ class LocalCorpusSource(PaperSource):
                    ({expr}) AS n_hits
             FROM evidence_units eu
             JOIN papers p ON p.id = eu.paper_id
-            WHERE ({expr}) >= :min_hits
+            WHERE p.id IN ({', '.join(id_keys)})
+              AND ({expr}) >= :min_hits
             ORDER BY n_hits DESC, p.citation_count DESC
             LIMIT :lim
             """
         ), params).fetchall()
         for r in rows:
             self._add_hit(hits, r, match_type="evidence", section=r.section,
-                          snippet=r.snippet, limit=limit, n_hits=r.n_hits)
+                          snippet=r.snippet, limit=limit, n_hits=r.n_hits,
+                          admit=False)
 
     def _collect_paper_hits(self, db, terms, hits: dict, limit: int) -> None:
         # Title matches are worth more than abstract matches, so the title
@@ -242,23 +270,35 @@ class LocalCorpusSource(PaperSource):
             self._add_hit(hits, r, match_type="metadata", section=None,
                           snippet=None, limit=limit, n_hits=r.n_hits)
 
-    @staticmethod
-    def _add_hit(hits: dict, row, match_type: str, section, snippet, limit: int,
-                 n_hits: int = 0) -> None:
-        # The cap is enforced by the caller between tiers; here we dedupe and
-        # upgrade, so a stronger match for an already-seen paper can replace a
-        # weaker one. match_type lives in raw_data (RawPaper has no such field).
+    _TIER = {"metadata": 0, "evidence": 1, "full_text": 2}
+
+    @classmethod
+    def _add_hit(cls, hits: dict, row, match_type: str, section, snippet, limit: int,
+                 n_hits: int = 0, admit: bool = True) -> None:
+        """Insert a paper, or upgrade one already present to a stronger match.
+
+        `admit=False` restricts this to papers already in `hits`, which is how the
+        evidence/full-text tiers are kept from loosening precision (see
+        `_search_sync`).
+
+        `n_hits` is NOT comparable across tiers -- the metadata tier scores a
+        weighted (title*2 + abstract) count while the chunk/evidence tiers count
+        raw term hits -- so it is stored per tier and never used to re-rank a
+        paper against one from another tier. Comparing them was a latent bug:
+        upgrading a metadata hit (weighted score, e.g. 8) to a full-text hit
+        (raw count, e.g. 3) would have DEMOTED the paper in the final sort.
+        """
         pid = row.id
         existing = hits.get(pid)
-        tier = {"metadata": 0, "evidence": 1, "full_text": 2}
         if existing is not None:
-            prev = (existing.raw_data or {}).get("match_type")
+            prev_tier = (existing.raw_data or {}).get("match_type")
             prev_hits = (existing.raw_data or {}).get("n_hits", 0)
-            # Keep the better tier; within a tier keep the higher term-match
-            # count, so the snippet we show a reviewer is the most on-topic one.
-            if (tier.get(match_type, 0), n_hits) <= (tier.get(prev, 0), prev_hits):
+            # Better tier wins outright. Within the same tier keep the higher
+            # term-match count, so the snippet shown to a reviewer is the most
+            # on-topic one available.
+            if (cls._TIER.get(match_type, 0), n_hits) <= (cls._TIER.get(prev_tier, 0), prev_hits):
                 return
-        elif len(hits) >= limit:
+        elif not admit or len(hits) >= limit:
             return
         hits[pid] = RawPaper(
             title=(row.title or "").strip(),

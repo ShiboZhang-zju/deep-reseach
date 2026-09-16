@@ -79,12 +79,13 @@ def corpus_db(tmp_path, monkeypatch):
     from app.db.models import Paper, PaperChunk, EvidenceUnit
 
     engine = create_engine(url, connect_args={"check_same_thread": False})
-    db = sessionmaker(bind=engine)()
     # LocalCorpusSource reads `SessionLocal`, which is bound to the engine built
     # at import time from settings.database_url. Setting DATABASE_URL via env
     # here would be too late, so rebind the module globals directly.
+    make_session = sessionmaker(bind=engine)
     monkeypatch.setattr(session_mod, "engine", engine)
-    monkeypatch.setattr(session_mod, "SessionLocal", sessionmaker(bind=engine))
+    monkeypatch.setattr(session_mod, "SessionLocal", make_session)
+    db = make_session()
     try:
         papers = {
             "p_diff": Paper(id="p_diff", title="Accelerating Diffusion Sampling with Optimized Time Steps",
@@ -106,8 +107,13 @@ def corpus_db(tmp_path, monkeypatch):
         db.add_all(papers.values())
         db.add_all([
             PaperChunk(paper_id="p_rag", chunk_index=0, section="conclusion", chunk_type="text",
-                       text="Our evidence grounding check rejects claims that the retrieved "
-                            "context does not support, improving faithfulness.",
+                       # Must clear `_min_hits` for the query below. With 5 query
+                       # terms the threshold is 3, so this sentence has to contain
+                       # at least 3 of them — note "retrieval" (not "retrieved"),
+                       # since matching is substring-based on the stem.
+                       text="Evidence grounding for retrieval augmented generation rejects "
+                            "claims the retrieved context does not support, improving "
+                            "faithfulness.",
                        has_pdf=True),
             PaperChunk(paper_id="p_other", chunk_index=0, section="method", chunk_type="text",
                        text="Graph networks are trained on residue distance maps.",
@@ -120,7 +126,9 @@ def corpus_db(tmp_path, monkeypatch):
         db.commit()
     finally:
         db.close()
-    return db_path
+    # Hand back a factory rather than a live session: tests that need to add
+    # fixtures (see the cap-saturation regression) open their own.
+    return make_session
 
 
 class TestRetrievalAgainstSeededCorpus:
@@ -175,6 +183,54 @@ class TestRetrievalAgainstSeededCorpus:
             f"omnibus survey outranked the topical paper: {[h.title for h in b]}"
         # And they must not return an identical result set.
         assert [h.title for h in a] != [h.title for h in b]
+
+    def test_later_tiers_still_run_when_the_cap_is_already_full(self, corpus_db):
+        """Regression: gating tiers 2-3 behind `len(hits) < limit` starved them.
+
+        On 2026-09-15 all 392 local_corpus candidates in the audit were
+        metadata-only with `snippet: null`, because a topic with hundreds of
+        papers fills the 12 slots in the metadata tier and the evidence/full-text
+        tiers then never execute. The blind review sheet therefore reached
+        reviewers with titles but no quotable passage — defeating the purpose of
+        holding a full-text corpus.
+
+        Here the metadata tier alone fills the cap, and the assertion is that a
+        paper WITH a chunk still gets upgraded and carries its snippet.
+        """
+        from app.db.models import Paper
+
+        # Fillers whose titles rack up more query terms than p_rag, so the
+        # metadata tier fills EVERY slot with metadata-only papers and p_rag is
+        # admitted too. The old code then skipped the chunk tier entirely
+        # (`if len(hits) < limit`), leaving p_rag with snippet=None.
+        #
+        # `limit` must exceed the filler count so p_rag is inside the selection:
+        # the bug was about enrichment of ALREADY-SELECTED papers, not about
+        # which papers get selected.
+        db = corpus_db()
+        try:
+            for i in range(3):
+                db.add(Paper(id=f"filler{i}",
+                             title=f"Evidence Grounding Retrieval Augmented "
+                                   f"Generation Study {i}",
+                             abstract="Evidence grounding for retrieval augmented generation.",
+                             year=2020 + i, citation_count=10 + i, is_oa=True))
+            db.commit()
+        finally:
+            db.close()
+
+        hits = asyncio.run(LocalCorpusSource().search(
+            "evidence grounding retrieval augmented generation", limit=5))
+        assert len(hits) >= 4, f"expected the saturated set, got {len(hits)}"
+        # p_rag has a chunk matching the query. If the chunk tier ran, it must
+        # have been upgraded and carry a snippet even though the cap was full.
+        rag = [h for h in hits if h.title ==
+               "Evidence Grounding for Retrieval Augmented Generation"]
+        assert rag, f"seeded paper missing: {[h.title for h in hits]}"
+        assert rag[0].raw_data["match_type"] == "full_text", (
+            "chunk tier did not run because the cap was already full — "
+            "snippets will be missing from the blind review sheet")
+        assert rag[0].raw_data.get("snippet"), "full-text hit must carry a snippet"
 
     def test_full_text_tier_upgrades_an_already_selected_paper(self, corpus_db):
         """The chunk tier may enrich a hit but must never admit a new paper."""
