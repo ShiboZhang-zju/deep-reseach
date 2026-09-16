@@ -388,7 +388,15 @@ async def _run(args) -> None:
         # empty list raises ValidationError INSIDE the except block, which
         # escapes the per-target isolation and kills the whole run (observed
         # 2026-09-15: 3 of 91 targets done, then the process died outright).
-        sub["queries"] = queries
+        # Store the PLAIN list of query strings. This used to be
+        # `sub["queries"] = queries` where `queries` held an AuditQueries model,
+        # so json.dumps fell through to repr() and wrote the Python literal
+        # "queries=['...']" — a string json.loads cannot read back. Every
+        # downstream consumer of the recorded queries was silently broken.
+        if isinstance(queries, list):
+            sub["queries"] = queries                    # failure path: already []
+        else:
+            sub["queries"] = list(queries.queries)      # success path: pydantic model
         sub["query_failure"] = failure
         sub["candidate_papers"] = candidates
         sub["llm"] = stats.as_dict()
