@@ -296,12 +296,8 @@ async def _run(args) -> None:
             "claim": claim,
             "_topic": topic,
         })
-    print(f"[super_audit] {len(submissions)} audit targets "
-          f"({sum(1 for s in submissions if s['target_type'] == 'idea')} ideas, "
-          f"{sum(1 for s in submissions if s['target_type'] == 'gap')} surviving gaps), "
-          f"shuffled with seed={args.shuffle_seed}")
-
     candidates_path = run.dir / "candidate_killer_papers.jsonl"
+    template_path = run.dir / "human_verdicts.jsonl"
     review_md = [
         "# Super Audit — BLIND human review sheet",
         "",
@@ -310,7 +306,53 @@ async def _run(args) -> None:
         "",
         "",
     ]
-    template_path = run.dir / "human_verdicts.jsonl"
+
+    # ---- resume: re-run only the targets whose retrieval failed ------------
+    # The first pass (2026-09-16) left 21/91 targets with `query_failure` set and
+    # therefore zero candidates. Their blind verdicts are meaningless and would
+    # silently dilute the false-open-gap rate, but re-running all 91 to repair 21
+    # wastes hours. So: keep every successful record verbatim, re-run only the
+    # failures, and rebuild the review artifacts from the union.
+    #
+    # Identity is preserved deliberately. submission_id is what ties the blind
+    # sheet to submission_mapping.json and to any verdict already keyed to it, so
+    # a re-run must reuse the ORIGINAL id rather than minting a fresh uuid. The
+    # two runs' random ids differ, so records are matched on
+    # (system, topic_id, target_type) — the natural key of an audit target.
+    kept: list[dict] = []
+    if args.resume:
+        prior = _load_prior_records(candidates_path)
+        if not prior:
+            raise SystemExit(
+                f"[super_audit] --resume needs an existing {candidates_path}")
+        prior_by_key = {
+            (rec.get("system"), rec.get("topic_id"), rec.get("target_type")): rec
+            for rec in prior
+        }
+        to_rerun = []
+        for sub in submissions:
+            rec = prior_by_key.get(
+                (sub["system"], sub["topic_id"], sub["target_type"]))
+            if rec is None:
+                to_rerun.append(sub)           # never attempted
+            elif rec.get("query_failure"):
+                sub["submission_id"] = rec["submission_id"]   # keep identity
+                to_rerun.append(sub)
+            else:
+                kept.append(rec)               # retrieval succeeded, keep as-is
+        print(f"[super_audit] --resume: {len(kept)} kept, {len(to_rerun)} to re-run "
+              f"(of {len(submissions)} targets)")
+        submissions = to_rerun
+        for path in (candidates_path, template_path):
+            path.unlink(missing_ok=True)       # rebuilt from kept + new results
+    if not submissions:
+        print("[super_audit] nothing to re-run")
+
+    print(f"[super_audit] running {len(submissions)} target(s) "
+          f"({sum(1 for s in submissions if s['target_type'] == 'idea')} ideas, "
+          f"{sum(1 for s in submissions if s['target_type'] == 'gap')} surviving gaps), "
+          f"shuffle seed={args.shuffle_seed}")
+
     for idx, sub in enumerate(submissions):
         stats = CallStats()
         print(f"[{idx+1}/{len(submissions)}] {sub['submission_id']}")
@@ -351,21 +393,77 @@ async def _run(args) -> None:
                 "notes": "",
             }, ensure_ascii=False) + "\n")
 
+    # Under --resume the artifacts above were deleted and rebuilt from the
+    # re-run targets only, so fold the previously-successful records back in.
+    # They are written AFTER the loop so both sources land in one pass.
+    if kept:
+        existing_ids = {rec["submission_id"]
+                        for rec in _load_prior_records(candidates_path)}
+        with candidates_path.open("a", encoding="utf-8") as fh:
+            for rec in kept:
+                if rec["submission_id"] not in existing_ids:
+                    fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        # Re-render the kept submissions' blind sections in the resumed sheet.
+        for rec in kept:
+            review_md.append(blind_review_section(
+                rec["submission_id"], rec.get("_topic") or rec.get("topic_id") or "",
+                rec.get("claim") or "", rec.get("candidate_papers") or [],
+                rec.get("query_failure")))
+        with template_path.open("a", encoding="utf-8") as fh:
+            for rec in kept:
+                fh.write(json.dumps({
+                    "submission_id": rec["submission_id"],
+                    "false_open": None,
+                    "novelty": None,
+                    "feasibility": None,
+                    "credible": None,
+                    "notes": "",
+                }, ensure_ascii=False) + "\n")
+        print(f"[super_audit] folded {len(kept)} previously-successful record(s) "
+              f"back into the review artifacts")
+
     # Identity mapping: DO NOT share with the reviewer before review is done.
+    all_records = _load_prior_records(candidates_path)
     mapping = {
         "shuffle_seed": args.shuffle_seed,
+        "resumed": bool(args.resume),
         "submissions": [
-            {k: s[k] for k in ("submission_id", "system", "topic_id",
-                               "target_type", "claim")}
-            for s in submissions
+            {k: rec.get(k) for k in ("submission_id", "system", "topic_id",
+                                     "target_type", "claim")}
+            for rec in all_records
         ],
     }
     (run.dir / "submission_mapping.json").write_text(
         json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
     (run.dir / "human_review_blind.md").write_text("\n".join(review_md), encoding="utf-8")
+
+    total = len(all_records)
+    failed = sum(1 for rec in all_records if rec.get("query_failure"))
     print(f"[super_audit] run dir: {run.dir}")
+    print(f"[super_audit] audit targets on record: {total} "
+          f"({failed} with retrieval failure)")
     print("[super_audit] next: fill human_verdicts.jsonl from human_review_blind.md "
           "(keyed by submission_id), then run evaluate.py --audit-dir")
+
+
+def _load_prior_records(path: Path) -> list[dict]:
+    """Read existing audit records, tolerating a partially-written last line.
+
+    A crash mid-append can leave a truncated JSON object; skipping it is right
+    because such a target has no usable candidates anyway and will be re-run.
+    """
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -375,6 +473,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="run dirs of the three systems (predictions.jsonl required)")
     parser.add_argument("--shuffle-seed", type=int, default=42)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="keep targets whose retrieval succeeded and re-run only "
+                             "those that failed; preserves submission_ids")
     return parser
 
 

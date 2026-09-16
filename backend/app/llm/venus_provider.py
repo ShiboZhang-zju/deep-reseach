@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from typing import Any
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -159,9 +160,19 @@ class VenusProvider(LLMProvider):
         merge the schema directive into an existing leading system message
         instead of prepending a second one.
         """
+        # Kept deliberately short: every character here is prepended to EVERY
+        # chat_json prompt, and the window is a hard 40960 (see the prompt-budget
+        # guard tests). The anti-echo clause earns its space — without it the
+        # literal schema object is a plausible-looking reply sitting in the
+        # prompt, and the model sometimes echoes it verbatim. Observed
+        # 2026-09-16 as `ValidationError ... input_value={'properties':
+        # {'queries': ...}}` for AuditQueries, i.e. the schema itself came back
+        # as the answer; that burnt the single repair retry and lost the sample.
         directive = (
-            "You must respond with valid JSON matching this schema. "
-            f"Do not include markdown code fences.\n\n{json.dumps(schema_json, ensure_ascii=False)}"
+            "Respond with valid JSON matching this schema (required shape, NOT "
+            "the answer — never copy it back; fill every field from the task "
+            "above). No markdown code fences.\n\n"
+            f"{json.dumps(schema_json, ensure_ascii=False)}"
         )
         msgs = [dict(m) for m in messages]
         if msgs and msgs[0].get("role") == "system":
@@ -197,6 +208,34 @@ class VenusProvider(LLMProvider):
                 return with_excerpt
         return prepared + [{"role": "user", "content": instruction}]
 
+    @staticmethod
+    def _unwrap_schema_echo(data: Any) -> Any:
+        """Recover the payload when the model echoed the schema wrapper.
+
+        A recurring failure mode of this backend (observed 2026-09-16 on
+        AuditQueries): instead of `{"queries": [...]}` the model returns
+        `{"properties": {"queries": [...]}, "required": ["queries"], "title":
+        "AuditQueries", "type": "object"}` — the schema's own envelope, with the
+        real values nested one level down. Validation then fails on the missing
+        top-level field even though the answer is right there.
+
+        This is deterministic to repair, so do it here rather than spending the
+        single repair retry (and a second round trip) on it. Only unwrap when the
+        top-level object is missing the schema's fields but `properties` supplies
+        them, so a legitimate payload can never be misread.
+        """
+        if not isinstance(data, dict) or not isinstance(data.get("properties"), dict):
+            return data
+        props = data["properties"]
+        # The wrapper also carries these schema keywords; ignore them as content.
+        if not any(k not in ("properties", "required", "title", "type", "$defs",
+                             "additionalProperties", "description")
+                   for k in data):
+            # Looks like a pure schema envelope — the values are in `properties`.
+            if props:
+                return props
+        return data
+
     async def chat_json(
         self,
         messages: list[dict],
@@ -216,7 +255,7 @@ class VenusProvider(LLMProvider):
         content = self._content_of(resp)
 
         try:
-            data = json.loads(content)
+            data = self._unwrap_schema_echo(json.loads(content))
             return schema.model_validate(data)
         except (json.JSONDecodeError, ValidationError) as e:
             logger.error("LLM JSON parse error: %s\nContent: %s", e, content[:500])
@@ -234,8 +273,25 @@ class VenusProvider(LLMProvider):
                 "response_format": {"type": "json_object"},
             })
             resp2 = await self._post(payload2)
-            data2 = json.loads(self._content_of(resp2))
-            return schema.model_validate(data2)
+            content2 = self._content_of(resp2)
+            try:
+                data2 = self._unwrap_schema_echo(json.loads(content2))
+                return schema.model_validate(data2)
+            except (json.JSONDecodeError, ValidationError) as repair_error:
+                # Report both attempts. A bare json/validation error from the
+                # repair turn hides which failure mode actually occurred, and the
+                # two are not equivalent: an unusable first response that the
+                # repair cannot fix is a prompt-schema problem, whereas a
+                # transport error is transient. Callers (and the audit's
+                # query_failure field) need to tell them apart.
+                logger.error(
+                    "LLM JSON repair retry failed for %s: %s\nFirst response: %s\nRepair response: %s",
+                    schema.__name__, repair_error, content[:300], content2[:300])
+                raise ValueError(
+                    f"{schema.__name__} response was not valid JSON after a repair "
+                    f"retry ({type(repair_error).__name__}: {repair_error}); "
+                    f"first={content[:200]!r} repair={content2[:200]!r}"
+                ) from repair_error
 
     async def _get_client(self) -> httpx.AsyncClient:
         """The process-wide reusable AsyncClient (keep-alive, no per-call SSL)."""

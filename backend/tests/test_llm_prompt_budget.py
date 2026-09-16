@@ -105,9 +105,22 @@ async def test_repair_retry_that_cannot_fit_is_reported_not_sent():
         return {"choices": [{"message": {"content": "{\"value\": "}}]}
 
     provider._post = fake_post
-    # A prompt that fits, but leaves no room for a correction turn on top of it.
+    # A prompt that fits on its own, but leaves no room for a correction turn on
+    # top of it. The size is derived rather than hardcoded: it must sit just
+    # under `input_token_budget` once the schema directive is prepended, and the
+    # directive's length is not part of this test's subject (a hardcoded size
+    # made the test fail whenever that wording changed, which is a false alarm).
+    from app.llm.base import estimate_messages_tokens
+
+    directive_tokens = estimate_messages_tokens(
+        provider._inject_schema_instruction(
+            [{"role": "user", "content": ""}], Answer.model_json_schema()))
+    # Leave ~10 tokens of slack so the prompt itself is accepted...
+    filler = max(1, provider.input_token_budget - directive_tokens - 10)
+    assert directive_tokens + filler <= provider.input_token_budget
+    # ...but appending the repair turn on top of it cannot fit.
     with pytest.raises(LLMContextOverflow):
-        await provider.chat_json([{"role": "user", "content": "证" * 210}], Answer)
+        await provider.chat_json([{"role": "user", "content": "证" * filler}], Answer)
 
     assert len(calls) == 1
 
