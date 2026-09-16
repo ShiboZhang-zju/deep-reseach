@@ -173,6 +173,10 @@ async def search_candidates(queries: list[str]) -> list[dict]:
                     "url": getattr(paper, "url", None) or None,
                     "source": source_name,
                     "query": query,
+                    # Our own papers.id when the hit came from the local corpus.
+                    # Without it a candidate cannot be joined back to `papers`,
+                    # so full-text backfill has no way to find the PDF to parse.
+                    "local_paper_id": raw.get("local_paper_id"),
                     # local_corpus can quote the sentence that matched; that is
                     # what lets a reviewer adjudicate FULL/PARTIAL/NONE instead of
                     # guessing from a title. Empty for the public sources.
