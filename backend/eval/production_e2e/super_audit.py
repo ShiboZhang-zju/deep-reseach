@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import random
+import re
 import uuid
 from pathlib import Path
 
@@ -125,6 +126,17 @@ async def gen_queries(llm, topic: str, claim: str, stats: CallStats) -> AuditQue
     )
 
 
+# Entries that are demonstrably not research papers, so showing them to a
+# reviewer as "prior art to check" is simply wrong. Deliberately narrow: it must
+# never drop a paper that could plausibly be a killer paper, because a dropped
+# candidate is invisible and turns into a false gap.
+_NON_PAPER_TITLE = re.compile(
+    r'^(proceedings of|front matter|table of contents|author index|'
+    r'subject index|erratum|corrigendum|retraction|'
+    r'conference program|workshop program|keynote abstract|'
+    r'editorial board|call for papers)\b', re.I)
+
+
 async def search_candidates(queries: list[str]) -> list[dict]:
     """Multi-source retrieval with per-source failure isolation."""
     from app.paper_sources.arxiv import ArxivSource
@@ -199,6 +211,44 @@ async def search_candidates(queries: list[str]) -> list[dict]:
             break
         cursor += 1
     return candidates
+
+
+def filter_candidates_by_relevance(candidates: list[dict], claim: str) -> list[dict]:
+    """Drop only CLEARLY non-academic junk, never "off-topic but plausibly related".
+
+    Two attempts at a vocabulary-overlap gate were measured against the real
+    2026-09-16 records and both were rejected:
+
+    * requiring >=2 shared content words dropped 630/895 candidates (70%) and
+      left 20 of 91 targets with NOTHING, because a claim is an experimental
+      design description ("minimal experiment measuring gradient norms to
+      isolate the optimization state") while a title is a topic phrase
+      ("Gradient-Based Importance Smoothing for Dynamic Rank Allocation").
+      Their vocabularies legitimately differ, so low overlap does not mean
+      irrelevant. That gate discarded highly relevant papers.
+    * requiring >=1 dropped 367/895 (41%) and still removed relevant work.
+      A gate that fires on 41-100% of all samples is not filtering noise.
+
+    The deeper reason to abandon the approach: lexical overlap cannot adjudicate
+    topical relevance here, and a wrong drop is worse than a wrong keep. A
+    spurious candidate costs the reviewer one "NONE"; a dropped one is
+    invisible, and if it was the actual killer paper the audit reports a false
+    gap — precisely the error the audit exists to detect. Recall must win.
+
+    What remains is a narrow, defensible filter for entries that are not
+    research papers at all (proceedings front-matter, errata, indices). Topical
+    judgement is left to the human reviewer and, where available, citation
+    signal.
+    """
+    out = []
+    for cand in candidates:
+        title = (cand.get("title") or "").strip()
+        if not title:
+            continue                      # nothing to show a reviewer anyway
+        if _NON_PAPER_TITLE.search(title):
+            continue
+        out.append(cand)
+    return out
 
 
 def blind_review_section(submission_id: str, topic: str, claim: str,
@@ -374,6 +424,15 @@ async def _run(args) -> None:
         try:
             queries = await gen_queries(llm, sub["_topic"], sub["claim"], stats)
             candidates = await search_candidates(queries.queries)
+            # Gate AFTER merging so it applies to every source uniformly. The
+            # public APIs rank by their own relevance model, which happily
+            # returns a cancer-epidemiology review for a claim about MoE
+            # interpretability; without this the sheet is 39% noise and a
+            # reviewer's "NONE" on that noise reads as "no prior art exists".
+            before = len(candidates)
+            candidates = filter_candidates_by_relevance(candidates, sub["claim"])
+            if before != len(candidates):
+                print(f"    relevance: {before} -> {len(candidates)} candidates")
         except Exception as exc:  # per-target isolation
             print(f"    FAILED: {type(exc).__name__}: {exc}")
             candidates = []
