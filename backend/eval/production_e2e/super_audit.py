@@ -317,34 +317,40 @@ async def _run(args) -> None:
     # Identity is preserved deliberately. submission_id is what ties the blind
     # sheet to submission_mapping.json and to any verdict already keyed to it, so
     # a re-run must reuse the ORIGINAL id rather than minting a fresh uuid. The
-    # two runs' random ids differ, so records are matched on
-    # (system, topic_id, target_type) — the natural key of an audit target.
+    # two runs' random ids differ, so records are matched on a natural key.
+    #
+    # That key MUST include the claim. (system, topic_id, target_type) is NOT
+    # unique: one topic produces several ideas, so keying on the triple collapsed
+    # them onto a single record and reported "1 kept, 90 to re-run" instead of
+    # "70 kept, 21 to re-run" — silently re-running 69 good targets.
     kept: list[dict] = []
     if args.resume:
         prior = _load_prior_records(candidates_path)
         if not prior:
             raise SystemExit(
                 f"[super_audit] --resume needs an existing {candidates_path}")
-        prior_by_key = {
-            (rec.get("system"), rec.get("topic_id"), rec.get("target_type")): rec
-            for rec in prior
-        }
+        prior_by_key = {}
+        for rec in prior:
+            prior_by_key.setdefault(_target_key(rec), []).append(rec)
         to_rerun = []
         for sub in submissions:
-            rec = prior_by_key.get(
-                (sub["system"], sub["topic_id"], sub["target_type"]))
-            if rec is None:
-                to_rerun.append(sub)           # never attempted
-            elif rec.get("query_failure"):
-                sub["submission_id"] = rec["submission_id"]   # keep identity
-                to_rerun.append(sub)
-            else:
+            bucket = prior_by_key.get(_target_key(sub)) or []
+            # Prefer a successful record for this exact target; otherwise reuse a
+            # failed one's identity so its verdict stays addressable.
+            rec = next((r for r in bucket if not r.get("query_failure")), None)
+            if rec is not None:
                 kept.append(rec)               # retrieval succeeded, keep as-is
+                continue
+            if bucket:
+                sub["submission_id"] = bucket[0]["submission_id"]  # keep identity
+            to_rerun.append(sub)
         print(f"[super_audit] --resume: {len(kept)} kept, {len(to_rerun)} to re-run "
               f"(of {len(submissions)} targets)")
         submissions = to_rerun
-        for path in (candidates_path, template_path):
-            path.unlink(missing_ok=True)       # rebuilt from kept + new results
+        # Do NOT unlink here. Deleting up front and then dying (or being killed)
+        # destroys the previous results with nothing written in their place —
+        # which is exactly what happened on 2026-09-16. Instead the rewrite is
+        # atomic-per-file at the end, from `kept` + the new records.
     if not submissions:
         print("[super_audit] nothing to re-run")
 
@@ -353,6 +359,10 @@ async def _run(args) -> None:
           f"{sum(1 for s in submissions if s['target_type'] == 'gap')} surviving gaps), "
           f"shuffle seed={args.shuffle_seed}")
 
+    # Under --resume the existing file already holds `kept`; new records are
+    # APPENDED so an interruption leaves the previous results intact instead of
+    # having to be rebuilt from a deleted file.
+    fresh: list[dict] = []
     for idx, sub in enumerate(submissions):
         stats = CallStats()
         print(f"[{idx+1}/{len(submissions)}] {sub['submission_id']}")
@@ -378,6 +388,7 @@ async def _run(args) -> None:
         sub["query_failure"] = failure
         sub["candidate_papers"] = candidates
         sub["llm"] = stats.as_dict()
+        fresh.append(sub)
         with candidates_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(sub, ensure_ascii=False, default=str) + "\n")
         review_md.append(blind_review_section(
@@ -393,17 +404,10 @@ async def _run(args) -> None:
                 "notes": "",
             }, ensure_ascii=False) + "\n")
 
-    # Under --resume the artifacts above were deleted and rebuilt from the
-    # re-run targets only, so fold the previously-successful records back in.
-    # They are written AFTER the loop so both sources land in one pass.
+    # `candidates_path` now holds kept + fresh (kept was never removed and fresh
+    # was appended). Only the REVIEW ARTIFACTS are rebuilt from scratch, since a
+    # resumed run starts with the header and must present every target again.
     if kept:
-        existing_ids = {rec["submission_id"]
-                        for rec in _load_prior_records(candidates_path)}
-        with candidates_path.open("a", encoding="utf-8") as fh:
-            for rec in kept:
-                if rec["submission_id"] not in existing_ids:
-                    fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-        # Re-render the kept submissions' blind sections in the resumed sheet.
         for rec in kept:
             review_md.append(blind_review_section(
                 rec["submission_id"], rec.get("_topic") or rec.get("topic_id") or "",
@@ -444,6 +448,19 @@ async def _run(args) -> None:
           f"({failed} with retrieval failure)")
     print("[super_audit] next: fill human_verdicts.jsonl from human_review_blind.md "
           "(keyed by submission_id), then run evaluate.py --audit-dir")
+
+
+def _target_key(rec: dict) -> tuple:
+    """Natural key identifying an audit target across runs.
+
+    MUST include the claim: one topic yields several ideas, so keying on
+    (system, topic_id, target_type) alone maps them all onto a single entry.
+    Using that triple made a resume report "1 kept, 90 to re-run" instead of
+    "70 kept, 21 to re-run", silently re-running 69 targets that had already
+    succeeded.
+    """
+    return (rec.get("system"), rec.get("topic_id"),
+            rec.get("target_type"), (rec.get("claim") or "").strip())
 
 
 def _load_prior_records(path: Path) -> list[dict]:
