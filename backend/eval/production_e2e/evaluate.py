@@ -155,23 +155,47 @@ def main() -> None:
     for system, records in systems.items():
         idea_records = [r for r in records if r.get("decision") == "propose_idea"]
         # --- human-verdict-derived metrics (pending until verdicts exist) ---
+        #
+        # Only JUDGED verdicts count. The sheet ships one row per submission with
+        # `verdict: ""` meaning "not judged yet", and every row de-anonymises to a
+        # real topic_id — so a plain lookup finds a record for EVERY topic and an
+        # unjudged row would be silently scored as "not false-open" and "not
+        # credible". That made a partly-reviewed sample look like a completed
+        # result: with 9 of 24 judged, the table reported `verdicted: 24` and a
+        # 4.2% false-open rate whose denominator was 24 rather than 9.
+        #
+        # An unjudged submission is not evidence in either direction, so it is
+        # excluded from the denominator rather than counted as a negative.
+        def _judged(v: dict | None) -> bool:
+            return bool(v) and str(v.get("verdict") or "").strip() != ""
+
         idea_verdicts = [verdict_map.get(("idea", system, r["topic_id"]))
                          for r in idea_records]
         idea_verdicts = [v for v in idea_verdicts if v]
+        judged_idea_verdicts = [v for v in idea_verdicts if _judged(v)]
         gap_verdicts = [v for (t, s, _), v in verdict_map.items()
                         if t == "gap" and s == system and v]
+        judged_gap_verdicts = [v for v in gap_verdicts if _judged(v)]
 
-        false_open_ideas = sum(1 for v in idea_verdicts
+        false_open_ideas = sum(1 for v in judged_idea_verdicts
                                if v.get("verdict") == "false_open")
-        gap_total = len(gap_verdicts)
-        gap_false_open = sum(1 for v in gap_verdicts
+        gap_total = len(judged_gap_verdicts)
+        gap_false_open = sum(1 for v in judged_gap_verdicts
                              if v.get("verdict") == "false_open")
         credible_topics = {
             r["topic_id"] for r in idea_records
             if (verdict_map.get(("idea", system, r["topic_id"])) or {}).get("idea_credible")
         }
-        novelty_scores = [float(v["novelty"]) for v in idea_verdicts if v.get("novelty")]
-        feasibility_scores = [float(v["feasibility"]) for v in idea_verdicts if v.get("feasibility")]
+        # Denominator = topics whose idea was actually judged, so partial review
+        # cannot masquerade as a low yield.
+        judged_topics = {
+            r["topic_id"] for r in idea_records
+            if _judged(verdict_map.get(("idea", system, r["topic_id"])))
+        }
+        novelty_scores = [float(v["novelty"]) for v in judged_idea_verdicts
+                          if v.get("novelty")]
+        feasibility_scores = [float(v["feasibility"]) for v in judged_idea_verdicts
+                              if v.get("feasibility")]
 
         abst = abstention_stats(records)
         metrics[system] = {
@@ -184,10 +208,10 @@ def main() -> None:
             },
             "false_open_gap": {
                 "idea_level": {
-                    "verdicted": len(idea_verdicts),
+                    "verdicted": len(judged_idea_verdicts),
                     "false_open": false_open_ideas,
-                    "rate": round(false_open_ideas / len(idea_verdicts), 4)
-                    if idea_verdicts else None,
+                    "rate": round(false_open_ideas / len(judged_idea_verdicts), 4)
+                    if judged_idea_verdicts else None,
                 },
                 "gap_level_full_v2_only": {
                     "verdicted": gap_total,
@@ -197,9 +221,16 @@ def main() -> None:
             },
             "credible_idea_yield": {
                 "credible_topics": len(credible_topics),
-                "total_topics": total_topics,
-                "rate": round(len(credible_topics) / total_topics, 4)
-                if total_topics else None,
+                "judged_topics": len(judged_topics),
+                "rate": round(len(credible_topics) / len(judged_topics), 4)
+                if judged_topics else None,
+            },
+            # Coverage is reported so a partly-reviewed run is never mistaken for
+            # a complete one: rate denominators are judged-topics, not all topics.
+            "review_coverage": {
+                "topics_total": len(idea_records),
+                "topics_judged": len(judged_topics),
+                "complete": len(judged_topics) == len(idea_records),
             },
             "novelty_mean": round(sum(novelty_scores) / len(novelty_scores), 3)
             if novelty_scores else None,
@@ -226,6 +257,25 @@ def main() -> None:
         "# production_e2e_v1 — headline table",
         "",
         f"Topics: {total_topics} (12 narrow_mature / 6 emerging_sparse / 6 broad_ambiguous)",
+        "",
+    ]
+    # State review completion up front. The rate denominators are judged topics,
+    # so a partly-reviewed run yields correct-but-narrow numbers; without this
+    # line those numbers read as final and invite a conclusion the data cannot
+    # support.
+    for system in ("direct_llm", "retrieval_llm", "full_v2"):
+        m = metrics.get(system)
+        if not m:
+            continue
+        cov = m.get("review_coverage") or {}
+        judged, total = cov.get("topics_judged"), cov.get("topics_total")
+        if judged is None:
+            continue
+        flag = "" if cov.get("complete") else "  <-- INCOMPLETE, not a final result"
+        lines.append(
+            f"Human review: {SYSTEM_LABELS.get(system, system)} "
+            f"{judged}/{total} judged{flag}")
+    lines += [
         "",
         "| System | False-open-gap ↓ | Credible Idea Yield ↑ | Novelty ↑ | Feasibility ↑ | Abstention | Cost |",
         "|---|---:|---:|---:|---:|---:|---|",
