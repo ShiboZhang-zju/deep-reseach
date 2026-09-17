@@ -137,9 +137,126 @@ _NON_PAPER_TITLE = re.compile(
     r'editorial board|call for papers)\b', re.I)
 
 
-async def search_candidates(queries: list[str]) -> list[dict]:
+def _seed_openalex_ids(topic_id: str, claim: str, limit: int = 4,
+                       prior_candidates: list[dict] | None = None) -> list[str]:
+    """Pick citation-snowball seeds: papers the audited system itself retrieved.
+
+    Seeds are the papers the audited topic actually drew on, resolved to
+    OpenAlex ids. Ranking by raw citation count was measured to be actively
+    harmful: the corpus's most-cited paper is "R: A Language and Environment for
+    Statistical Computing" (353k citations), and restricting ITS citers to a
+    topic term returned phylogenetics and ecology papers.
+
+    Two resolution paths, because neither is sufficient alone:
+
+    * `prior_candidates` — the local-corpus hits already recorded for this
+      submission. This is the most faithful seed set: it is literally the
+      literature the audited system was reading. Only usable on a re-run that
+      already has a first pass.
+    * title/keyword match against the topic's own papers — the fallback for a
+      cold run, where no prior candidate list exists yet.
+
+    Note `topic_id` here is the EVAL sample id (pe2e-014), not a
+    `research_tasks.id` UUID; audit artifacts carry no link to the task table,
+    which is why seeds cannot be looked up through `task_papers`.
+
+    Forward citations (who cites it) are the useful direction for killing a
+    claim, since a killer paper must postdate the work it challenges.
+    """
+    from sqlalchemy import text
+    from app.db.session import SessionLocal
+
+    terms = _snowball_terms(claim)
+    db = SessionLocal()
+    try:
+        ids: list[str] = []
+
+        # Path 1: titles already surfaced by the local corpus for this submission.
+        #
+        # Ordered by CLAIM OVERLAP, not citation count. Measured why: the
+        # local-corpus candidate list is itself ranked by citations, so its top
+        # entries are broad surveys ("A review of uncertainty quantification in
+        # deep learning", 2,989 citers). A survey's citers are the whole field,
+        # and the claim's specific terms (`entropy-adaptive`, `diffusion-lm`)
+        # appear in ZERO of their titles. A paper that is precisely about the
+        # claim is what makes the topic restriction bite — with it,
+        # `title.search:catastrophic` returned 3 directly relevant works.
+        titles = [((c.get("title") or "").strip())
+                  for c in (prior_candidates or [])
+                  if c.get("source") == "local_corpus" and c.get("title")]
+        titles = [t for t in titles if t]
+        if titles:
+            claim_terms = set(_snowball_terms(claim, 20))
+            ranked = sorted(
+                titles,
+                key=lambda t: -len(claim_terms & set(_snowball_terms(t, 20))),
+            )
+            ranked = ranked[:40]
+            params = {f"t{i}": " ".join(t.lower().split())
+                      for i, t in enumerate(ranked)}
+            ph = ", ".join(f":t{i}" for i in range(len(ranked)))
+            rows = db.execute(text(f"""
+                SELECT openalex_id FROM papers
+                WHERE LOWER(TRIM(title)) IN ({ph})
+                  AND openalex_id IS NOT NULL AND openalex_id != ''
+                ORDER BY citation_count DESC LIMIT :lim
+            """), {**params, "lim": limit}).fetchall()
+            ids = [r[0] for r in rows]
+        if ids:
+            # Dedupe while preserving order: title matching can hit several rows
+            # for the same work, and repeating a seed multiplies the same query.
+            seen: set[str] = set()
+            uniq = []
+            for i in ids:
+                if i not in seen:
+                    seen.add(i)
+                    uniq.append(i)
+            return uniq
+
+        # Path 2 (cold run): the topic's papers whose titles share a claim term.
+        if terms:
+            like = " OR ".join(f"LOWER(p.title) LIKE :t{i}" for i in range(len(terms)))
+            params = {f"t{i}": f"%{t}%" for i, t in enumerate(terms)}
+            params["lim"] = limit
+            rows = db.execute(text(f"""
+                SELECT p.openalex_id FROM papers p
+                JOIN task_papers tp ON tp.paper_id = p.id
+                WHERE p.openalex_id IS NOT NULL AND p.openalex_id != ''
+                  AND ({like})
+                ORDER BY p.citation_count DESC LIMIT :lim
+            """), params).fetchall()
+            ids = [r[0] for r in rows]
+            if ids:
+                return ids
+
+        # Last resort: any paper whose title mentions a claim term at all.
+        if terms:
+            for t in terms[:3]:
+                row = db.execute(text("""
+                    SELECT openalex_id FROM papers
+                    WHERE openalex_id IS NOT NULL AND openalex_id != ''
+                      AND LOWER(title) LIKE :t
+                    ORDER BY citation_count DESC LIMIT :lim
+                """), {"t": f"%{t}%", "lim": limit}).fetchall()
+                ids.extend(r[0] for r in row)
+                if len(ids) >= limit:
+                    break
+        return ids[:limit]
+    finally:
+        db.close()
+
+
+def _snowball_terms(text: str, max_terms: int = 6) -> list[str]:
+    from app.paper_sources.citation_snowball import _topic_terms
+    return _topic_terms(text, max_terms)
+
+
+async def search_candidates(queries: list[str], claim: str = "",
+                            topic_id: str = "",
+                            prior_candidates: list[dict] | None = None) -> list[dict]:
     """Multi-source retrieval with per-source failure isolation."""
     from app.paper_sources.arxiv import ArxivSource
+    from app.paper_sources.citation_snowball import CitationSnowballSource
     from app.paper_sources.local_corpus import LocalCorpusSource
     from app.paper_sources.openalex import OpenAlexSource
     from app.paper_sources.semantic_scholar import SemanticScholarSource
@@ -150,10 +267,43 @@ async def search_candidates(queries: list[str]) -> list[dict]:
     # rate-limited, leaving OpenAlex alone), and it can surface prior art that
     # production itself retrieved -- the most likely place for a killer paper to
     # hide, and invisible to a public-API-only audit.
+    #
+    # `citation_snowball` attacks the opposite weakness: keyword search returns
+    # whatever shares a few words with the claim (39% of the 2026-09-16
+    # candidates shared NO content word with it). Snowball constrains by a real
+    # citation edge first, then by topic, so its hits are later work that
+    # actually builds on the audited topic.
     sources = [("openalex", OpenAlexSource()),
                ("local_corpus", LocalCorpusSource()),
                ("semantic_scholar", SemanticScholarSource()),
                ("arxiv", ArxivSource())]
+
+    # citation_snowball is implemented and working, but is OFF by default because
+    # it cannot yet do what it was added for. Measured across four tuning
+    # attempts on the real records: a single narrow claim term returned 0 hits
+    # (the seeds are broad surveys whose citers never use the claim's exact
+    # compounds in a title), a single generic term returned 12 irrelevant ones
+    # ("gradients" produced MARL policy-gradient papers for an orthogonal-LoRA
+    # claim), and 2-term conjunctions returned 0-1.
+    #
+    # The blocker is the seed set, not the query. The audit records carry no
+    # `task_id` link to `research_tasks`, so seeds cannot be taken from the
+    # papers production actually read for this topic; they fall back to
+    # title-matching, which surfaces broad surveys ("Multi-task Learning Using
+    # Uncertainty to Weigh Losses", "Counterfactual Multi-Agent Policy
+    # Gradients"). A broad survey's citers are its entire field, so within that
+    # set no claim term can discriminate — the citation edge guarantees
+    # "cites the seed" and nothing about "asks the same question".
+    #
+    # Left wired but disabled so the next run can enable it once records carry
+    # task_id. Enabled it would only add latency and API load for no recall.
+    if args.enable_snowball:
+        seeds = _seed_openalex_ids(topic_id, claim,
+                                   prior_candidates=prior_candidates)
+        if seeds:
+            sources.insert(1, ("citation_snowball",
+                               CitationSnowballSource(seed_ids=seeds, topic=claim)))
+            print(f"    [super_audit] snowball seeds: {len(seeds)}")
     seen_titles: set[str] = set()
     # Per-source buckets, then round-robin. Concatenating per source and
     # truncating at CANDIDATES_PER_TARGET made the first healthy source eat the
@@ -189,6 +339,11 @@ async def search_candidates(queries: list[str]) -> list[dict]:
                     # Without it a candidate cannot be joined back to `papers`,
                     # so full-text backfill has no way to find the PDF to parse.
                     "local_paper_id": raw.get("local_paper_id"),
+                    # For snowball hits: which of our papers it cites. This is
+                    # the strongest relevance signal the sheet can show — the
+                    # candidate demonstrably builds on the audited topic, which
+                    # no keyword match can establish.
+                    "cites_seed": raw.get("cites_seed"),
                     # local_corpus can quote the sentence that matched; that is
                     # what lets a reviewer adjudicate FULL/PARTIAL/NONE instead of
                     # guessing from a title. Empty for the public sources.
@@ -196,20 +351,47 @@ async def search_candidates(queries: list[str]) -> list[dict]:
                     "snippet": raw.get("snippet"),
                     "section": raw.get("section"),
                 })
+    # Allocate the cap per SOURCE rather than filling it first-come-first-served.
+    #
+    # Plain round-robin over source order silently starved the later sources:
+    # openalex and arxiv each returned 6+ hits, so the first two laps filled all
+    # 12 slots and citation_snowball contributed NOTHING even though it had
+    # returned 6 directly relevant works (measured: "Regularizing Deep Multi-Task
+    # Networks using Orthogonal Gradients" for an orthogonal-gradient claim).
+    # A source's position in the list must not decide whether it is heard.
+    #
+    # Leftover slots are redistributed because some sources find nothing (S2 is
+    # rate-limited most of the time), and unused quota should not be wasted.
     candidates: list[dict] = []
-    cursor = 0
-    while len(candidates) < CANDIDATES_PER_TARGET:
-        progressed = False
-        for source_name, _ in sources:
-            bucket = per_source[source_name]
-            if cursor < len(bucket):
-                candidates.append(bucket[cursor])
-                progressed = True
-                if len(candidates) >= CANDIDATES_PER_TARGET:
-                    break
-        if not progressed:
-            break
-        cursor += 1
+    per_source_quota = max(1, CANDIDATES_PER_TARGET // len(sources))
+    taken = {name: 0 for name, _ in sources}
+
+    for source_name, _ in sources:
+        for cand in per_source[source_name]:
+            if len(candidates) >= CANDIDATES_PER_TARGET:
+                break
+            if taken[source_name] >= per_source_quota:
+                break
+            taken[source_name] += 1
+            candidates.append(cand)
+
+    # Fill remaining slots from any source with leftovers, round-robin so no
+    # single source dominates the spill.
+    if len(candidates) < CANDIDATES_PER_TARGET:
+        leftover = {name: per_source[name][taken[name]:] for name, _ in sources}
+        cursor = 0
+        while len(candidates) < CANDIDATES_PER_TARGET:
+            progressed = False
+            for source_name, _ in sources:
+                bucket = leftover[source_name]
+                if cursor < len(bucket):
+                    candidates.append(bucket[cursor])
+                    progressed = True
+                    if len(candidates) >= CANDIDATES_PER_TARGET:
+                        break
+            if not progressed:
+                break
+            cursor += 1
     return candidates
 
 
@@ -251,9 +433,58 @@ def filter_candidates_by_relevance(candidates: list[dict], claim: str) -> list[d
     return out
 
 
+def blind_sheet_header() -> list[str]:
+    """The sheet's front matter, including the candidate-relevance disclosure.
+
+    Kept as ONE function because it previously existed as two copies — the
+    generator's and the sheet rebuilder's — and the disclosure was added to only
+    one, so a `--rebuild-sheet` silently produced a sheet WITHOUT the limitation
+    notice. The reviewer's only warning about candidate noise must not depend on
+    which code path wrote the file.
+    """
+    return [
+        "# Super Audit — BLIND human review sheet",
+        "",
+        "Review each submission WITHOUT knowing which system produced it.",
+        "Fill every field; identities are restored automatically afterwards.",
+        "",
+        "## Known limitation: candidate lists are NOT relevance-filtered",
+        "",
+        "Candidates come from keyword search over public APIs plus a local corpus "
+        "search that DOES apply a relevance gate. Measured on this run's records, "
+        "39% of the keyword-sourced candidates share NO content word with the "
+        "claim they are meant to test (a claim about MoE visual salience drew "
+        "\"Obesity and Cancer\" and \"IoT Network Security Threat Detection\").",
+        "",
+        "Two consequences for your verdicts:",
+        "",
+        "1. A candidate whose TITLE is clearly off-topic is noise, not evidence. "
+        "Mark it NONE, and if a submission's list is mostly such candidates say "
+        "so in `notes` — an all-noise list means the audit FAILED TO FIND prior "
+        "art, which is a different fact from `the prior art does not exist`.",
+        "2. Do NOT treat a list of irrelevant candidates as evidence IN FAVOUR of "
+        "a submission's novelty. Importing that noise into the verdict is the "
+        "single largest way this evaluation can be wrong.",
+        "",
+        "An automatic relevance filter was attempted and rejected: at the "
+        "thresholds tested it discarded 41-70% of candidates and removed "
+        "relevant work (e.g. \"Gradient-Based Importance Smoothing for Dynamic "
+        "Rank Allocation\" for a claim about measuring gradient norms). Recall "
+        "won because a wrongly dropped candidate is invisible and fabricates a "
+        "false gap, whereas a spurious one costs one NONE verdict.",
+        "",
+        "Each submission states its own candidate-list quality, so you can weigh "
+        "a `false-open: no` verdict against how good the search actually was.",
+        "",
+        "",
+    ]
+
+
 def blind_review_section(submission_id: str, topic: str, claim: str,
                          candidates: list[dict], query_failure: str | None = None) -> str:
     """Blind sheet: NO system identity, NO target_type, NO internal scores."""
+    local_n = sum(1 for c in candidates if c.get("source") == "local_corpus")
+    snippet_n = sum(1 for c in candidates if c.get("snippet"))
     lines = [
         f"## Submission {submission_id}",
         "",
@@ -264,6 +495,17 @@ def blind_review_section(submission_id: str, topic: str, claim: str,
         "For each candidate below, mark whether it already covers the claim:",
         "FULL (implements the same mechanism for the same purpose) / "
         "PARTIAL (overlapping but not the same) / NONE.",
+        "",
+        # Surface how trustworthy the candidate LIST is, per submission. The
+        # reviewer cannot see the retrieval process, so without this they have no
+        # way to distinguish "searched well, found nothing" from "searched
+        # badly". local_corpus hits passed a relevance gate (quote-verified);
+        # keyword hits did not, so a list made only of the latter deserves less
+        # weight when concluding that no prior art exists.
+        f"Candidate list quality: {len(candidates)} candidates "
+        f"({local_n} relevance-gated, {snippet_n} with a quoted passage). "
+        f"Remaining are unfiltered keyword matches — judge their titles "
+        f"critically.",
         "",
     ]
     if query_failure:
@@ -280,9 +522,15 @@ def blind_review_section(submission_id: str, topic: str, claim: str,
         lines.append("- (no candidates found — control sample: judge from your "
                      "own knowledge)")
     for idx, cand in enumerate(candidates, 1):
+        # Do NOT fall back to `cand['source']` here. It leaked "openalex" /
+        # "local_corpus" into the sheet, which breaks the blind protocol twice
+        # over: it reveals the retrieval path, and since local-corpus hits carry
+        # quoted passages the pairing lets a reviewer infer which system's
+        # candidate set they are looking at.
         lines.append(
-            f"- [ ] {idx}. {cand['title']} ({cand.get('year') or 'n.d.'}, "
-            f"{cand.get('venue') or cand['source']}) — FULL / PARTIAL / NONE: ____")
+            f"- [ ] {idx}. {cand['title']} ({cand.get('year') or 'n.d.'}"
+            f"{', ' + str(cand['venue']) if cand.get('venue') else ''}"
+            f") — FULL / PARTIAL / NONE: ____")
         # Quote the matched passage when the local corpus supplied one. A title
         # alone often cannot settle whether prior art implements the SAME
         # mechanism for the SAME purpose; the sentence can.
@@ -352,14 +600,7 @@ async def _run(args) -> None:
         })
     candidates_path = run.dir / "candidate_killer_papers.jsonl"
     template_path = run.dir / "human_verdicts.jsonl"
-    review_md = [
-        "# Super Audit — BLIND human review sheet",
-        "",
-        "Review each submission WITHOUT knowing which system produced it.",
-        "Fill every field; identities are restored automatically afterwards.",
-        "",
-        "",
-    ]
+    review_md = blind_sheet_header()
 
     # ---- resume: re-run only the targets whose retrieval failed ------------
     # The first pass (2026-09-16) left 21/91 targets with `query_failure` set and
@@ -377,6 +618,13 @@ async def _run(args) -> None:
     # unique: one topic produces several ideas, so keying on the triple collapsed
     # them onto a single record and reported "1 kept, 90 to re-run" instead of
     # "70 kept, 21 to re-run" — silently re-running 69 good targets.
+    # Prior candidates by target, available whether or not this is a resume: on a
+    # cold run it is empty and the snowball falls back to title matching, on a
+    # re-run it supplies the real literature the target drew on.
+    prior_by_target: dict[tuple, list[dict]] = {}
+    for _rec in _load_prior_records(candidates_path):
+        prior_by_target[_target_key(_rec)] = _rec.get("candidate_papers") or []
+
     kept: list[dict] = []
     if args.resume:
         prior = _load_prior_records(candidates_path)
@@ -423,7 +671,11 @@ async def _run(args) -> None:
         failure = None
         try:
             queries = await gen_queries(llm, sub["_topic"], sub["claim"], stats)
-            candidates = await search_candidates(queries.queries)
+            # Pass the submission's previously-recorded local-corpus hits so the
+            # snowball seeds on the literature this target actually drew on.
+            candidates = await search_candidates(
+                queries.queries, claim=sub["claim"], topic_id=sub["topic_id"],
+                prior_candidates=prior_by_target.get(_target_key(sub)))
             # Gate AFTER merging so it applies to every source uniformly. The
             # public APIs rank by their own relevance model, which happily
             # returns a cancer-epidemiology review for a claim about MoE
@@ -564,6 +816,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true",
                         help="keep targets whose retrieval succeeded and re-run only "
                              "those that failed; preserves submission_ids")
+    parser.add_argument("--enable-snowball", action="store_true",
+                        help="also query citation_snowball. Off by default: seeds "
+                             "cannot be resolved to the papers production read "
+                             "(audit records carry no task_id), so it currently "
+                             "returns no relevant candidates.")
     return parser
 
 

@@ -215,6 +215,20 @@ def _run(args) -> None:
         print("[enrich] --dry-run: not writing")
         return
 
+    # Re-apply the non-paper filter to records written before it existed. Without
+    # this, entries such as "Proceedings of Resources for African Indigenous
+    # Languages (RAIL) 2026" stay in the sheet and waste reviewer attention.
+    from eval.production_e2e.super_audit import filter_candidates_by_relevance
+
+    removed = 0
+    for rec in records:
+        before = len(rec.get("candidate_papers") or [])
+        rec["candidate_papers"] = filter_candidates_by_relevance(
+            rec.get("candidate_papers") or [], rec.get("claim") or "")
+        removed += before - len(rec["candidate_papers"])
+    if removed:
+        print(f"[enrich] removed {removed} non-paper candidate(s) from stored records")
+
     with records_path.open("w", encoding="utf-8") as fh:
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
@@ -223,11 +237,12 @@ def _run(args) -> None:
     # Rebuild the blind sheet so the reviewer sees the new snippets. It is a
     # derived view of the records, so regenerating is safe.
     if args.rebuild_sheet:
-        from eval.production_e2e.super_audit import blind_review_section
-        md = ["# Super Audit — BLIND human review sheet", "",
-              "Review each submission WITHOUT knowing which system produced it.",
-              "Fill every field; identities are restored automatically afterwards.",
-              "", ""]
+        from eval.production_e2e.super_audit import (
+            blind_review_section, blind_sheet_header,
+        )
+        # Use the shared header. Duplicating it here previously meant a rebuild
+        # dropped the candidate-relevance disclosure entirely.
+        md = blind_sheet_header()
         for rec in records:
             md.append(blind_review_section(
                 rec["submission_id"], rec.get("_topic") or rec.get("topic_id") or "",
