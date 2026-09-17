@@ -433,6 +433,40 @@ def filter_candidates_by_relevance(candidates: list[dict], claim: str) -> list[d
     return out
 
 
+# Retrieval-source names. They can appear in a candidate's `venue` when a paper
+# has no real venue, and must never reach the blind sheet.
+_SOURCE_NAMES = {
+    "local_corpus", "openalex", "semantic_scholar", "arxiv",
+    "citation_snowball", "unknown",
+}
+
+
+def empty_verdict(submission_id: str) -> dict:
+    """The verdict row a reviewer fills in, keyed by submission_id only.
+
+    Field names MUST match what `evaluate.py` reads, or the headline silently
+    stays "pending" forever no matter how carefully the sheet is filled:
+
+    * `verdict`        — evaluate reads `v["verdict"] == "false_open"`, NOT a
+                         boolean `false_open` field.
+    * `idea_credible`  — evaluate reads `v["idea_credible"]` for Credible Idea
+                         Yield, not `credible`.
+    * `novelty` / `feasibility` — 1-5, averaged per system.
+
+    `verdict` allowed values: "false_open" (prior art already covers the claimed
+    contribution), "true_gap" (contribution stands), or "" (not judged).
+    `idea_credible` is only meaningful for idea targets; gaps leave it false.
+    """
+    return {
+        "submission_id": submission_id,
+        "verdict": "",            # "false_open" | "true_gap" | ""
+        "idea_credible": False,   # for idea targets
+        "novelty": None,          # 1-5
+        "feasibility": None,      # 1-5
+        "notes": "",
+    }
+
+
 def blind_sheet_header() -> list[str]:
     """The sheet's front matter, including the candidate-relevance disclosure.
 
@@ -522,14 +556,17 @@ def blind_review_section(submission_id: str, topic: str, claim: str,
         lines.append("- (no candidates found — control sample: judge from your "
                      "own knowledge)")
     for idx, cand in enumerate(candidates, 1):
-        # Do NOT fall back to `cand['source']` here. It leaked "openalex" /
-        # "local_corpus" into the sheet, which breaks the blind protocol twice
-        # over: it reveals the retrieval path, and since local-corpus hits carry
-        # quoted passages the pairing lets a reviewer infer which system's
-        # candidate set they are looking at.
+        # Never print the retrieval source. It leaks via two paths: falling back
+        # to `cand['source']`, and `venue` itself holding a source name when the
+        # paper has no real venue. Either one breaks the blind protocol twice —
+        # it reveals the retrieval path, and because local-corpus hits are the
+        # ones carrying quoted passages it also reveals which arm is being read.
+        venue = (cand.get("venue") or "").strip()
+        if venue.lower() in _SOURCE_NAMES:
+            venue = ""
         lines.append(
             f"- [ ] {idx}. {cand['title']} ({cand.get('year') or 'n.d.'}"
-            f"{', ' + str(cand['venue']) if cand.get('venue') else ''}"
+            f"{', ' + venue if venue else ''}"
             f") — FULL / PARTIAL / NONE: ____")
         # Quote the matched passage when the local corpus supplied one. A title
         # alone often cannot settle whether prior art implements the SAME
@@ -716,16 +753,11 @@ async def _run(args) -> None:
             fh.write(json.dumps(sub, ensure_ascii=False, default=str) + "\n")
         review_md.append(blind_review_section(
             sub["submission_id"], sub["_topic"], sub["claim"], candidates, failure))
-        # Fill-in template: reviewer edits the nulls, keyed by submission_id only.
+        # Fill-in template: reviewer edits the empty fields, keyed by
+        # submission_id only (evaluate.py de-anonymises via submission_mapping).
         with template_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({
-                "submission_id": sub["submission_id"],
-                "false_open": None,
-                "novelty": None,
-                "feasibility": None,
-                "credible": None,
-                "notes": "",
-            }, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(empty_verdict(sub["submission_id"]),
+                                ensure_ascii=False) + "\n")
 
     # `candidates_path` now holds kept + fresh (kept was never removed and fresh
     # was appended). Only the REVIEW ARTIFACTS are rebuilt from scratch, since a
@@ -738,14 +770,8 @@ async def _run(args) -> None:
                 rec.get("query_failure")))
         with template_path.open("a", encoding="utf-8") as fh:
             for rec in kept:
-                fh.write(json.dumps({
-                    "submission_id": rec["submission_id"],
-                    "false_open": None,
-                    "novelty": None,
-                    "feasibility": None,
-                    "credible": None,
-                    "notes": "",
-                }, ensure_ascii=False) + "\n")
+                fh.write(json.dumps(empty_verdict(rec["submission_id"]),
+                                    ensure_ascii=False) + "\n")
         print(f"[super_audit] folded {len(kept)} previously-successful record(s) "
               f"back into the review artifacts")
 
