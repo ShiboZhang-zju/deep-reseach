@@ -747,6 +747,12 @@ class GapCandidateSchema(BaseModel):
     question_ids: list[str] = Field(..., min_length=1, description="关联的 ResearchQuestion ID 列表（至少 1 个）")
     supporting_evidence_ids: list[str] = Field(..., min_length=1, description="支撑此 Gap 的 Evidence ID 列表（至少 1 个）")
     contradicting_evidence_ids: list[str] = Field(default_factory=list, description="产生矛盾的 Evidence ID 列表")
+    # v7.1 cross_domain_transfer two-sided contract: the source-domain
+    # mechanism units and the target-domain problem units, cited explicitly
+    # (must also appear in supporting_evidence_ids). Empty for every other
+    # opportunity type.
+    source_domain_evidence_ids: list[str] = Field(default_factory=list, description="cross_domain_transfer 专用：记录 source domain 成熟机制的 Evidence ID（须同时出现在 supporting_evidence_ids）")
+    target_evidence_ids: list[str] = Field(default_factory=list, description="cross_domain_transfer 专用：记录 target domain 待迁移问题的 Evidence ID（须同时出现在 supporting_evidence_ids）")
     novelty_score: float = Field(0.5, ge=0, le=1, description="新颖性")
     feasibility_score: float = Field(0.5, ge=0, le=1, description="可行性")
     significance_score: float = Field(0.5, ge=0, le=1, description="重要性")

@@ -12,6 +12,10 @@ Locks the three structural changes of opportunity-ontology-v7:
    contradiction opportunity type.
 3. Lens fan-out: one LLM call per opportunity type; a candidate whose type
    does not match its lens call is rejected as TYPE_LENS_MISMATCH.
+4. v7.1: the paper floor is per-type, not uniform — untested_assumption
+   demands assumption prevalence (>=3 independent papers) and
+   cross_domain_transfer demands two-sided evidence (source-domain mechanism
+   + target-domain problem, declared explicitly).
 """
 
 import json
@@ -101,11 +105,14 @@ class LensScriptedLLM:
 
     Parses the lens type from the mining prompt ("Opportunity type for this
     call: X") and emits a candidate of exactly that type, so every lens is
-    exercised in a single mining run.
+    exercised in a single mining run. transfer_domains optionally fills the
+    cross_domain_transfer two-sided fields; when omitted the transfer
+    candidate lacks them (for the both-domains rejection test).
     """
 
-    def __init__(self, citations_by_type):
+    def __init__(self, citations_by_type, transfer_domains=None):
         self.citations_by_type = citations_by_type
+        self.transfer_domains = transfer_domains
         self.lens_calls = []
         self.prompts = []
 
@@ -125,6 +132,10 @@ class LensScriptedLLM:
         cited = self.citations_by_type.get(gap_type)
         if not cited:
             return GapCandidateList(gaps=[])
+        extra = {}
+        if gap_type == "cross_domain_transfer" and self.transfer_domains:
+            extra["source_domain_evidence_ids"] = list(self.transfer_domains[0])
+            extra["target_evidence_ids"] = list(self.transfer_domains[1])
         return GapCandidateList(gaps=[GapCandidateSchema(
             gap_type=gap_type,
             description=f"{gap_type} opportunity in agent memory",
@@ -137,6 +148,7 @@ class LensScriptedLLM:
             falsification_condition="a neighbour already covers this delta",
             question_ids=[question_id],
             supporting_evidence_ids=list(cited),
+            **extra,
         )])
 
 
@@ -154,7 +166,9 @@ async def test_admission_contracts_are_type_specific(temp_db):
     type: method+result evidence (no limitation anywhere) admits the
     assumption / contradiction / mechanism / scaling / transfer opportunities
     but NOT boundary or missing-evaluation ones, whose contracts genuinely
-    demand a documented shortcoming.
+    demand a documented shortcoming. v7.1: the assumption admission is
+    prevalence (>=3 papers sharing it), so the pool carries three independent
+    papers.
     """
     from app.agent.state import ResearchState
     from app.agent.steps.mine_gaps import _OPPORTUNITY_CONTRACTS, mine_gap_candidates
@@ -163,9 +177,12 @@ async def test_admission_contracts_are_type_specific(temp_db):
     task, contract, question, units = _seed_question_with_evidence(db, [
         ("method", "verified", True, "supports"),
         ("result", "abstract_only", False, "supports"),
+        ("method", "verified", True, "supports"),
     ])
-    cited = [units[0].id, units[1].id]
-    llm = LensScriptedLLM({spec.gap_type: cited for spec in _OPPORTUNITY_CONTRACTS})
+    cited = [units[0].id, units[1].id, units[2].id]
+    llm = LensScriptedLLM(
+        {spec.gap_type: cited for spec in _OPPORTUNITY_CONTRACTS},
+        transfer_domains=([units[0].id], [units[2].id]))
     state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=1)
 
     gaps = await mine_gap_candidates(db, state, llm, task.id)
@@ -181,6 +198,64 @@ async def test_admission_contracts_are_type_specific(temp_db):
     rejections = {(item["lens"], item["reason"]) for item in trace["rejected_candidates"]}
     assert ("boundary_gap", "CANDIDATE_LACKS_LIMITATION_SIGNAL") in rejections
     assert ("missing_evaluation", "CANDIDATE_LACKS_LIMITATION_SIGNAL") in rejections
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_assumption_requires_three_paper_prevalence(temp_db):
+    """v7.1: the untested_assumption contract is assumption PREVALENCE, not
+    the generic two-paper floor — two methods sharing a habit is coincidence,
+    not a research opportunity. With only two independent papers behind the
+    cited support the candidate is rejected with a prevalence-specific code.
+    """
+    from app.agent.state import ResearchState
+    from app.agent.steps.mine_gaps import mine_gap_candidates
+
+    db = temp_db()
+    task, contract, question, units = _seed_question_with_evidence(db, [
+        ("method", "verified", True, "supports"),
+        ("result", "abstract_only", False, "supports"),
+    ])
+    llm = LensScriptedLLM({"untested_assumption": [units[0].id, units[1].id]})
+    state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=1)
+
+    gaps = await mine_gap_candidates(db, state, llm, task.id)
+
+    assert gaps == []
+    trace = json.loads(_last_trace(db, task.id, "gap_mining_candidates").output_json)
+    assert [(item["lens"], item["reason"]) for item in trace["rejected_candidates"]] == [
+        ("untested_assumption", "ASSUMPTION_NEEDS_BROADER_PREVALENCE")]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_transfer_requires_both_domain_evidence(temp_db):
+    """v7.1: cross_domain_transfer is two-sided by contract — a documented
+    source-domain mechanism AND a documented target-domain problem, both
+    cited explicitly. Two arbitrary papers (or a one-sided citation) do not
+    establish a transfer opportunity.
+    """
+    from app.agent.state import ResearchState
+    from app.agent.steps.mine_gaps import mine_gap_candidates
+
+    db = temp_db()
+    task, contract, question, units = _seed_question_with_evidence(db, [
+        ("method", "verified", True, "supports"),
+        ("result", "verified", True, "supports"),
+        ("comparison", "abstract_only", False, "supports"),
+    ])
+    cited = [units[0].id, units[1].id, units[2].id]
+    # transfer_domains omitted: the candidate cites three papers but never
+    # declares which side of the transfer each belongs to.
+    llm = LensScriptedLLM({"cross_domain_transfer": cited})
+    state = ResearchState(task_id=task.id, contract_id=contract.id, current_round=1)
+
+    gaps = await mine_gap_candidates(db, state, llm, task.id)
+
+    assert gaps == []
+    trace = json.loads(_last_trace(db, task.id, "gap_mining_candidates").output_json)
+    assert [(item["lens"], item["reason"]) for item in trace["rejected_candidates"]] == [
+        ("cross_domain_transfer", "TRANSFER_NEEDS_BOTH_DOMAIN_EVIDENCE")]
     db.close()
 
 

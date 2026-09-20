@@ -79,7 +79,15 @@ _MAX_CONTRADICTING_PER_QUESTION = 2
 # candidate rejection — the limitation requirement is now per-type: boundary /
 # missing_evaluation still demand it, assumption / contradiction / transfer
 # never did need it).
-GAP_MINING_POLICY_VERSION = "opportunity-ontology-v7"
+# v7.1 (2026-09-20, replay-readiness tightening): the >=2-paper floor is no
+# longer uniform. untested_assumption requires assumption PREVALENCE — the
+# same implicit assumption shared by >=3 independent papers (two methods
+# sharing a habit is coincidence, three is a pattern worth testing);
+# cross_domain_transfer requires BOTH sides of the transfer to be cited
+# explicitly (>=1 source-domain mechanism unit + >=1 target-domain problem
+# unit via the source_domain_evidence_ids / target_evidence_ids schema
+# fields), not merely two arbitrary papers.
+GAP_MINING_POLICY_VERSION = "opportunity-ontology-v7.1"
 
 # Max candidates accepted from a single opportunity lens — the fan-out's total
 # breadth stays bounded (7 lenses x 2 = 14 per round before gates), and the
@@ -125,7 +133,15 @@ class OpportunityContract:
       of these types (None = no type requirement for this type);
     - signal_rejection_code: rejection reason when that requirement fails;
     - min_usable_units / min_units_rejection_code: floor on distinct usable
-      cited evidence units (a contradiction needs the two conflicting claims).
+      cited evidence units (a contradiction needs the two conflicting claims);
+    - min_independent_papers / paper_floor_rejection_code: per-type floor on
+      the distinct papers behind the cited support. The universal default is
+      2, but it is NOT a uniform absolute: untested_assumption demands
+      prevalence (>=3 papers sharing the assumption), because "two methods
+      happen to share a habit" is not a research opportunity on its own;
+    - requires_both_domains: cross_domain_transfer must cite BOTH sides of
+      the transfer explicitly (source-domain mechanism + target-domain
+      problem), not merely two arbitrary papers that mention the field.
     """
     gap_type: str
     definition: str
@@ -135,6 +151,9 @@ class OpportunityContract:
     signal_rejection_code: str = ""
     min_usable_units: int = 1
     min_units_rejection_code: str = ""
+    min_independent_papers: int = 2
+    paper_floor_rejection_code: str = "INSUFFICIENT_CANDIDATE_PAPER_SUPPORT"
+    requires_both_domains: bool = False
 
 
 # Order matters: the two legacy types come first so historical behaviour (and
@@ -211,16 +230,22 @@ _OPPORTUNITY_CONTRACTS: tuple[OpportunityContract, ...] = (
             "evidence tests."
         ),
         discovery_directive=(
-            "Look for an assumption several papers inherit without verifying "
-            "(e.g. 'retrieval similarity ranks future usefulness'). The "
-            "opportunity is testing the inverted or untested assumption. A "
-            "limitation admission is NOT required for this type."
+            "Look for an assumption SEVERAL papers inherit without verifying "
+            "(e.g. 'retrieval similarity ranks future usefulness'). "
+            "Prevalence is the signal: an assumption shared by only two "
+            "methods may be coincidence, while one inherited across many "
+            "independent methods is a pattern worth testing. The opportunity "
+            "is testing the inverted or untested assumption. A limitation "
+            "admission is NOT required for this type."
         ),
         citation_rule=(
-            "cite evidence units from at least two independent papers that "
-            "share or rely on the same implicit assumption; method and result "
-            "units are admissible"
+            "cite evidence units from at least THREE independent papers that "
+            "share or rely on the same implicit assumption (assumption "
+            "prevalence is the admission contract for this type); method and "
+            "result units are admissible"
         ),
+        min_independent_papers=3,
+        paper_floor_rejection_code="ASSUMPTION_NEEDS_BROADER_PREVALENCE",
     ),
     OpportunityContract(
         gap_type="mechanism_gap",
@@ -274,14 +299,20 @@ _OPPORTUNITY_CONTRACTS: tuple[OpportunityContract, ...] = (
         discovery_directive=(
             "Look for a mature mechanism in an adjacent area (databases, "
             "systems, signal processing, control theory, statistics, ...) "
-            "that maps onto an unsolved problem in the target setting. Name "
-            "the source field and the mapping. A limitation admission is NOT "
-            "required for this type."
+            "that maps onto an unsolved problem in the target setting. The "
+            "admission contract is TWO-SIDED: the source-domain mechanism "
+            "must be documented, the target-domain problem must be "
+            "documented, and the mapping between them must be explicit. A "
+            "limitation admission is NOT required for this type."
         ),
         citation_rule=(
-            "cite the evidence that documents the source mechanism and the "
-            "evidence that shows the target setting lacks it"
+            "cite the evidence that documents the source mechanism AND the "
+            "evidence that shows the target setting lacks it, then ALSO list "
+            "the source evidence IDs in source_domain_evidence_ids and the "
+            "target evidence IDs in target_evidence_ids, and make the "
+            "source->target mapping explicit in the description"
         ),
+        requires_both_domains=True,
     ),
 )
 
@@ -873,11 +904,16 @@ async def mine_gap_candidates(
             elif len(usable_evidence_ids) < contract_spec.min_usable_units:
                 # v7: a contradiction is established by the conflicting claims
                 # themselves — at least two cited units are required. Checked
-                # before the universal paper floor so the rejection names the
-                # actual defect (only one side of the conflict cited); for every
-                # other type min_usable_units is 1 and this never fires.
+                # before the paper floor so the rejection names the actual
+                # defect (only one side of the conflict cited); for every other
+                # type min_usable_units is 1 and this never fires.
                 reason = contract_spec.min_units_rejection_code
-            elif len({item.paper_id for item in support}) < 2: reason = "INSUFFICIENT_CANDIDATE_PAPER_SUPPORT"
+            elif len({item.paper_id for item in support}) < contract_spec.min_independent_papers:
+                # v7.1: the paper floor is per-type. The universal default
+                # stays 2, but untested_assumption demands PREVALENCE (>=3
+                # papers sharing the assumption) — two methods sharing a
+                # habit is coincidence, not a research opportunity.
+                reason = contract_spec.paper_floor_rejection_code
             elif (contract_spec.required_evidence_types is not None
                   and not any(item.evidence_type in contract_spec.required_evidence_types
                               for item in support)):
@@ -886,6 +922,20 @@ async def mine_gap_candidates(
                 # missing_evaluation demand a documented shortcoming; mechanism
                 # / scaling demand a documented phenomenon or tested range.
                 reason = contract_spec.signal_rejection_code
+            elif (contract_spec.requires_both_domains
+                  and (not [item for item in candidate.source_domain_evidence_ids
+                            if item in allowed_evidence_ids]
+                       or not [item for item in candidate.target_evidence_ids
+                               if item in allowed_evidence_ids]
+                       or not (set(candidate.source_domain_evidence_ids)
+                               | set(candidate.target_evidence_ids))
+                       <= set(usable_evidence_ids))):
+                # v7.1: cross_domain_transfer is two-sided by contract — a
+                # documented source-domain mechanism AND a documented
+                # target-domain problem, both cited among the supporting
+                # evidence. Two arbitrary papers that mention the field do
+                # not establish a transfer opportunity.
+                reason = "TRANSFER_NEEDS_BOTH_DOMAIN_EVIDENCE"
             elif (_PLACEHOLDER_OPERAND_RE.search(candidate.testable_hypothesis or "")
                     or _PLACEHOLDER_OPERAND_RE.search(candidate.claimed_delta or "")):
                 # P1-1 (task d6f64087): ">X% label noise or <Y parameters" is a
