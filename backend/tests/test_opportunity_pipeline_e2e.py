@@ -39,6 +39,11 @@ class ScriptedLLM:
         self.calls.append(schema.__name__)
         if schema.__name__ == "GapCandidateList":
             from app.schemas.schemas import GapCandidateList, GapCandidateSchema
+            # v7 lens fan-out: only the boundary_gap lens emits for this
+            # scripted scenario; every other opportunity type reports "does
+            # not fit" so the single-gap lineage assertions below stay sharp.
+            if "Opportunity type for this call: boundary_gap" not in messages[1]["content"]:
+                return GapCandidateList(gaps=[])
             question_id = next(line.split(": ", 1)[1] for line in messages[1]["content"].splitlines() if "Question ID:" in line)
             evidence_ids = [line.split(": ", 1)[1] for line in messages[1]["content"].splitlines() if "Evidence ID:" in line]
             return GapCandidateList(gaps=[GapCandidateSchema(

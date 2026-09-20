@@ -805,13 +805,24 @@ class GapCandidate(Base):
 
     Phase 3A Closure: Structured falsifiable contract fields added.
 
-    gap_type:
-    - coverage_gap: A research question with low coverage score
-    - contradiction: Evidence units conflict with each other
-    - missing_method: No method evidence found for a question
-    - missing_dataset: No dataset/benchmark evidence found
-    - missing_evaluation: No evaluation/metric evidence found
-    - boundary_gap: Edge of current knowledge, unexplored combination
+    gap_type (v7 Research Opportunity ontology — the seven types mining can
+    produce; the three legacy values remain valid for historical rows only):
+    - boundary_gap: A documented boundary, failure condition, or untested
+      setting of an existing method or evaluation
+    - missing_evaluation: A concrete, important capability/condition/cost/risk
+      that existing work does not evaluate
+    - contradiction: Verified results conflict under comparable settings and
+      the disagreement itself is unexplained
+    - untested_assumption: Multiple works share an implicit assumption that no
+      supplied evidence tests
+    - mechanism_gap: A phenomenon is documented but its cause is not
+      established
+    - scaling_regime: A behaviour is established in one scale/regime range
+      while an important range is untested
+    - cross_domain_transfer: A mechanism proven in a neighbouring field solves
+      an isomorphic problem the target field has not imported
+    - coverage_gap / missing_method / missing_dataset: legacy types, no longer
+      produced by mining
 
     status (frozen enum):
     - candidate: Newly identified, not yet audited

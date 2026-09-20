@@ -344,8 +344,12 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
     # Take chunks round-robin across sections instead of by global priority. A
     # long method section used to consume the whole per-paper budget, so
     # conclusions never reached the model at all: on a real run
-    # limitation/negative_result units were 8% of the extracted evidence and 9 of
-    # 12 research questions were then rejected for NO_LIMITATION_SIGNAL.
+    # limitation/negative_result units were 8% of the extracted evidence and 9
+    # of 12 research questions then failed the (pre-v7) question-level
+    # limitation gate. Since opportunity-ontology-v7 the limitation signal is
+    # a per-type candidate contract (boundary_gap / missing_evaluation), but
+    # the section rotation stays: those lenses still cannot be satisfied
+    # without conclusion-section evidence.
     candidates = interleave_section_chunks(by_section, max_chunks, section_priority)
     if not candidates:
         db.commit()

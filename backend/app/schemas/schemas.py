@@ -670,10 +670,15 @@ class PaperRoleClassificationSchema(BaseModel):
 
 
 # === Phase 3A: Gap Control Plane schemas ===
-
+# v7 Research Opportunity ontology: mining produces exactly the seven
+# opportunity types in _OPPORTUNITY_CONTRACTS (mine_gaps.py). The three legacy
+# values (coverage_gap / missing_method / missing_dataset) stay valid for
+# historical rows and API reads but can no longer be produced by mining.
 GapType = Literal[
     "coverage_gap", "contradiction", "missing_method",
     "missing_dataset", "missing_evaluation", "boundary_gap",
+    "untested_assumption", "mechanism_gap", "scaling_regime",
+    "cross_domain_transfer",
 ]
 
 GapStatus = Literal[

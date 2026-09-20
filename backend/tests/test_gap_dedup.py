@@ -112,13 +112,21 @@ class MultiGapLLM:
 
 
 def _patch_embed(monkeypatch, vectors):
-    """Replace the embedding call with fixed vectors so cosine is controlled."""
+    """Replace the embedding call with fixed vectors so cosine is controlled.
+
+    v7 lens fan-out: mining embeds the existing-gap fingerprints once, then
+    each lens's type-matched candidates in a separate call. The mock hands
+    out the scripted vectors as consecutive slices — one slice per call, sized
+    to that call's input — so per-run vector assignments stay meaningful.
+    """
     import app.agent.steps.mine_gaps as mg
 
+    state = {"offset": 0}
+
     async def _embed(texts):
-        # vectors length must equal len(existing_fps) + len(candidate_fps),
-        # otherwise mine disables dedup (dedup_enabled=False).
-        return vectors
+        result = vectors[state["offset"]:state["offset"] + len(texts)]
+        state["offset"] += len(texts)
+        return result
 
     monkeypatch.setattr(mg, "_embed_fingerprints", _embed)
 

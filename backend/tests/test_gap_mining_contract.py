@@ -43,7 +43,13 @@ def temp_db():
 
 
 class _GapLLM:
-    """Emits one candidate whose citations are chosen by the test."""
+    """Emits one candidate whose citations are chosen by the test.
+
+    v7 lens fan-out: each mining call names exactly one opportunity type
+    ("Opportunity type for this call: X"). The fake only emits for the
+    missing_evaluation lens so every recorded rejection is attributable to the
+    candidate's own defects, never to a type mismatch.
+    """
 
     def __init__(self, question_ids, evidence_ids):
         self.question_ids = question_ids
@@ -56,6 +62,8 @@ class _GapLLM:
 
         self.system_prompts.append(messages[0]["content"])
         self.prompts.append(messages[1]["content"])
+        if "Opportunity type for this call: missing_evaluation" not in messages[1]["content"]:
+            return GapCandidateList(gaps=[])
         return GapCandidateList(gaps=[GapCandidateSchema(
             gap_type="missing_evaluation",
             description="Fixed-budget state-change retention is never measured.",

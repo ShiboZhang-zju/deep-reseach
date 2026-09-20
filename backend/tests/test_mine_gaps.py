@@ -257,7 +257,15 @@ def test_admission_rejects_single_paper_and_missing_span():
     assert "NO_FULLTEXT_LOCATABLE_EVIDENCE" in result.reason_codes
 
 
-def test_admission_blocks_verified_contradiction():
+def test_admission_treats_verified_contradiction_as_opportunity_signal():
+    """v7 (opportunity-ontology): a verified contradiction is the raw material
+    of the contradiction opportunity type, not a defect of the question.
+
+    It used to force UNKNOWN via UNRESOLVED_VERIFIED_CONTRADICTION — the most
+    valuable discovery signal (two credible results that cannot both hold)
+    was destroyed before any lens could see it, while generate_interventions
+    kept a contradiction_resolver lens that could never receive one.
+    """
     from types import SimpleNamespace
     from app.agent.steps.mine_gaps import evaluate_gap_mining_admission
 
@@ -274,8 +282,40 @@ def test_admission_blocks_verified_contradiction():
         SimpleNamespace(evidence_id="c", relation_type="contradicts", relevance_score=0.9),
     ]
     result = evaluate_gap_mining_admission(question, links, evidence)
-    assert result.status == "UNKNOWN"
-    assert "UNRESOLVED_VERIFIED_CONTRADICTION" in result.reason_codes
+    assert result.status == "PASS"
+    assert "UNRESOLVED_VERIFIED_CONTRADICTION" not in result.reason_codes
+    assert result.contradicting_evidence_ids == ["c"]
+    # The conflicting unit enters the admissible pool so the contradiction
+    # lens is actually shown the conflict it is asked to mine.
+    assert "c" in result.admissible_evidence_ids
+
+
+def test_admission_no_longer_requires_limitation_signal():
+    """v7: the limitation requirement moved from question-level admission to
+    per-type candidate contracts (boundary_gap / missing_evaluation demand it;
+    untested_assumption / contradiction / cross_domain_transfer never needed
+    it). A question backed by two independent papers of non-limitation types
+    is admissible mining material — under the old NO_LIMITATION_SIGNAL gate it
+    could never produce an assumption or mechanism opportunity.
+    """
+    from types import SimpleNamespace
+    from app.agent.steps.mine_gaps import evaluate_gap_mining_admission
+
+    question = SimpleNamespace(id="q", status="open")
+    fulltext = lambda item_id, paper_id, kind: SimpleNamespace(
+        id=item_id, paper_id=paper_id, evidence_type=kind, verification_status="verified",
+        original_span="span", source_chunk_hash="hash", page_number=1, page_start=1,
+        span_start=0, span_end=4,
+    )
+    evidence = {"a": fulltext("a", "p1", "method"), "b": fulltext("b", "p2", "result")}
+    links = [
+        SimpleNamespace(evidence_id="a", relation_type="supports", relevance_score=0.9),
+        SimpleNamespace(evidence_id="b", relation_type="supports", relevance_score=0.9),
+    ]
+    result = evaluate_gap_mining_admission(question, links, evidence)
+    assert result.status == "PASS"
+    assert "NO_LIMITATION_SIGNAL" not in result.reason_codes
+    assert result.limiting_evidence_ids == []
 
 
 # --- Bounded evidence selection for the mining prompt -------------------------
