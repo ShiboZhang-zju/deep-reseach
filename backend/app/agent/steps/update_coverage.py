@@ -26,6 +26,13 @@ from sqlalchemy import func
 
 logger = logging.getLogger(__name__)
 
+# A question whose evidence is purely contradictory still carries information,
+# so it must not collapse onto the same score as an empty evidence pool. Kept
+# at the same level as the "one weak background match" floor (0.15) so the two
+# remain distinguishable through the contradicting_* columns rather than by a
+# magic offset.
+COVERAGE_CONTRADICTION_FLOOR = 0.15
+
 
 def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -128,14 +135,33 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
         # ten questions hit 1.00 after only 15 papers. That inflated score is not
         # cosmetic — coverage decides whether to keep searching and which
         # questions may back a gap, so it must reflect corroboration breadth.
+        #
+        # Contradicting evidence must never *raise* the score. It used to be a
+        # `+0.05/distinct_paper` addend, which is a sign error: an observed run
+        # scored 0.95 on a question carrying 3 refuting papers, and a question
+        # with 10 refuting papers scored the same as one with a single weak
+        # match. GRADE treats inconsistency as a *downgrade* domain, and the
+        # question status it drives (`covered`) is consumed downstream as
+        # permission to back a gap — so refutation has to subtract.
+        #
+        # Contradiction is capped so that a fully-refuted question still reads as
+        # "has coverage" rather than being silently indistinguishable from
+        # "no information"; the refutation itself is preserved and reported
+        # through `distinct_contradicting_papers` / `contradicting_evidence_count`.
         distinct_supporting = len(supporting_papers)
         distinct_contradicting = len(contradicting_papers)
         total_relevant = supporting + contradicting + background
         if total_relevant >= 5 and distinct_supporting >= 3:
             coverage = min(1.0, 0.4 + distinct_supporting * 0.1
-                          + distinct_contradicting * 0.05)
+                          - min(0.3, distinct_contradicting * 0.1))
         elif total_relevant >= 3 and distinct_supporting >= 1:
-            coverage = 0.3 + distinct_supporting * 0.1
+            coverage = max(0.15, 0.3 + distinct_supporting * 0.1
+                           - min(0.15, distinct_contradicting * 0.1))
+        elif distinct_contradicting >= 1:
+            # Refutation is information, not absence of it: keep it above the
+            # "nothing relevant" floor so it is not conflated with an empty
+            # evidence pool.
+            coverage = COVERAGE_CONTRADICTION_FLOOR
         elif total_relevant >= 1:
             coverage = 0.15
         else:
@@ -166,7 +192,14 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
         # noise such as 0.7000000000000001.
         coverage = round(coverage, 2)
         cr.coverage_score = coverage
-        cr.confidence = min(1.0, total_relevant * 0.15)
+        # `confidence` answers "how much do we trust this coverage reading", so
+        # it must be driven by the corroboration the score itself rests on —
+        # distinct *papers*, not `total_relevant`. `total_relevant` counts
+        # background/weak matches that coverage deliberately excludes, so the
+        # old formula saturated at 1.00 while coverage sat at 0.15 (observed in
+        # a real run), advertising high confidence in a conclusion the score
+        # does not support.
+        cr.confidence = min(1.0, distinct_supporting * 0.2)
         cr.supporting_evidence_count = supporting
         cr.contradicting_evidence_count = contradicting
         cr.distinct_supporting_papers = distinct_supporting
@@ -317,12 +350,20 @@ def _get_relevant_evidence_types(question_type: str) -> list[str]:
 
 
 def _determine_relation(evidence: EvidenceUnit, question: ResearchQuestion) -> str:
-    """Determine the relationship between evidence and question."""
+    """Determine the relationship between evidence and question.
+
+    Fallback path only (the LLM matcher is the primary decider). `comparison`
+    used to be mapped to `background`, which meant a failed LLM call demoted
+    every measured head-to-head result — precisely the evidence
+    `EVIDENCE_EXTRACT_SYSTEM` calls the strongest corroboration — out of
+    `supporting`. A comparison against a named baseline is a partial answer to
+    "how does X perform", so it is treated as such rather than as background.
+    """
     if evidence.evidence_type == "negative_result":
         return "contradicts"
-    if evidence.evidence_type == "limitation":
+    if evidence.evidence_type in ["limitation", "comparison"]:
         return "partially_answers"
-    if evidence.evidence_type in ["future_work", "comparison"]:
+    if evidence.evidence_type == "future_work":
         return "background"
     return "supports"
 

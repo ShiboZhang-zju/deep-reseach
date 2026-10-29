@@ -12,6 +12,15 @@
 | [11-llm-wiki.md](11-llm-wiki.md) | 设计+决策记录 | 已实现 | LLM Wiki 知识编译：放弃 GraphRAG 改用 Karpathy LLM Wiki 范式的完整决策对比 |
 | [12-literature-map.md](12-literature-map.md) | 设计文档 | 待实现（roadmap） | 文献地图：引文网络+语义聚类双视角，业界方案调研与算法选型（Adamic/Adar + Louvain） |
 | [15_从研究方向到Idea的难点分析与优化建议.md](15_从研究方向到Idea的难点分析与优化建议.md) | 探索性分析 | 诊断框架仍有效 | V2 长链路 7 道硬闸门的系统性诊断：为何"研究方向→Idea"难。其中 O3-O9 缓解已落地，核心张力（闸门串联 × 上游供给 × 分级产出）仍是主线 |
+| [eval_report_v2_v3_2026-09-01.md](eval_report_v2_v3_2026-09-01.md) | 评测汇报 | 已归档 | V2 Ranking clean baseline + RINoBench criterion-first-v3 的对照结论：pairwise ranking 质变（0.14→0.71），绝对 1-5 novelty 打分仅把系统性偏差方向反转（Macro-F1 +2pp） |
+
+## 2026-10-28 整理处置记录
+
+- **backend/_report_check.py**：v7 replay pilot 的一次性结果打印脚本（硬编码读 `eval_results/v7_replay_pilot/*.jsonl`），结论已进 `eval_results/v7_replay_pilot/replay_report.json`，删除。
+- **backend/tests/pdf_cache/**：空目录，测试用相对路径 `pdf_cache/` 落在 backend 根而非此处，删除。
+- **.session_tmps/、output/**：空运行时目录（已在 .gitignore），删除。
+- **paper_assets/ 下 11 个空 UUID 目录**：抽取失败留下的空壳，删除。
+- **docs/eval_report_v2_v3_2026-09-01.md**：原为未跟踪文件，补入本索引与 README 文档表。
 
 ## 2026-08-31 整理处置记录
 

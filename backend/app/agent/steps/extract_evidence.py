@@ -78,6 +78,12 @@ def find_span_in_chunk(original_span: str, chunk_text: str) -> tuple[int, int] |
     return (located[0], located[1]) if located else None
 
 
+# Why each paper's PDF could not be retrieved in the most recent extraction run,
+# keyed by task id then paper id. Threaded from the download step to the
+# persistence step so the cause survives into `task_papers`.
+_download_diagnoses: dict[str, dict[str, str | None]] = {}
+
+
 async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
                                   round_number: int = 0):
     """Extract evidence units from papers found in this round (or all if round=0).
@@ -90,65 +96,122 @@ async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
     - (#11) Concurrent LLM calls use separate sessions
     """
     from app.agent.steps.analyze_papers import extract_pdf_text_by_section
-    from app.services.rag_service import download_pdf_multi_source
+    from app.services.rag_service import download_pdf_classified
     from app.config import settings
 
-    # Get papers to process
+    # Get papers to process — the *whole* candidate set, not a per-round slice.
+    #
+    # Two allocation rules used to fight each other and both are now gone:
+    #   1. A per-round `evidence_max_papers` cap. With 146 candidates and a cap of
+    #      15, a five-round task could assess at most 75 papers — the corpus was
+    #      unreachable by construction, and which papers got read depended on how
+    #      many rounds happened to run.
+    #   2. A priority-tier quota on top of that cap. It correctly stopped mid-tier
+    #      papers from crowding out topic-critical ones, but it did so by dropping
+    #      papers rather than by making extraction cheaper.
+    #
+    # Coverage is now unconditional: every candidate is extracted. What made that
+    # affordable is concurrency (see the pool below) plus the fact that a paper
+    # whose evidence is already stored is skipped cheaply — so re-entering this
+    # phase in a later round costs almost nothing for papers already done, and
+    # rounds accumulate coverage instead of re-rolling the same truncated slice.
     query = db.query(TaskPaper).filter(
         TaskPaper.task_id == task_id,
         TaskPaper.priority.in_(["high", "medium"]),
     )
+    # Round > 0 means a "continue/regenerate" pass: new papers only. But round 0
+    # re-runs (resume, or a second attempted solution) must see the full corpus,
+    # so only the incremental case narrows.
     if round_number > 0:
         query = query.filter(TaskPaper.discovered_round == round_number)
-    all_tps = query.order_by(
-        TaskPaper.final_score.desc().nullslast()
-    ).limit(settings.evidence_max_papers).all()
 
+    all_tps = query.order_by(TaskPaper.final_score.desc().nullslast()).all()
     papers = [(tp.paper, tp) for tp in all_tps if tp.paper]
 
     if not papers:
         logger.info("Task %s: no papers for evidence extraction (round %d)", task_id[:8], round_number)
         return 0
 
-    logger.info("Task %s: extracting evidence from %d papers (round %d)",
-                task_id[:8], len(papers), round_number)
+    n_high = sum(1 for tp in all_tps if tp.priority == "high")
+    logger.info(
+        "Task %s: extracting evidence from all %d candidate papers (round %d) — "
+        "high=%d medium=%d, concurrency=%d",
+        task_id[:8], len(papers), round_number, n_high, len(all_tps) - n_high,
+        settings.evidence_extract_concurrency,
+    )
+
     emit_event(task_id, "status", {"status": "extracting_evidence", "total": len(papers), "round": round_number})
 
-    # (#4) Download PDFs first (before extraction)
-    pdf_paths = await _download_pdfs(papers, task_id)
+    # Prewarm: fetch the whole round's PDFs before any extraction work begins.
+    #
+    # This used to be the same call as the one below, i.e. downloads happened as
+    # the first thing extraction did. Splitting them matters because the two have
+    # different time/cost profiles: downloading is network-bound and recoverable
+    # (retries absorb rate-limit windows), extraction is LLM-bound and expensive.
+    # Interleaving them means a transient retrieval failure becomes permanent
+    # evidence loss, and the round's duration is unpredictable. Prewarming makes
+    # the corpus a settled input: by the time extraction runs, availability is
+    # already known and disclosed.
+    if settings.enable_pdf_prewarm:
+        prewarm = await prewarm_pdfs(papers, task_id)
+        logger.info(
+            "Task %s: prewarm complete — %d/%d retrievable, %d unavailable "
+            "(%s); extraction proceeds with what is on disk",
+            task_id[:8], prewarm["retrieved"], prewarm["total"],
+            prewarm["unavailable"],
+            ", ".join("{}={}".format(k, v) for k, v in sorted(prewarm["reasons"].items())) or "none",
+        )
 
-    # P0/P1: process in small batches so finished papers are committed (and
-    # survive a crash/OOM) before starting the next batch, and so peak memory
-    # is bounded to `batch_size` PDFs rather than all of them at once.
-    batch_size = max(1, settings.evidence_batch_size)
+    # (#4) Download PDFs first (before extraction)
+    pdf_paths = await _download_pdfs(
+        papers, task_id, concurrency=settings.pdf_prewarm_concurrency)
+
+    # One shared semaphore spanning the whole paper set, rather than a fresh
+    # per-batch one.
+    #
+    # The old code created a `Semaphore(batch_size)` inside each batch and
+    # awaited the batch before starting the next, so concurrency never exceeded
+    # `batch_size` and the duration scaled as ceil(N/batch_size) x per-paper-time.
+    # A single pool keeps exactly `evidence_extract_concurrency` papers in flight
+    # continuously: no barrier between batches, so a slow paper no longer holds
+    # back the papers queued behind it, and throughput no longer degrades as the
+    # N/1 remainder shrinks.
+    #
+    # Peak cost is bounded by the sampling of that pool, and each paper carries
+    # its own timeout (`evidence_paper_timeout_s`) inside `_extract_from_paper_safe`,
+    # so a hung PDF cannot stall the round.
+    concurrency = max(1, settings.evidence_extract_concurrency)
+    semaphore = asyncio.Semaphore(concurrency)
     total_evidence = 0
-    for batch_start in range(0, len(papers), batch_size):
-        batch = papers[batch_start:batch_start + batch_size]
-        semaphore = asyncio.Semaphore(batch_size)
-        tasks_list = [
-            _extract_from_paper_safe(
-                task_id, paper, tp, pdf_paths.get(paper.id), llm, round_number, semaphore
-            )
-            for paper, tp in batch
-        ]
-        results = await asyncio.gather(*tasks_list, return_exceptions=True)
-        for r in results:
-            if isinstance(r, int):
-                total_evidence += r
-            elif isinstance(r, Exception):
-                logger.error("Evidence extraction task failed: %s", r)
-        # Per-batch commit — CRITICAL for multi-task concurrency. The per-paper
-        # flushes above open a WRITE transaction on the shared session; without
-        # this commit that transaction stays open across every later batch's
-        # minutes-long LLM calls until the phase-tail commit, starving the
-        # other concurrent tasks' writers past busy_timeout (2026-09-09 3-way
-        # retest: two of three tasks died "database is locked" in round 1
-        # because a sibling held the write lock across its whole extract
-        # phase). Committing per batch bounds the write transaction to the
-        # flush→commit span (milliseconds, no awaits inside).
-        db.commit()
-        logger.info("Task %s: evidence batch %d-%d done, cumulative=%d",
-                    task_id[:8], batch_start, batch_start + len(batch), total_evidence)
+    done = 0
+
+    results = await asyncio.gather(*[
+        _extract_from_paper_safe(
+            task_id, paper, tp, pdf_paths.get(paper.id), llm, round_number, semaphore
+        )
+        for paper, tp in papers
+    ], return_exceptions=True)
+
+    for r in results:
+        done += 1
+        if isinstance(r, int):
+            total_evidence += r
+        elif isinstance(r, Exception):
+            logger.error("Evidence extraction task failed: %s", r)
+
+    # Single commit after the pool drains.
+    #
+    # The old code committed per batch specifically because a write transaction
+    # held open across later minutes-long LLM calls starves concurrent tasks past
+    # busy_timeout (2026-09-09 3-way retest: two of three tasks died "database is
+    # locked"). That reasoning is preserved rather than dropped: every per-paper
+    # write happens in its own short-lived session (`_extract_from_paper_safe`
+    # opens and closes a SessionLocal per paper) which is what bounds the write
+    # transaction. This session only writes the phase-tail trace, so it stays
+    # outside the LLM window entirely.
+    db.commit()
+    logger.info("Task %s: evidence extraction pool drained, %d papers, cumulative=%d",
+                task_id[:8], done, total_evidence)
 
     # Classify paper roles
     await _classify_paper_roles_safe(db, task_id, papers)
@@ -167,36 +230,115 @@ async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
     return total_evidence
 
 
-async def _download_pdfs(papers, task_id: str) -> dict[str, str]:
+async def prewarm_pdfs(papers, task_id: str) -> dict:
+    """Fetch this round's PDFs before extraction, and report what is retrievable.
+
+    Purpose is *decision*, not just motion: the caller learns the corpus that
+    actually exists before spending LLM budget on it, and the number plus the
+    reason distribution are surfaced in the phase summary so a truncated corpus
+    is visible instead of silently reducing evidence yield.
+
+    Downloads are idempotent against `pdf_cache`, so papers already on disk cost
+    one `os.path.exists` and no network. Returns a summary dict:
+    {"total", "retrieved", "unavailable", "reasons": {reason: count}}.
+    """
+    from app.services.rag_service import PDF_RETRY_MAX_ATTEMPTS, PDF_RETRY_BACKOFF_SECONDS
+    from app.config import settings
+
+    papers = [(p, tp) for p, tp in papers if p is not None]
+    if not papers:
+        return {"total": 0, "retrieved": 0, "unavailable": 0, "reasons": {}}
+
+    # A prewarm batch has a bounded worst case: every paper needs its full retry
+    # budget plus inter-attempt backoff. Logging the bound up front keeps the
+    # worst-case delay visible rather than showing up as an unexplained stall.
+    worst_case = len(papers) / max(1, settings.pdf_prewarm_concurrency) * (
+        PDF_RETRY_MAX_ATTEMPTS * 30 + sum(PDF_RETRY_BACKOFF_SECONDS))
+    logger.info(
+        "Task %s: prewarming %d PDFs (concurrency %d, worst case ~%.0fs before extraction)",
+        task_id[:8], len(papers), settings.pdf_prewarm_concurrency, worst_case,
+    )
+    emit_event(task_id, "status", {
+        "status": "prewarming_pdfs", "total": len(papers), "round": None,
+    })
+
+    pdf_paths = await _download_pdfs(
+        papers, task_id, concurrency=settings.pdf_prewarm_concurrency)
+
+    diagnoses = _download_diagnoses.get(task_id, {})
+    reasons: dict[str, int] = {}
+    for paper, _tp in papers:
+        if pdf_paths.get(paper.id):
+            continue
+        reason = diagnoses.get(paper.id) or "unknown"
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    retrieved = sum(1 for paper, _tp in papers if pdf_paths.get(paper.id))
+    summary = {
+        "total": len(papers),
+        "retrieved": retrieved,
+        "unavailable": len(papers) - retrieved,
+        "reasons": reasons,
+    }
+    emit_event(task_id, "status", {
+        "status": "prewarm_done",
+        "retrieved": retrieved,
+        "total": len(papers),
+    })
+    return summary
+
+
+async def _download_pdfs(papers, task_id: str, concurrency: int = 3) -> dict[str, str]:
     """(#4) Download PDFs for papers before extraction."""
-    from app.services.rag_service import download_pdf_multi_source
+    from app.services.rag_service import download_pdf_classified
 
     pdf_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.dirname(__file__))))), "pdf_cache")
     os.makedirs(pdf_cache_dir, exist_ok=True)
 
     pdf_paths = {}
-    semaphore = asyncio.Semaphore(3)
+    diagnoses = {}
+    semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def download_one(paper):
         async with semaphore:
             cache_path = os.path.join(pdf_cache_dir, f"{paper.id}.pdf")
             if os.path.exists(cache_path):
-                return paper.id, cache_path
+                return paper.id, cache_path, None
             try:
-                pdf_bytes = await download_pdf_multi_source(paper)
-                if pdf_bytes:
+                outcome = await download_pdf_classified(paper)
+                if outcome.content:
                     with open(cache_path, "wb") as f:
-                        f.write(pdf_bytes)
-                    return paper.id, cache_path
+                        f.write(outcome.content)
+                    return paper.id, cache_path, None
+                # No bytes: the outcome says *why*, and that reason is persisted
+                # by the caller. Previously this was a bare `return None` with no
+                # record, so an unretrievable paper was re-attempted every round
+                # and stayed indistinguishable from one that was read and found
+                # empty. Measured impact before this: 42 of 122 papers with a
+                # pdf_url had a cached PDF and only 22 produced any evidence.
+                logger.info("PDF unavailable for paper %s (reason=%s)",
+                            paper.id[:8], outcome.gap_reason)
+                return paper.id, None, outcome.gap_reason
             except Exception as e:
-                logger.debug("PDF download failed for paper %s: %s", paper.id[:8], e)
-            return paper.id, None
+                logger.warning("PDF download failed for paper %s: %s: %s",
+                               paper.id[:8], type(e).__name__, e)
+            return paper.id, None, "unknown"
 
     results = await asyncio.gather(*[download_one(p) for p, _ in papers], return_exceptions=True)
     for r in results:
-        if isinstance(r, tuple):
+        if isinstance(r, tuple) and len(r) == 3:
             pdf_paths[r[0]] = r[1]
+            diagnoses[r[0]] = r[2]
+
+    # Aggregate so the phase summary distinguishes "we tried and failed" from
+    # "there was nothing to try". Without this, a round where 80 of 122 papers
+    # could not be retrieved reads exactly like a round that simply found little
+    # evidence — which is how a retrieval failure turns into a scientific claim.
+    retrieved = sum(1 for v in pdf_paths.values() if v)
+    logger.info("PDF availability: %d/%d papers retrieved (task %s)",
+                retrieved, len(papers), task_id[:8])
+    _download_diagnoses[task_id] = diagnoses
     return pdf_paths
 
 
@@ -229,6 +371,74 @@ async def _extract_from_paper_safe(task_id, paper, tp, pdf_path, llm, round_numb
         db.close()
 
 
+def _record_extraction_gap(db, tp, status: str, reason: str | None) -> None:
+    """Record whether this paper's full text was actually assessed.
+
+    Needed so that "we could not retrieve/parse the full text" stays distinct
+    from "we read the full text and found nothing" all the way downstream.
+    Best-effort: a bookkeeping write must never break extraction itself.
+    """
+    try:
+        tp.extraction_status = status
+        tp.extraction_gap_reason = reason
+    except Exception:  # pragma: no cover - defensive, columns may be absent pre-migration
+        logger.debug("Could not record extraction status for task_paper %s", getattr(tp, "id", "?"))
+
+
+# Verification states that mean the unit carries a locatable source span and is
+# therefore admissible downstream. Observed values in a production DB:
+# `verified` (span located in the source text), `abstract_only` (derived from an
+# abstract, not a full text) and `unverified` (span could not be located).
+# `upgraded` is set by `_upgrade_abstract_evidence` once an abstract-level unit
+# has been superseded by a full-text one, so it counts as usable too.
+#
+# `unverified` does not qualify: a paper whose units were all rejected had a
+# failed extraction and must be retried. Neither does `abstract_only` on its own
+# — it should be retried once a PDF exists so the abstract-level result can be
+# upgraded. Including either would freeze a degraded result in place forever.
+_USABLE_VERIFICATION_STATUSES = ("verified", "upgraded")
+
+
+def _has_usable_evidence(db, task_id: str, paper_id: str) -> bool:
+    """Is usable evidence for this paper already recorded for this task?
+
+    Counts units that already have a locatable source span. Note that
+    `abstract_only` is excluded on purpose: it marks an abstract-level result,
+    and a later round that has since obtained the PDF should be free to upgrade
+    it. `upgraded` is included because it means the abstract-level unit was
+    already replaced by a full-text one.
+
+    Reads through the ORM rather than issuing raw SQL, so the caller may pass
+    either a Session or a plain connection; when `db` is None (the per-paper
+    worker runs on its own session) a short-lived session is opened instead.
+
+    Never raises: any failure is reported as "not extracted". The skip is an
+    optimisation, so a lookup problem must cost time, never silently drop a paper
+    from the corpus.
+    """
+    try:
+        from app.db.models import EvidenceUnit
+        from app.db.session import SessionLocal
+
+        def _query(session):
+            return (session.query(EvidenceUnit.id)
+                    .filter(EvidenceUnit.task_id == task_id,
+                            EvidenceUnit.paper_id == paper_id,
+                            EvidenceUnit.verification_status.in_(_USABLE_VERIFICATION_STATUSES))
+                    .first() is not None)
+
+        if db is not None:
+            return _query(db)
+        session = SessionLocal()
+        try:
+            return _query(session)
+        finally:
+            session.close()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("Evidence lookup failed for paper %s: %s", str(paper_id)[:8], e)
+        return False
+
+
 async def _extract_from_paper(db, llm, task_id, paper, tp, pdf_path, round_number) -> int:
     """Extract evidence from a single paper with provenance validation.
 
@@ -236,6 +446,39 @@ async def _extract_from_paper(db, llm, task_id, paper, tp, pdf_path, round_numbe
     released immediately, instead of opening the same file twice and keeping all
     page text resident across the whole round.
     """
+    # Skip work already done. Now that the phase targets the *whole* corpus on
+    # every entry, a resume or a later round would otherwise re-parse and re-send
+    # every paper it already processed — turning full coverage into a repeated
+    # full cost.
+    #
+    # The expensive part of extraction is the LLM call, so the skip is keyed on
+    # whether usable evidence is *already recorded* for this paper, not on a
+    # provenance flag alone. Keying it on `extraction_status` had two failures:
+    #   - It applies per TaskPaper, but a PDF belongs to a Paper. Within one task
+    #     a paper can be reached on several rounds, and each round used to carry a
+    #     fresh TaskPaper, so the same paper was re-extracted repeatedly — paying
+    #     full LLM cost to rediscover claims that were already stored.
+    #   - `abstract_only` was deliberately re-processed so a later round could
+    #     upgrade it. That is worth the cost only when a full text now exists; if
+    #     the PDF is still missing, re-running reproduces the same abstract-level
+    #     result at full price.
+    #
+    # Scope note: the lookup is scoped to this task, and that scoping is load
+    # bearing. Evidence rows are owned by the task that produced them and
+    # coverage counts this task's own units, so treating "another task already
+    # read this paper" as "skip it" would leave this task with zero rows for that
+    # paper — indistinguishable from having found nothing, i.e. a fresh instance
+    # of the absence-of-evidence error this module keeps having to avoid.
+    #
+    # The cost that scoping leaves on the table is bounded and real: a second
+    # task touching the same paper re-reads it (34% of (task, paper) pairs
+    # overlap across tasks in a production DB). Collapsing that requires promoting
+    # evidence to a corpus-level asset with shared ownership, which trades the
+    # self-containment above for a dedup win.
+    if _has_usable_evidence(db, task_id, paper.id):
+        logger.debug("Skipping paper %s: evidence already recorded for this task", paper.id[:8])
+        return 0
+
     evidence_count = 0
 
     sections = None
@@ -247,6 +490,10 @@ async def _extract_from_paper(db, llm, task_id, paper, tp, pdf_path, round_numbe
             logger.debug("PDF parse failed for paper %s: %s", paper.id[:8], e)
 
     if sections:
+        # Full text was actually assessed — record it so this paper is never
+        # conflated with one whose PDF was never retrieved.
+        _record_extraction_gap(db, tp, "full_text", None)
+
         # (#5) Use real PDF page numbers
         evidence_count += await _extract_from_sections(
             db, llm, task_id, paper, sections, page_texts, round_number
@@ -255,10 +502,31 @@ async def _extract_from_paper(db, llm, task_id, paper, tp, pdf_path, round_numbe
         # (#9) Upgrade abstract-only evidence to full-text
         await _upgrade_abstract_evidence(db, paper, task_id)
     else:
-        # Abstract fallback
+        # Abstract fallback.
+        #
+        # Reaching this branch means the full text was never assessed — either
+        # the PDF could not be downloaded or it failed to parse. That is a
+        # different fact from "the full text was read and contained nothing
+        # relevant" ("not tested" vs "tested negative"), and the two used to be
+        # indistinguishable: both produced zero evidence units and left
+        # `extraction_method` unset. Downstream coverage then treated an
+        # unretrievable paper exactly like an empty one, biasing conclusions
+        # toward "no prior work exists". The gap is recorded on the TaskPaper so
+        # the readiness gate and reports can disclose it.
         abstract = paper.abstract or ""
+        # Prefer the download verdict over a generic label: "paywall" is
+        # actionable (stop retrying, disclose it) whereas "pdf_not_retrieved" is
+        # not. Falls back cleanly when the download step recorded nothing.
+        verdict = _download_diagnoses.get(task_id, {}).get(paper.id)
+        if pdf_path:
+            gap_reason = "pdf_parse_failed"
+        else:
+            gap_reason = verdict or "pdf_not_retrieved"
         if len(abstract) > 50:
             evidence_count += await _extract_from_abstract(db, llm, task_id, paper, abstract, round_number)
+            _record_extraction_gap(db, tp, "abstract_only", gap_reason)
+        else:
+            _record_extraction_gap(db, tp, "not_assessed", gap_reason)
 
     # P1: free page text ASAP so peak memory is bounded per paper.
     page_texts.clear()
@@ -332,6 +600,20 @@ async def _extract_from_sections(db, llm, task_id, paper, sections, page_texts, 
             if chunk_hash in seen_hashes:
                 continue
             seen_hashes.add(chunk_hash)
+            # Dedup is scoped to (task, paper, chunk_hash) — i.e. "has this task
+            # already processed this chunk", not "has this chunk produced this
+            # claim". The distinction matters because a chunk legitimately yields
+            # many claims: measured in a production DB, every one of the 6,437
+            # multi-row (task, paper, chunk) groups held *distinct* claims (one
+            # chunk produced 29 of them, a related-work paragraph enumerating
+            # baselines). Deduping on the claim would silently collapse an
+            # enumerating chunk down to a single row.
+            #
+            # Not widened to "any task that read this chunk" either: evidence rows
+            # stay owned by the task that produced them, so skipping a chunk
+            # because another task read it would leave this task with no rows for
+            # that paper, which coverage cannot distinguish from having found
+            # nothing.
             existing = db.query(EvidenceUnit).filter(
                 EvidenceUnit.task_id == task_id,
                 EvidenceUnit.paper_id == paper.id,

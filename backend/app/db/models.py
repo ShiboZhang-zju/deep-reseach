@@ -119,6 +119,18 @@ class TaskPaper(Base):
     priority = Column(String)
     reason = Column(Text)
     summary = Column(Text)
+
+    # Extraction provenance. Distinguishes "the full text was assessed" from
+    # "the full text was never retrieved/parsed" — the "not tested" vs "tested
+    # negative" distinction. Without it, an unretrievable paper is
+    # indistinguishable from an empty one and downstream coverage reads the
+    # resulting absence of evidence as evidence of absence.
+    # extraction_status: full_text / abstract_only / not_assessed
+    # extraction_gap_reason: pdf_not_retrieved / pdf_unavailable / pdf_parse_failed
+    #                        / pdf_not_retrieved_no_abstract
+    extraction_status = Column(String, nullable=True)
+    extraction_gap_reason = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=_utcnow)
 
     task = relationship("ResearchTask", back_populates="task_papers")

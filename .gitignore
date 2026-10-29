@@ -71,6 +71,10 @@ chroma/
 # ===== CodeBuddy workspace data =====
 .codebuddy/
 
+# ===== Runtime artifacts =====
+output/
+.session_tmps/
+
 # ===== OS =====
 .DS_Store
 Thumbs.db

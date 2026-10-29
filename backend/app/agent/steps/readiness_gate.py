@@ -29,6 +29,14 @@ HIGH_IMPORTANCE_THRESHOLD = 0.7
 # surface a landscape brief and (optionally) trigger targeted follow-up search.
 MIN_HIGH_IMPORTANCE_SNAPSHOT_RATIO = 0.6
 
+# A high-importance question counts as covered by this gate only when its
+# snapshot shows at least this coverage. `> 0` was the old bar and it admitted
+# the 0.15 "single weak background match" floor, which is not corroboration.
+# `distinct_supporting_papers >= 1` is the authoritative signal (it excludes
+# background/weak links by construction); this numeric floor is the fallback for
+# snapshots written before that column existed.
+MIN_HIGH_IMPORTANCE_COVERAGE = 0.3
+
 
 @dataclass
 class Phase2ReadinessResult:
@@ -214,16 +222,26 @@ def evaluate_phase2_readiness(db, task_id: str,
     # in the downstream coverage check below.
 
     # --- 5. Check if high-importance questions have any coverage ---
+    # `coverage_score > 0` was too weak a bar to be a gate: the scoring floor for
+    # "one weak background match" is 0.15, so a single tangential link admitted
+    # a question regardless of whether anything genuinely corroborated it. The
+    # gate now requires at least one high-importance question to carry a
+    # *supporting* snapshot (distinct_supporting_papers >= 1, or a recorded
+    # unavailable_reason that keeps an unassessable question from reading as
+    # absence of evidence). The dead `unavailable_reason` clause is kept so the
+    # "reports not retrieved" case stays admissible once writers exist.
     high_covered = 0
     unresolved = []
     for q in high_importance_qs:
         cov = latest_cov.get(q.id)
-        if cov and (cov.coverage_score > 0 or cov.unavailable_reason):
+        if cov and ((cov.distinct_supporting_papers or 0) >= 1
+                    or (cov.coverage_score or 0) >= MIN_HIGH_IMPORTANCE_COVERAGE
+                    or cov.unavailable_reason):
             high_covered += 1
         else:
             unresolved.append(q.id)
 
-    # At least one high-importance question must have coverage > 0 or unavailable_reason
+    # At least one high-importance question must carry real corroboration
     if high_covered == 0 and high_importance_qs:
         return Phase2ReadinessResult(
             ready=False, status="more_research_required",

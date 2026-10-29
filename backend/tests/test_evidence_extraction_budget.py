@@ -72,6 +72,47 @@ def test_selection_is_empty_when_there_is_nothing_to_extract():
     assert interleave_section_chunks({}, 6, _PRIORITY) == []
 
 
+def test_extraction_gap_records_not_tested_versus_tested_negative():
+    """An unretrievable paper must not be recorded the same way as an empty one.
+
+    Both used to leave `extraction_method` unset and produce zero evidence units,
+    so downstream coverage treated "we could not get the full text" identically to
+    "we read it and found nothing" — the absence-of-evidence error. The
+    provenance write makes the two distinguishable.
+    """
+    from app.agent.steps.extract_evidence import _record_extraction_gap
+
+    class _TaskPaper:
+        extraction_status = None
+        extraction_gap_reason = None
+        id = "tp-1"
+
+    assessed = _TaskPaper()
+    _record_extraction_gap(None, assessed, "full_text", None)
+    assert assessed.extraction_status == "full_text"
+    assert assessed.extraction_gap_reason is None
+
+    abstract_only = _TaskPaper()
+    _record_extraction_gap(None, abstract_only, "abstract_only", "pdf_not_retrieved")
+    assert abstract_only.extraction_status == "abstract_only"
+    assert abstract_only.extraction_gap_reason == "pdf_not_retrieved"
+
+    untouched = _TaskPaper()
+    _record_extraction_gap(None, untouched, "not_assessed", "pdf_not_retrieved_no_abstract")
+    assert untouched.extraction_status == "not_assessed"
+
+
+def test_extraction_gap_write_never_breaks_extraction():
+    """Bookkeeping must stay best-effort: it must not abort extraction."""
+    from app.agent.steps.extract_evidence import _record_extraction_gap
+
+    class _Frozen:
+        __slots__ = ()
+        id = "tp-frozen"
+
+    _record_extraction_gap(None, _Frozen(), "full_text", None)  # must not raise
+
+
 class _CapturingLLM:
     def __init__(self):
         self.messages = None

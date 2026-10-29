@@ -423,6 +423,82 @@ def test_readiness_gate_missing_snapshot(temp_db):
     db.close()
 
 
+def test_readiness_gate_rejects_weak_background_only_coverage(temp_db):
+    """A weak background match must not satisfy the readiness gate.
+
+    The gate used `coverage_score > 0`, but 0.15 is the formula's floor for
+    "exactly one weak background match" — so a single tangential link admitted a
+    high-importance question regardless of whether anything corroborated it.
+    Premature closure: the pipeline proceeded to mine gaps from questions whose
+    only evidence was background noise.
+    """
+    engine, Session = temp_db
+    db = Session()
+
+    from app.db.models import ResearchTask
+    import uuid
+    task = ResearchTask(id=str(uuid.uuid4()), user_input="weak background only",
+                        status="updating_coverage")
+    db.add(task)
+    db.flush()
+    contract_id = str(uuid.uuid4())
+    contract, _questions = _create_readiness_test_data(
+        db, task.id, contract_id,
+        high_importance_count=2,
+        add_coverage=True, coverage_score=0.15,
+        missing_coverage_for_one_high=False,
+    )
+
+    from app.db.models import CoverageRecord
+    # 0.15 is reachable with zero corroborating papers — make that explicit.
+    for cr in db.query(CoverageRecord).filter(CoverageRecord.task_id == task.id).all():
+        cr.distinct_supporting_papers = 0
+
+    db.commit()
+
+    from app.agent.steps.readiness_gate import evaluate_phase2_readiness
+    result = evaluate_phase2_readiness(db, task.id, contract.id)
+
+    assert result.status == "more_research_required", \
+        f"weak background-only coverage must not pass the gate, got '{result.status}'"
+
+    db.close()
+
+
+def test_readiness_gate_accepts_single_corroborating_paper(temp_db):
+    """One genuine corroborating paper is enough for the gate to open."""
+    engine, Session = temp_db
+    db = Session()
+
+    from app.db.models import ResearchTask
+    import uuid
+    task = ResearchTask(id=str(uuid.uuid4()), user_input="one corroborating paper",
+                        status="updating_coverage")
+    db.add(task)
+    db.flush()
+    contract_id = str(uuid.uuid4())
+    contract, _questions = _create_readiness_test_data(
+        db, task.id, contract_id,
+        high_importance_count=2,
+        add_coverage=True, coverage_score=0.5,
+        missing_coverage_for_one_high=False,
+    )
+
+    from app.db.models import CoverageRecord
+    for cr in db.query(CoverageRecord).filter(CoverageRecord.task_id == task.id).all():
+        cr.distinct_supporting_papers = 1
+
+    db.commit()
+
+    from app.agent.steps.readiness_gate import evaluate_phase2_readiness
+    result = evaluate_phase2_readiness(db, task.id, contract.id)
+
+    assert result.status == "ready", \
+        f"a corroborated high-importance question must open the gate, got '{result.status}'"
+
+    db.close()
+
+
 def test_readiness_gate_insufficient_coverage(temp_db):
     """All questions have latest snapshot, but high-importance coverage = 0
     → status == more_research_required.

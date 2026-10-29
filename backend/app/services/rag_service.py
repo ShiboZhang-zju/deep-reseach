@@ -258,29 +258,124 @@ def get_paper_similarities(paper_ids: list[str], top_k_per_paper: int = 5) -> di
 
 # === Phase 1: PDF Download ===
 
+# Retry policy. Measured 2026-09-18: of arXiv papers that had *never* been
+# cached, a plain retry recovered 40/40 and then 30/30 — and a controlled
+# comparison showed UA, concurrency and retry policy were all irrelevant
+# variables. So the failures are not properties of the papers; they are
+# transient (arXiv rate-limit windows), which means an unbounded single attempt
+# converts a temporary condition into permanent evidence loss.
+#
+# Retrying is therefore keyed on *cause*, not applied blanket:
+#   429 / 5xx / timeouts / connection errors -> transient, retry with backoff
+#   403 / 401                                -> paywall or bot block, permanent
+#   200 with HTML body                       -> landing page, this URL will
+#                                              never yield a PDF, permanent
+# Retrying a paywall wastes a minute per paper per round; not retrying a 429
+# silently deletes the paper from the corpus.
+PDF_RETRY_MAX_ATTEMPTS = 3
+PDF_RETRY_BACKOFF_SECONDS = (2.0, 8.0)
+PDF_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+# Why a download attempt ended. Persisted so a failed fetch is distinguishable
+# from a fetch that was never attempted — otherwise every round re-attempts the
+# same hopeless URLs and the corpus never converges.
+PDF_GAP_TRANSIENT = "transient"          # retried and exhausted
+PDF_GAP_PAYWALL = "paywall"              # 403/401 — will not be fixed by retrying
+PDF_GAP_NOT_PDF = "html_landing_page"    # 200 but not a PDF body
+PDF_GAP_NOT_FOUND = "not_found"          # 404/410 — the URL itself is dead
+PDF_GAP_UNKNOWN = "unknown"
+
+
+class _DownloadOutcome:
+    """Carries both the bytes and *why* there are none."""
+
+    __slots__ = ("content", "gap_reason", "status_code", "retryable")
+
+    def __init__(self, content=None, gap_reason=None, status_code=None, retryable=False):
+        self.content = content
+        self.gap_reason = gap_reason
+        self.status_code = status_code
+        self.retryable = retryable
+
+    def __bool__(self):
+        return self.content is not None
+
+
 async def _try_download(url: str, timeout: int = PDF_DOWNLOAD_TIMEOUT) -> bytes | None:
-    """Download a URL and verify it's a PDF. Returns None on failure."""
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code == 200:
+    """Download a URL and verify it's a PDF. Returns None on failure.
+
+    Thin wrapper kept for existing callers; `_try_download_classified` is the
+    one that reports why a fetch failed.
+    """
+    outcome = await _try_download_classified(url, timeout=timeout)
+    return outcome.content
+
+
+async def _try_download_classified(url: str, timeout: int = PDF_DOWNLOAD_TIMEOUT) -> _DownloadOutcome:
+    """Download a URL, classifying failures and retrying only transient ones."""
+    last = _DownloadOutcome(gap_reason=PDF_GAP_UNKNOWN)
+    for attempt in range(PDF_RETRY_MAX_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            status = resp.status_code
+
+            if status == 200:
                 content_type = resp.headers.get("content-type", "")
-                if "pdf" in content_type or resp.content[:4] == b"%PDF":
-                    return resp.content
-                logger.warning("Download: unexpected content-type %s for %s", content_type, url[:80])
+                if "pdf" in content_type.lower() or resp.content[:4] == b"%PDF":
+                    return _DownloadOutcome(content=resp.content, status_code=status)
+                # 200 with an HTML body: a landing page, not a PDF. Retrying the
+                # same URL cannot change the media type.
+                logger.info("Download: %s served %s, not a PDF (permanent)",
+                            url[:80], content_type or "unknown type")
+                return _DownloadOutcome(gap_reason=PDF_GAP_NOT_PDF, status_code=status)
+
+            if status in (401, 403):
+                logger.info("Download blocked (%d, paywall/bot-block) for %s — not retrying",
+                            status, url[:80])
+                return _DownloadOutcome(gap_reason=PDF_GAP_PAYWALL, status_code=status)
+
+            if status in (404, 410):
+                logger.info("Download %d for %s — URL is dead, not retrying", status, url[:80])
+                return _DownloadOutcome(gap_reason=PDF_GAP_NOT_FOUND, status_code=status)
+
+            if status in PDF_RETRYABLE_STATUS:
+                last = _DownloadOutcome(gap_reason=PDF_GAP_TRANSIENT,
+                                        status_code=status, retryable=True)
             else:
-                logger.warning("Download failed %d for %s", resp.status_code, url[:80])
-    except Exception as e:
-        logger.warning("Download error for %s: %s", url[:80], e)
-    return None
+                # Unclassified status: treat as transient once, since the cost of
+                # a wasted attempt is far below the cost of dropping a paper.
+                last = _DownloadOutcome(gap_reason=PDF_GAP_TRANSIENT,
+                                        status_code=status, retryable=True)
+                logger.warning("Download unexpected status %d for %s", status, url[:80])
+
+        except Exception as e:
+            last = _DownloadOutcome(gap_reason=PDF_GAP_TRANSIENT, retryable=True)
+            logger.warning("Download error for %s: %s: %s", url[:80], type(e).__name__, e)
+
+        if not last.retryable or attempt >= PDF_RETRY_MAX_ATTEMPTS - 1:
+            break
+        delay = PDF_RETRY_BACKOFF_SECONDS[min(attempt, len(PDF_RETRY_BACKOFF_SECONDS) - 1)]
+        logger.info("Retrying %s in %.0fs (attempt %d/%d, reason=%s)",
+                    url[:80], delay, attempt + 2, PDF_RETRY_MAX_ATTEMPTS, last.gap_reason)
+        await asyncio.sleep(delay)
+
+    if last.gap_reason == PDF_GAP_TRANSIENT:
+        logger.warning("Download exhausted %d attempts for %s (last status %s)",
+                       PDF_RETRY_MAX_ATTEMPTS, url[:80], last.status_code)
+    return last
+
+
+def _arxiv_pdf_url(arxiv_id: str) -> str:
+    """Build the canonical arXiv PDF URL from an arXiv ID."""
+    # Clean arxiv_id (remove version suffix for URL, arXiv handles both)
+    clean_id = arxiv_id.split("v")[0] if "v" in arxiv_id[-2:] else arxiv_id
+    return f"https://arxiv.org/pdf/{clean_id}"
 
 
 async def _fetch_arxiv_pdf(arxiv_id: str) -> bytes | None:
     """Download PDF from arXiv by arxiv_id."""
-    # Clean arxiv_id (remove version suffix for URL, arXiv handles both)
-    clean_id = arxiv_id.split("v")[0] if "v" in arxiv_id[-2:] else arxiv_id
-    url = f"https://arxiv.org/pdf/{clean_id}"
-    pdf = await _try_download(url)
+    pdf = await _try_download(_arxiv_pdf_url(arxiv_id))
     if pdf:
         logger.info("arXiv PDF downloaded for %s", arxiv_id)
     return pdf
@@ -546,6 +641,76 @@ async def download_pdf_multi_source(paper) -> bytes | None:
         _save_pdf_to_cache(paper.id, pdf_bytes)
     
     return pdf_bytes
+
+
+async def download_pdf_classified(paper) -> _DownloadOutcome:
+    """Same source cascade as `download_pdf_multi_source`, but reports the cause.
+
+    Callers need to persist *why* a paper could not be retrieved. Without that,
+    an unretrievable paper is re-attempted on every round with no progress and no
+    record — the corpus never converges and the loss is invisible. The reason is
+    taken from the *most informative* attempt: a paywall/HTML verdict is durable,
+    while a timeout is worth retrying next round.
+    """
+    from app.config import settings
+
+    cached = _load_pdf_from_cache(paper.id)
+    if cached:
+        return _DownloadOutcome(content=cached)
+
+    # Durable verdicts win over transient ones: if any source returned a real
+    # 403 or an HTML landing page, that is a property of the record we can act
+    # on. A timeout elsewhere should not mask it.
+    verdicts: list[str] = []
+
+    plans = []
+    if paper.pdf_url:
+        plans.append(lambda: _try_download_classified(paper.pdf_url))
+    if paper.arxiv_id:
+        plans.append(lambda: _try_download_classified(_arxiv_pdf_url(paper.arxiv_id)))
+    if paper.doi:
+        arxiv_from_doi = _extract_arxiv_from_doi(paper.doi)
+        if arxiv_from_doi:
+            plans.append(lambda: _try_download_classified(_arxiv_pdf_url(arxiv_from_doi)))
+
+    for plan in plans:
+        outcome = await plan()
+        if outcome.content:
+            if paper.doi and not paper.arxiv_id:
+                recovered = _extract_arxiv_from_doi(paper.doi)
+                if recovered:
+                    paper.arxiv_id = recovered
+            _save_pdf_to_cache(paper.id, outcome.content)
+            return outcome
+        if outcome.gap_reason:
+            verdicts.append(outcome.gap_reason)
+
+    # Remaining sources only yield a URL at runtime, so they stay unclassified;
+    # any success here is already a durable win.
+    for fetch in (
+        (lambda: _fetch_s2_pdf(paper.semantic_scholar_id)) if paper.semantic_scholar_id else None,
+        (lambda: _fetch_openalex_pdf(paper.openalex_id)) if paper.openalex_id else None,
+        (lambda: _fetch_unpaywall_pdf(paper.doi)) if paper.doi else None,
+        (lambda: _fetch_crossref_pdf(paper.doi)) if paper.doi else None,
+        (lambda: _fetch_aclanthology_pdf(paper.doi)) if paper.doi else None,
+        (lambda: _fetch_scihub_pdf(paper.doi)) if (paper.doi and settings.enable_scihub) else None,
+    ):
+        if fetch is None:
+            continue
+        pdf_bytes = await fetch()
+        if pdf_bytes:
+            _save_pdf_to_cache(paper.id, pdf_bytes)
+            return _DownloadOutcome(content=pdf_bytes)
+
+    durable = [v for v in verdicts if v in (PDF_GAP_PAYWALL, PDF_GAP_NOT_PDF, PDF_GAP_NOT_FOUND)]
+    if durable:
+        # Prefer the most actionable: paywall > dead URL > wrong media type.
+        for reason in (PDF_GAP_PAYWALL, PDF_GAP_NOT_FOUND, PDF_GAP_NOT_PDF):
+            if reason in durable:
+                return _DownloadOutcome(gap_reason=reason, retryable=False)
+    if verdicts:
+        return _DownloadOutcome(gap_reason=PDF_GAP_TRANSIENT, retryable=True)
+    return _DownloadOutcome(gap_reason=PDF_GAP_UNKNOWN)
 
 
 def _extract_arxiv_from_doi(doi: str) -> str | None:

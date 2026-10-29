@@ -71,11 +71,18 @@ the same wording across queries."""
 
 
 def _iter_targets(run_dirs: list[Path]):
-    """Yield (system, topic_id, topic, claim, target_type) audit targets.
+    """Yield (system, topic_id, topic, claim, target_type, stratum) audit targets.
 
     - every proposed idea from every system (target_type=idea)
     - every surviving gap of full_v2 (target_type=gap) — the direct object of
       the false-open-gap metric.
+
+    `stratum` is carried through so results can be analysed per stratum
+    (12 narrow_mature / 6 emerging_sparse / 6 broad_ambiguous). It was dropped
+    here at first, which silently made every stratum `None` downstream and
+    removed the ability to check whether a difference between systems is a
+    mechanism effect or a topic-mix effect — the strata exist precisely to
+    prevent that confusion.
     """
     for run_dir in run_dirs:
         config_path = run_dir / "config.json"
@@ -97,7 +104,8 @@ def _iter_targets(run_dirs: list[Path]):
                 if rec.get("decision") == "propose_idea" and rec.get("idea"):
                     idea = rec["idea"]
                     claim = idea.get("research_question") or idea.get("title") or ""
-                    yield system, rec["topic_id"], rec.get("topic", ""), str(claim), "idea"
+                    yield (system, rec["topic_id"], rec.get("topic", ""),
+                           str(claim), "idea", rec.get("stratum"))
         gaps_path = run_dir / "gaps_export.jsonl"
         if gaps_path.exists():
             for line in gaps_path.read_text(encoding="utf-8").splitlines():
@@ -107,7 +115,8 @@ def _iter_targets(run_dirs: list[Path]):
                 rec = json.loads(line)
                 for gap in rec.get("gaps") or []:
                     if gap.get("status") == "surviving" and gap.get("claimed_delta"):
-                        yield "full_v2", rec["topic_id"], "", str(gap["claimed_delta"]), "gap"
+                        yield ("full_v2", rec["topic_id"], "",
+                               str(gap["claimed_delta"]), "gap", rec.get("stratum"))
 
 
 async def gen_queries(llm, topic: str, claim: str, stats: CallStats) -> AuditQueries:
@@ -626,7 +635,7 @@ async def _run(args) -> None:
     # Blind protocol: shuffle order, hide identities behind submission_ids.
     random.Random(args.shuffle_seed).shuffle(targets)
     submissions = []
-    for system, topic_id, topic, claim, target_type in targets:
+    for system, topic_id, topic, claim, target_type, stratum in targets:
         submissions.append({
             "submission_id": uuid.uuid4().hex[:12],
             "system": system,
@@ -634,6 +643,9 @@ async def _run(args) -> None:
             "target_type": target_type,
             "claim": claim,
             "_topic": topic,
+            # Carried into the audit record so the headline can be broken down
+            # by stratum without re-joining against topics.jsonl.
+            "stratum": stratum,
         })
     candidates_path = run.dir / "candidate_killer_papers.jsonl"
     template_path = run.dir / "human_verdicts.jsonl"

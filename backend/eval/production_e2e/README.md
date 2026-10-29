@@ -97,8 +97,8 @@ Credible）。评完通过 `submission_mapping.json` 恢复系统身份——否
 
 ### 公平性控制（两处小调整）
 
-1. **同一基础模型**：三系统共用 `get_llm()`（production 同款 provider：Qwen3.5-397B 主 +
-   35B fallback）。Generator model / temperature（0.3，= production idea 生成链路
+1. **同一基础模型**：三系统共用 `get_llm()`（production 同款 provider，端点与模型由
+   `.env` 的 `VENUS_LLM_*` 决定，当前为 DeepSeek-V4.1-Flash）。Generator model / temperature（0.3，= production idea 生成链路
    `chat_json` 默认值）/ topic / 最终 Idea 输出 schema 完全相同，唯一变量是
    information / workflow。禁止 A 用 35B 而 V2 用 397B 的配置。
 2. **固定评价单位**：每系统每 topic 最多提交 1 个 final Idea（Full V2 取 active ideas 中
