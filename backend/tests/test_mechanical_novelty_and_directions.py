@@ -18,6 +18,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+@pytest.fixture(autouse=True)
+def _legacy_relevance_gate(monkeypatch):
+    """Pin the P2 relevance gate off for this file.
+
+    These tests cover the mechanical score itself — how coverage judgments
+    aggregate into a novelty number — and their fixtures seed no relevance
+    rows. Left on the production defaults (floor 0.3, >=2 qualified
+    neighbours), unscored single-neighbour fixtures would be refused upstream
+    and every assertion here would measure the gate instead of the score.
+    The gate has its own tests in test_mechanical_novelty_relevance_floor.py.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "gap_relevance_min_neighbor", 0.0)
+    monkeypatch.setattr(settings, "mech_novelty_min_qualified_neighbors", 1)
+
+
 @pytest.fixture
 def temp_db():
     fd, db_path = tempfile.mkstemp(suffix=".db")

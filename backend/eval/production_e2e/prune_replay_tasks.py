@@ -17,9 +17,6 @@ import argparse
 import io
 import sys
 
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-
 from sqlalchemy import or_
 
 from app.db.models import (
@@ -37,17 +34,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--status", default="replay_v7",
                         help="task status filter identifying the replay tasks to prune")
+    parser.add_argument("--task-ids", nargs="*", default=None,
+                        help="prune exactly these task ids (e.g. empty orphan shells left "
+                             "by an interrupted sweep) instead of the status filter")
     args = parser.parse_args()
 
     session = SessionLocal()
     try:
-        replay_tasks = session.query(ResearchTask).filter(
-            ResearchTask.status == args.status).all()
-        if not replay_tasks:
-            print(f"no '{args.status}' tasks to prune")
-            return
-        task_ids = [task.id for task in replay_tasks]
-        print(f"pruning {len(task_ids)} '{args.status}' task(s)")
+        if args.task_ids:
+            task_ids = args.task_ids
+            tasks = session.query(ResearchTask).filter(
+                ResearchTask.id.in_(task_ids)).all()
+            print(f"pruning {len(tasks)} task(s) by explicit id "
+                  f"({len(task_ids) - len(tasks)} not found)")
+        else:
+            replay_tasks = session.query(ResearchTask).filter(
+                ResearchTask.status == args.status).all()
+            if not replay_tasks:
+                print(f"no '{args.status}' tasks to prune")
+                return
+            task_ids = [task.id for task in replay_tasks]
+            print(f"pruning {len(task_ids)} '{args.status}' task(s)")
 
         question_ids = [row[0] for row in session.query(ResearchQuestion.id).filter(
             ResearchQuestion.task_id.in_(task_ids)).all()]
@@ -92,4 +99,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Rebind stdout to UTF-8 only when run as a script: doing it at import
+    # time replaces whatever stream the host holds (pytest capture, an IDE
+    # runner, a notebook), which makes the host fail at teardown with
+    # "I/O operation on closed file".
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace")
     main()

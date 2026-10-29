@@ -1998,6 +1998,23 @@ async def audit_gap_candidate(
             original_novelty = decision.novelty_confidence
             mech = (_mechanical_novelty_score(db, gap)
                     if settings.audit_mechanical_novelty_gate_enabled else None)
+            if mech is None and settings.gap_relevance_min_neighbor > 0:
+                # The signal returns None for several distinct reasons (no
+                # claims, no coverage rows, no or too few relevance-qualified
+                # neighbours). Without a trace that refusal is silent, and a
+                # gap that quietly fails to get backing is indistinguishable
+                # from one that never looked.
+                paper_repo.save_trace(
+                    db, task_id, "gap_audit_mechanical_novelty_refused",
+                    "decision", output_data={
+                        "gap_id": gap.id,
+                        "reason": "mechanical backing unavailable — no atomic "
+                                  "claims, no coverage rows, or fewer than the "
+                                  "required relevance-qualified neighbours",
+                        "floor": settings.gap_relevance_min_neighbor,
+                        "min_qualified_neighbors":
+                            settings.mech_novelty_min_qualified_neighbors,
+                    })
             if mech is not None and mech["novelty"] >= _MECHANICAL_NOVELTY_FLOOR:
                 backed = mech["novelty"]
                 decision.novelty_confidence = max(original_novelty, backed)
@@ -2013,6 +2030,15 @@ async def audit_gap_candidate(
                         "uncovered_ratio": mech["uncovered_ratio"],
                         "decided_ratio": mech["decided_ratio"],
                         "n_claims": mech["n_claims"],
+                        # P2 diagnostics: what the judgments rested on. The
+                        # floor is 0 by default, so a shadow run can show which
+                        # overrides would fail once relevance is enforced.
+                        "neighbor_relevance_floor": mech["neighbor_relevance_floor"],
+                        "neighbor_relevance_min": mech["neighbor_relevance_min"],
+                        "neighbor_relevance_median": mech["neighbor_relevance_median"],
+                        "neighbors_below_floor": mech["neighbors_below_floor"],
+                        "judgments_demoted_by_relevance":
+                            mech["judgments_demoted_by_relevance"],
                         "policy": "verified coverage matrix says unchecked "
                                   "territory — the low self-report was "
                                   "search noise, score corrected upward",
@@ -3073,7 +3099,8 @@ def _mechanical_claim_coverage(gap, neighbors) -> float:
     return best
 
 
-def _mechanical_novelty_score(db, gap: GapCandidate) -> dict | None:
+def _mechanical_novelty_score(db, gap: GapCandidate,
+                              relevance_floor: float | None = None) -> dict | None:
     """Aggregate the PERSISTED per-neighbor × per-claim coverage matrix into a
     mechanical novelty signal (option B, 2026-09-08).
 
@@ -3092,13 +3119,39 @@ def _mechanical_novelty_score(db, gap: GapCandidate) -> dict | None:
         decided;
       - UNCERTAIN or no judgment = insufficient evidence, NOT uncovered — the
         claim contributes nothing to the numerator and lowers decided_ratio.
-    gated_novelty = uncovered_ratio × decided_ratio, so search absence cannot
-    masquerade as novelty (the d6f64087 hollow-novelty mode fails closed).
+        gated_novelty = uncovered_ratio × decided_ratio, so search absence cannot
+        masquerade as novelty (the d6f64087 hollow-novelty mode fails closed).
+
+    P2 (2026-10-29) — relevance-gated judgments
+    -------------------------------------------
+    The matrix answers "did any judged neighbour cover this claim". It cannot
+    answer "was that neighbour worth judging", and the v7 replay pilot showed
+    the difference is not academic: all 33 neighbours behind the 11 mechanical
+    overrides screened a median gap-relevance of 0.17, 17/33 sat below 0.3, and
+    one gap's neighbours were off-domain papers (gravitational waves, general
+    relativity) at relevance 0.00. Every one of them was judged NONE — correct,
+    since they say nothing about the claim — so decided_ratio hit 1.0 and
+    mechanical novelty 1.0. "Three irrelevant papers were silent" was recorded
+    as the strongest available novelty evidence.
+
+    settings.gap_relevance_min_neighbor (0 = off) demotes a below-floor judgment
+    to UNCERTAIN: insufficient evidence, never coverage and never novelty. When
+    every judgment is demoted, decided == 0 and this returns None, so the audit
+    falls back to the legacy gate instead of claiming mechanical backing —
+    "no usable prior art was retrieved" cannot certify novelty.
+
+    `relevance_floor` overrides the configured floor for a single call, so an
+    offline counterfactual ("what would this gap have scored at 0.3?") can be
+    computed without mutating global settings mid-run.
+
+    Diagnostics are returned unconditionally (also with the gate off) so the
+    floor can be calibrated from a shadow run rather than guessed.
 
     Returns None when no atomic claims or no coverage rows exist (fail-open to
     the legacy gate).
     """
     from collections import defaultdict
+    from statistics import median
 
     claims = gap_repo.list_atomic_claims(db, gap.id)
     if not claims:
@@ -3115,12 +3168,71 @@ def _mechanical_novelty_score(db, gap: GapCandidate) -> dict | None:
     for cov in coverages:
         by_claim[cov.claim_id].append(cov)
 
+    # --- P2: relevance floor on JUDGMENTS (not on retrieved papers) -------
+    # The scores are read even when the gate is off: they are the only way to
+    # calibrate the floor from a shadow run, and one indexed query per audited
+    # gap is negligible next to the audit itself.
+    floor = (settings.gap_relevance_min_neighbor
+             if relevance_floor is None else relevance_floor)
+    relevance: dict[str, float] = {
+        row.paper_id: row.relevance_score
+        for row in gap_repo.list_gap_paper_relevance(db, gap.id)}
+
+    def _judgment_admitted(paper_id: str) -> bool:
+        """Whether this neighbour's judgment is evidence at all.
+
+        Unscored neighbours are admitted. A missing screen is not a verdict
+        about relevance, and dropping them would silently change behaviour for
+        every task that never ran the relevance screen.
+        """
+        if floor <= 0:
+            return True
+        score = relevance.get(paper_id)
+        if score is None:
+            return True
+        return score >= floor
+
+    judging_neighbours = {cov.neighbor_paper_id for cov in coverages}
+    scored = [relevance[pid] for pid in judging_neighbours if pid in relevance]
+    # "Qualified" means admitted as evidence, which is exactly what
+    # `_judgment_admitted` decides — including the unscored case. Counting only
+    # neighbours that carry a score would reject every task that never ran the
+    # relevance screen, silently changing behaviour far outside the pilot.
+    qualified = [pid for pid in judging_neighbours if _judgment_admitted(pid)]
+    diagnostics = {
+        "n_judging_neighbors": len(judging_neighbours),
+        "n_scored_neighbors": len(scored),
+        "n_qualified_neighbors": len(qualified),
+        "min_qualified_neighbors": (settings.mech_novelty_min_qualified_neighbors
+                                    if floor > 0 else 0),
+        "neighbor_relevance_floor": floor,
+        "neighbor_relevance_min": round(min(scored), 3) if scored else None,
+        "neighbor_relevance_median": round(median(scored), 3) if scored else None,
+        "neighbors_below_floor": (sum(1 for value in scored if value < floor)
+                                  if floor > 0 else 0),
+    }
+
+    # One qualified neighbour judged NONE is one paper that did not happen to
+    # mention the claim, not evidence that nobody has. Certifying novelty on
+    # fewer than the required count is how a single off-target retrieval run
+    # becomes a "discovery", so the signal refuses to speak at all.
+    if (floor > 0
+            and len(qualified) < settings.mech_novelty_min_qualified_neighbors):
+        diagnostics["insufficient_qualified_neighbors"] = True
+        return None
+
     uncovered_total = 0.0
     decided = 0
+    demoted = 0
     for claim in claims:
         best = 0.0
         judged = False
         for cov in by_claim.get(claim.id, []):
+            if not _judgment_admitted(cov.neighbor_paper_id):
+                # Below the relevance floor: insufficient evidence. Neither
+                # coverage (no numerator credit) nor a decided verdict.
+                demoted += 1
+                continue
             coverage = (cov.coverage or "").upper()
             if coverage in ("FULL", "PARTIAL"):
                 judged = True
@@ -3135,6 +3247,8 @@ def _mechanical_novelty_score(db, gap: GapCandidate) -> dict | None:
         uncovered_total += 1.0 - best
         decided += 1
 
+    diagnostics["judgments_demoted_by_relevance"] = demoted
+
     n = len(claims)
     if decided == 0:
         return None
@@ -3145,6 +3259,7 @@ def _mechanical_novelty_score(db, gap: GapCandidate) -> dict | None:
         "uncovered_ratio": round(uncovered_ratio, 3),
         "decided_ratio": round(decided_ratio, 3),
         "n_claims": n,
+        **diagnostics,
     }
 
 

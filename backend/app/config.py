@@ -33,19 +33,28 @@ class ModelConfig:
 # Project-level model registry. The first entry is the default backend used
 # by the Settings defaults below; .env values still override at runtime.
 MODELS: list[ModelConfig] = [
+    # DeepSeek-V4.1-Flash on the infer-proxy host. Verified 2026-10-28:
+    # /chat/completions answers without an Authorization header, accepts
+    # response_format=json_object, tools and the vendor params below, and
+    # reports max_model_len=557056. enable_thinking=False is honored (the
+    # `reasoning` field comes back empty and completion_tokens drops from 20
+    # to 2 on a trivial prompt), which keeps the reasoning chain from eating
+    # the output budget the pipeline reserved for JSON.
     ModelConfig(
-        name="Qwen3.5-397B-A17B",
-        base_url="http://28.251.176.200:8080/openapi",
-        model="Qwen3.5-397B-A17B-W8A8-P800-Functional-Agent",
+        name="DeepSeek-V4.1-Flash-1017-W8A8-P800-1028test",
+        base_url="http://28.251.176.246:8080/openapi",
+        model="DeepSeek-V4.1-Flash-1017-W8A8-P800-1028test",
         extra_body={
             "top_k": 50,
             "repetition_penalty": 1.05,
             "chat_template_kwargs": {"enable_thinking": False},
         },
     ),
-    # Fallback backend used when the primary's inference worker is down
-    # (observed: connection refused on its upstream :8021 port). Same
-    # Qwen3.6-35B-A3B family, deployed on a separate host.
+    # Fallback backend used when the primary's inference worker is down.
+    # NOTE (2026-10-28): the previous Qwen hosts are all unreachable right now
+    # (28.252.232.9 -> 502, 28.252.232.11 -> 404, 28.251.176.200 -> 502), so
+    # .env disables failover by leaving FALLBACK_VENUS_LLM_MODEL empty. This
+    # entry is kept as the default only for environments that still serve it.
     ModelConfig(
         name="Qwen3.6-35B-A3B-P800-test-image",
         base_url="http://28.252.230.68:8080/openapi",
@@ -89,14 +98,21 @@ class Settings(BaseSettings):
     llm_extra_body: dict[str, Any] = dict(_DEFAULT_MODEL.extra_body)
 
     # Context window of the configured model and the output budget reserved
-    # inside it. The local Qwen deployment rejects any request whose input
-    # exceeds llm_context_tokens with a bare HTTP 400, and it derives the
-    # allowed output length from what is left of the window: a prompt that
-    # nearly fills the context silently leaves no room for the answer, which
-    # arrives truncated mid-string. Reserving the output budget up front keeps
-    # both failure modes out of the pipeline.
-    llm_context_tokens: int = 40960
-    llm_max_output_tokens: int = 4096
+    # inside it. The backend rejects any request whose input exceeds the window
+    # with a bare HTTP 400, and it derives the allowed output length from what
+    # is left of the window: a prompt that nearly fills the context silently
+    # leaves no room for the answer, which arrives truncated mid-string.
+    # Reserving the output budget up front keeps both failure modes out of the
+    # pipeline.
+    #
+    # The DeepSeek-V4.1-Flash deployment reports max_model_len=557056, but this
+    # is deliberately declared far below that: under-declaring only makes the
+    # admission guard more conservative, while over-declaring lets doomed
+    # requests through. It also bounds `_output_allowance`, which asks for
+    # "context - prompt upper bound" output tokens — declaring the full window
+    # would request half a million output tokens for a short prompt.
+    llm_context_tokens: int = 131072
+    llm_max_output_tokens: int = 8192
 
     # Paper source API keys / polite-pool emails
     semantic_scholar_api_key: str = ""  # 可选，免费申请: https://www.semanticscholar.org/product/api#api-key-form
@@ -202,6 +218,40 @@ class Settings(BaseSettings):
     # How many chunks of a single paper to extract concurrently. Turns the old
     # serial per-chunk loop (N x 15s) into ceil(N/concurrency) x 15s.
     evidence_chunk_concurrency: int = 4
+
+    # PDF prewarm: fetch the round's PDFs *before* extraction starts, rather than
+    # discovering availability paper-by-paper inside the extraction loop.
+    #
+    # Rationale (measured 2026-09-18): retrieval failures are transient
+    # (arXiv rate-limit windows) rather than properties of the papers — of arXiv
+    # papers that had never been cached, a plain retry recovered 40/40 and then
+    # 30/30. Downloading inside the extraction loop therefore couples a
+    # recoverable network condition to evidence loss, and makes the round's cost
+    # unpredictable. Prewarming separates "can we get the corpus" from "what does
+    # the corpus say", so a rate-limit window costs a bounded delay instead of a
+    # silently truncated corpus.
+    enable_pdf_prewarm: bool = True
+    # Concurrency for prewarm downloads. Deliberately below the extraction-time
+    # concurrency (3): prewarm is the only thing running at that moment, and
+    # arXiv throttles aggressively above ~3 req/s. Raising this recovers nothing
+    # and triggers the very 429s the retry logic then has to absorb.
+    pdf_prewarm_concurrency: int = 3
+    # Padding added on top of the retry budget when sizing the prewarm timeout,
+    # so retries and slow large PDFs are not cut off by the batch timeout.
+    pdf_prewarm_timeout_padding_s: int = 60
+
+    # Extraction concurrency: how many papers are in flight simultaneously.
+    #
+    # This is the knob that makes full-corpus coverage affordable. Previously
+    # concurrency was pinned to `evidence_batch_size` *and* applied per batch with
+    # a barrier between batches, so a round of N papers took ceil(N/batch) rounds
+    # of the slowest paper. A single shared pool removes the barrier, which is why
+    # the per-round cap on how many papers get read can be dropped without the
+    # round time exploding.
+    #
+    # Each in-flight paper = 1 PDF in memory + `evidence_chunk_concurrency`
+    # concurrent LLM calls. Raising this multiplies both.
+    evidence_extract_concurrency: int = 4
     # Scoring prefilter: only send the top-N papers (by a cheap heuristic:
     # citations, recency, source authority) to the LLM for full scoring; the
     # rest are marked low-priority without an LLM call. 0 disables the prefilter
@@ -321,6 +371,51 @@ class Settings(BaseSettings):
     # NPA audit then runs on the Top-M only (two-stage, keeps 200+ pools cheap).
     gap_relevance_screen_top_m: int = 20
     gap_relevance_scoring_version: str = "gap-rel-v1"
+    # P2 (2026-10-29): a neighbour below this gap-relevance floor cannot CERTIFY
+    # novelty. Its FULL/PARTIAL/NONE judgment is treated as UNCERTAIN
+    # (insufficient evidence) instead of a decided verdict.
+    #
+    # Measured on the v7 replay pilot (2026-10-28): all 33 neighbours behind the
+    # 11 mechanical-novelty overrides screened a median gap_relevance of 0.17,
+    # 17/33 were below 0.3, and the three neighbours behind gap 4e409776 were
+    # off-domain (gravitational waves, general relativity; relevance 0.00). Each
+    # was judged NONE — correctly, they do cover nothing about LoRA interference
+    # — so decided_ratio reached 1.0 and mechanical novelty 1.0: "three
+    # irrelevant papers were silent" was recorded as the strongest possible
+    # novelty evidence. The screen score already existed; only the floor was
+    # missing.
+    #
+    # Calibrated on that pilot before switching on (all 11 overrides re-scored
+    # by the production function): the neighbour relevance pool splits into
+    # "off-domain" (<= 0.17) and "relevant" (>= 0.38) with nothing in between,
+    # so any floor in 0.2..0.3 gives the identical outcome — 8/11 overrides
+    # survive, and the 3 that drop out are the ones whose entire pool scored
+    # <= 0.17. A 0.4 floor would start discarding relevant neighbours (0.38)
+    # and leave only 4/11, so 0.3 is the widest setting that keeps real evidence.
+    #
+    # Set to 0.0 to restore legacy behaviour; the per-audit trace always records
+    # neighbour relevance diagnostics either way.
+    gap_relevance_min_neighbor: float = 0.3
+    # How many relevance-qualified neighbours the mechanical novelty override
+    # needs before it may certify novelty at all (2026-10-29).
+    #
+    # With the 0.3 floor applied to the v7 replay pilot, 3 of the 8 surviving
+    # override gaps rested on exactly ONE qualified neighbour — and two of
+    # those scored mechanical_novelty 1.00. One neighbour judged NONE is one
+    # paper that did not happen to mention the claim; it is not evidence that
+    # nobody has. An independent literature review of those 8 gaps (single
+    # reviewer, one search round, abstract-level) rated exactly those
+    # one-neighbour gaps as its least confident partial-coverage findings.
+    #
+    # Two independent routes — the neighbour-count structure and the external
+    # literature check — fail the same three gaps, so the floor alone is not
+    # sufficient and this count is the second half of the fix.
+    #
+    # COST, stated plainly: this suppresses discovery in fields where two
+    # relevant neighbours are genuinely hard to retrieve. Set to 1 to keep the
+    # floor without the count requirement; the final calibration belongs on a
+    # human-labelled set, not on this 6-topic pilot.
+    mech_novelty_min_qualified_neighbors: int = 2
     variant_regenerate_budget: int = 2          # per-variant regenerate attempts before dropping
 
     # Per-Gap audit guardrails. These are operational heuristics: they cap

@@ -15,9 +15,6 @@ import asyncio
 import io
 import sys
 
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-
 import httpx
 
 
@@ -66,4 +63,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Rebind stdout to UTF-8 only when run as a script: doing it at import
+    # time replaces whatever stream the host holds (pytest capture, an IDE
+    # runner, a notebook), which makes the host fail at teardown with
+    # "I/O operation on closed file".
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace")
     main()
