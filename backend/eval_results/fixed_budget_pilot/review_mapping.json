@@ -1,0 +1,553 @@
+{
+  "seed": 20261102,
+  "sealed_at": "2026-11-02",
+  "warning": "SEALED until the adjudication is complete. Opening this file before verdicts are written breaks blindness.",
+  "units": {
+    "fbp-001": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "B",
+      "real_id": "50a151cd-bd21-4198-9d77-dfae154fc4fb"
+    },
+    "fbp-002": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "537f63f1-90e4-4251-9499-8fe79e0a1a72"
+    },
+    "fbp-003": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "42115aea-6a4c-4960-b8c5-b7f6ee89ee31"
+    },
+    "fbp-004": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "A",
+      "real_id": "1d50765d-6693-4eab-b5c7-2a3dbbe346fe"
+    },
+    "fbp-005": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-024",
+      "arm": "B",
+      "real_id": "d84e5fbd-fec2-489b-89f9-a9961db7a2b7"
+    },
+    "fbp-006": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "6500b0a2-8d03-4805-adb1-2b341eca5f5b"
+    },
+    "fbp-007": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-019",
+      "arm": "A",
+      "real_id": "3d9d9e68-8ed9-41fe-8323-31cae15209a3"
+    },
+    "fbp-008": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-001",
+      "arm": "A",
+      "real_id": "a15e6eec-f075-4de0-8875-1a75537a94d0"
+    },
+    "fbp-009": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-001",
+      "arm": "A",
+      "real_id": "2070f575-ca18-4f9b-ae27-3dd45a547246"
+    },
+    "fbp-010": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-015",
+      "arm": "A",
+      "real_id": "18e0d804-15d0-42c0-9cf1-bedf1a26f73e"
+    },
+    "fbp-011": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "B",
+      "real_id": "54a75061-2c21-413d-a528-21e076aff12d"
+    },
+    "fbp-012": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-019",
+      "arm": "B",
+      "real_id": "b1940d51-1718-4e27-b90f-4dd4187800d1"
+    },
+    "fbp-013": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "d8ed9ed5-5f10-4f17-92bf-860b1788af98"
+    },
+    "fbp-014": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "16847bff-0ff5-4ed2-a338-782fa3b3e2e8"
+    },
+    "fbp-015": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-019",
+      "arm": "B",
+      "real_id": "1498ae48-c6e7-45aa-a3c6-1dec90ede3eb"
+    },
+    "fbp-016": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "b31d9b52-8542-4d8b-b1f9-bee82c1a4a91"
+    },
+    "fbp-017": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "56d4d88b-7864-45fa-9f7f-1687221e9a57"
+    },
+    "fbp-018": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "B",
+      "real_id": "dd6618fc-71af-4947-b7f8-765b77de1470"
+    },
+    "fbp-019": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "047ce141-4b55-4fe1-8086-ff33720a6211"
+    },
+    "fbp-020": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "b98e02b1-2dfa-4fb3-9ea1-0935ddb24400"
+    },
+    "fbp-021": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-024",
+      "arm": "B",
+      "real_id": "c25fd313-6c15-46c3-8db0-101c3167806f"
+    },
+    "fbp-022": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "B",
+      "real_id": "fe953b25-24bd-4748-a986-ddd7d801b05f"
+    },
+    "fbp-023": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "B",
+      "real_id": "b8408726-9f2a-458d-a141-d7b95b62c96f"
+    },
+    "fbp-024": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-015",
+      "arm": "B",
+      "real_id": "158b050f-67f2-4fb7-8d6e-61c45c39bf45"
+    },
+    "fbp-025": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "dd8af851-23ba-4fb8-b206-0331ce72e09c"
+    },
+    "fbp-026": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-015",
+      "arm": "A",
+      "real_id": "57568f96-5a10-4de2-9ec8-17e5e59990ad"
+    },
+    "fbp-027": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "37be2d19-44e1-48d4-8d7e-813a30934447"
+    },
+    "fbp-028": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-019",
+      "arm": "A",
+      "real_id": "bc1c8af8-891a-4cee-85e4-cabdb283c1c0"
+    },
+    "fbp-029": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "c56e3ff1-416e-46f7-8210-99fbe7fb8a6e"
+    },
+    "fbp-030": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-024",
+      "arm": "B",
+      "real_id": "6c8a43e2-6040-4814-9ccc-4ca4e077dcaa"
+    },
+    "fbp-031": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-015",
+      "arm": "B",
+      "real_id": "c191350f-30be-4e63-a6ec-44df6d94d820"
+    },
+    "fbp-032": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-001",
+      "arm": "A",
+      "real_id": "a1643653-10ca-48c0-90d4-8eacd33715d4"
+    },
+    "fbp-033": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "B",
+      "real_id": "a203c30b-f144-450d-86c8-c2f1337a5786"
+    },
+    "fbp-034": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "c33775bd-40f6-4388-a5fe-fd6adc809398"
+    },
+    "fbp-035": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "5d1d0b18-ea19-4bb8-81d0-99dce0bd6c38"
+    },
+    "fbp-036": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "f3c857fa-e28f-44aa-b3d3-7143b8cc1961"
+    },
+    "fbp-037": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-024",
+      "arm": "B",
+      "real_id": "91130f7b-b16e-4c88-8b8c-79a88f7e5d30"
+    },
+    "fbp-038": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "29d218a5-7b69-4597-9a82-48245dbdaaef"
+    },
+    "fbp-039": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "773c3119-98e3-4c32-83f3-518dd29c1388"
+    },
+    "fbp-040": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "A",
+      "real_id": "2db3b251-98fd-4c38-af68-9b9ea76395d7"
+    },
+    "fbp-041": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "5512840c-db2a-4d7a-95b8-25a2f65b2393"
+    },
+    "fbp-042": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "605836f4-cc42-46c6-ba16-89cedc1d63d3"
+    },
+    "fbp-043": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "1791c853-e893-4cd2-b20d-787b8bdfdec2"
+    },
+    "fbp-044": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "22e7ff01-a351-407c-8726-0a80720c2689"
+    },
+    "fbp-045": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "371a1a6c-b608-48b9-9c07-aed1d5bcbfce"
+    },
+    "fbp-046": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-001",
+      "arm": "B",
+      "real_id": "03dc3e94-1d3e-4a9c-b26d-fb6a794c4d7b"
+    },
+    "fbp-047": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-015",
+      "arm": "A",
+      "real_id": "52999a5e-07be-4bdb-bbc7-1d47201c86c6"
+    },
+    "fbp-048": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "256a0884-09e6-49f5-8d3c-3c25867d4065"
+    },
+    "fbp-049": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-015",
+      "arm": "B",
+      "real_id": "d454efc2-a806-4567-8d19-ef1093258804"
+    },
+    "fbp-050": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-015",
+      "arm": "A",
+      "real_id": "e004ee64-3574-4d96-89ea-58949225b6ee"
+    },
+    "fbp-051": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "0c07edfa-1067-4c21-9080-c9ed9a16b3d1"
+    },
+    "fbp-052": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-001",
+      "arm": "A",
+      "real_id": "20bb7ab9-c143-40f1-acfd-3b1f21700485"
+    },
+    "fbp-053": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "A",
+      "real_id": "16a6392f-23a3-4a06-a7fc-f6ad8dfcccf7"
+    },
+    "fbp-054": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-015",
+      "arm": "A",
+      "real_id": "e9f81b90-9122-4e67-bc47-87c3bf26b0dd"
+    },
+    "fbp-055": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "B",
+      "real_id": "27b19267-da9b-4d78-9265-8fb4a7283488"
+    },
+    "fbp-056": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-013",
+      "arm": "B",
+      "real_id": "c8800f5f-c80b-4a84-89b5-1877392edbcd"
+    },
+    "fbp-057": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "96cd0b0d-f730-4640-a431-ac3142b3d9ca"
+    },
+    "fbp-058": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-024",
+      "arm": "B",
+      "real_id": "12b1b4f2-056d-43ec-a333-77617d79ff2f"
+    },
+    "fbp-059": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-013",
+      "arm": "B",
+      "real_id": "54358a4f-5a94-4427-ad4a-7054fbfe6dd1"
+    },
+    "fbp-060": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-015",
+      "arm": "B",
+      "real_id": "32f813db-f088-47a9-b147-7f7b8404ad03"
+    },
+    "fbp-061": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-001",
+      "arm": "B",
+      "real_id": "9ce80fa7-7839-48dd-bdde-eb620adc8763"
+    },
+    "fbp-062": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-015",
+      "arm": "A",
+      "real_id": "8a9388fc-1dce-4f58-b41b-aecda7386341"
+    },
+    "fbp-063": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "c7025530-45e3-41b2-88a9-23a267ae759c"
+    },
+    "fbp-064": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "A",
+      "real_id": "5b185d66-05bb-4d97-b104-c5d611195e08"
+    },
+    "fbp-065": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "B",
+      "real_id": "c26b9cba-794d-4e6b-b7e0-8137e578cd12"
+    },
+    "fbp-066": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "63a3805f-911a-42ae-a5ce-11d56b193475"
+    },
+    "fbp-067": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "99650670-b058-4557-afae-7aedf0c41ea8"
+    },
+    "fbp-068": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "ab17d4c0-b0d2-4336-a724-5faa5cfd638f"
+    },
+    "fbp-069": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-015",
+      "arm": "A",
+      "real_id": "6af25682-d74e-410e-9f38-0e3652bc7355"
+    },
+    "fbp-070": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-001",
+      "arm": "A",
+      "real_id": "86e49637-15ab-4f20-ab35-3d5413a3103b"
+    },
+    "fbp-071": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "60e7605a-272e-456a-88c0-7dbcf69288dc"
+    },
+    "fbp-072": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "B",
+      "real_id": "e3f6cc67-514b-4e36-9122-0c4390ea619e"
+    },
+    "fbp-073": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-001",
+      "arm": "A",
+      "real_id": "2c1f621c-e5ca-4743-adde-628c3fc41fe2"
+    },
+    "fbp-074": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "ea039916-99a8-478a-9eb0-a567eb029c5f"
+    },
+    "fbp-075": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "0d09a47c-580c-4d20-8d53-fea807e6b2da"
+    },
+    "fbp-076": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-013",
+      "arm": "A",
+      "real_id": "4e82bf61-0cba-40d8-8418-3f3b329a6509"
+    },
+    "fbp-077": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "3c2e98c3-4be0-4c8d-af75-50076311dafa"
+    },
+    "fbp-078": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "1f15a8e2-0103-439d-98d8-686f771558df"
+    },
+    "fbp-079": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "166f7b31-e61c-4481-bd16-9ab7b3113e4f"
+    },
+    "fbp-080": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "0f4cc24b-67a3-4f27-a209-dd286593dc61"
+    },
+    "fbp-081": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-019",
+      "arm": "A",
+      "real_id": "7cd2f521-6872-48fb-b262-b032d1e384ba"
+    },
+    "fbp-082": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "A",
+      "real_id": "f3b1bdb4-e33f-40f3-bbd5-4d419485744a"
+    },
+    "fbp-083": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "7404f4da-5a69-4918-9e04-db9d9267fbac"
+    },
+    "fbp-084": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "6c154d23-82cc-4217-9e26-a4bf87dab71a"
+    },
+    "fbp-085": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-001",
+      "arm": "B",
+      "real_id": "83e61f67-2964-45b5-b2d8-b02508715604"
+    },
+    "fbp-086": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-015",
+      "arm": "A",
+      "real_id": "9fda3835-781a-4d22-9a44-293a10aa257d"
+    },
+    "fbp-087": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-001",
+      "arm": "B",
+      "real_id": "57552fae-f5d5-4c05-b02c-17fe1d41fe97"
+    },
+    "fbp-088": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-013",
+      "arm": "B",
+      "real_id": "114cbc16-b97f-459d-8d46-af8895c28688"
+    },
+    "fbp-089": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-015",
+      "arm": "B",
+      "real_id": "fc0b837a-e9e9-44aa-b5e7-c4cb72768bee"
+    },
+    "fbp-090": {
+      "unit_type": "idea",
+      "topic_id": "pe2e-007",
+      "arm": "B",
+      "real_id": "aaf49b17-83b8-4639-8ca4-b0db50bd586c"
+    },
+    "fbp-091": {
+      "unit_type": "gap",
+      "topic_id": "pe2e-024",
+      "arm": "A",
+      "real_id": "f9407186-bf14-4af0-b533-1358a716b899"
+    }
+  }
+}

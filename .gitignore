@@ -57,7 +57,37 @@ yarn-error.log*
 
 # ===== Eval harness (benchmark clones, downloaded data, run outputs) =====
 backend/eval/benchmarks/
-backend/eval_results/
+
+# eval_results: raw run outputs stay out of the repo, but the conclusion
+# artefacts (reports + the small adjudication/verdict files they are derived
+# from) are checked in, otherwise the README's findings cannot be verified by
+# anyone reading the repository.
+#
+# The directory itself must be re-included with /* and then re-ignored
+# wholesale, because git cannot descend into an ignored directory to honour a
+# nested negation. What is allowed back is then listed explicitly.
+backend/eval_results/*
+# Whitelist the three directories whose conclusions the README cites.
+!backend/eval_results/neighbor_budget/
+!backend/eval_results/fixed_budget_pilot/
+!backend/eval_results/v7_replay_pilot/
+# Inside them, ignore everything, then let the report/doc artefacts back in.
+backend/eval_results/neighbor_budget/*
+!backend/eval_results/neighbor_budget/*.md
+!backend/eval_results/neighbor_budget/*.json
+!backend/eval_results/neighbor_budget/*.jsonl
+backend/eval_results/fixed_budget_pilot/*
+!backend/eval_results/fixed_budget_pilot/*.md
+!backend/eval_results/fixed_budget_pilot/*.json
+backend/eval_results/v7_replay_pilot/*
+!backend/eval_results/v7_replay_pilot/*.md
+!backend/eval_results/v7_replay_pilot/*.json
+
+# guard: one-off scratch scripts and oversized raw dumps never come back in
+backend/eval_results/neighbor_budget/_*.txt
+backend/eval_results/**/*.bak
+backend/eval_results/**/*.db
+backend/eval_results/**/*.log
 
 # ===== Paper assets (downloaded PDFs / images) =====
 paper_assets/

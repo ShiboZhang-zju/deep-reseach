@@ -1,0 +1,343 @@
+{
+  "generated_at": "2026-10-29T06:58:26.092659+00:00",
+  "reporting_protocol": {
+    "pre_registered": "2026-09-21",
+    "layer_1_this_report": "Opportunity Discovery Quality (full-jury audit)",
+    "layer_2_deferred": "Production System Value (fixed-budget v6 vs v7 policy) — separate future experiment; do NOT headline-compare v7 full-jury surviving vs v6 budgeted surviving",
+    "more_search_rule": "at most one remediation re-audit, then terminal=inconclusive",
+    "pilot_gate": "GO iff >=1 v7-only opportunity is human-true AND yields a credible idea AND new opportunities are not mostly false-open; 6 topics decide GO/NO-GO only, not per-type deletion"
+  },
+  "topics_completed": 6,
+  "topics_errored": 0,
+  "topics_stale_excluded": [],
+  "topics_errored_ids": [],
+  "db_consistency": {
+    "checked": true,
+    "ok": true,
+    "mismatches": [],
+    "note": "record snapshots vs live DB counts; a mismatch means the record is stale and the report must not be used"
+  },
+  "q1_v7_only_recall": {
+    "v7_candidates_total": 35,
+    "v7_only_new": 30,
+    "note": "recall of the search space only — does not by itself prove v7 is better, nor is it cluster-adjusted (see cross_type_clusters)"
+  },
+  "q2_marginal_opportunity_precision": "PENDING blind human adjudication (true gap / adjudicated v7-only)",
+  "q3_marginal_credible_idea_yield": "PENDING blind human adjudication (v7-only ∩ human-true ∩ credible idea)",
+  "q4_per_type_funnel": {
+    "contradiction": {
+      "new": 4,
+      "audited": 4,
+      "inconclusive": 1,
+      "surviving": 3,
+      "rejected": 0,
+      "other_status": 0,
+      "surviving_self_report": 1,
+      "surviving_mechanical_override": 2,
+      "true_gap": null,
+      "false_open": null,
+      "credible_idea": null
+    },
+    "missing_evaluation": {
+      "new": 3,
+      "audited": 3,
+      "inconclusive": 2,
+      "surviving": 1,
+      "rejected": 0,
+      "other_status": 0,
+      "surviving_self_report": 0,
+      "surviving_mechanical_override": 1,
+      "true_gap": null,
+      "false_open": null,
+      "credible_idea": null
+    },
+    "untested_assumption": {
+      "new": 3,
+      "audited": 3,
+      "inconclusive": 0,
+      "surviving": 3,
+      "rejected": 0,
+      "other_status": 0,
+      "surviving_self_report": 2,
+      "surviving_mechanical_override": 1,
+      "true_gap": null,
+      "false_open": null,
+      "credible_idea": null
+    },
+    "scaling_regime": {
+      "new": 7,
+      "audited": 7,
+      "inconclusive": 2,
+      "surviving": 4,
+      "rejected": 1,
+      "other_status": 0,
+      "surviving_self_report": 2,
+      "surviving_mechanical_override": 2,
+      "true_gap": null,
+      "false_open": null,
+      "credible_idea": null
+    },
+    "boundary_gap": {
+      "new": 4,
+      "audited": 4,
+      "inconclusive": 2,
+      "surviving": 2,
+      "rejected": 0,
+      "other_status": 0,
+      "surviving_self_report": 1,
+      "surviving_mechanical_override": 1,
+      "true_gap": null,
+      "false_open": null,
+      "credible_idea": null
+    },
+    "mechanism_gap": {
+      "new": 5,
+      "audited": 5,
+      "inconclusive": 0,
+      "surviving": 5,
+      "rejected": 0,
+      "other_status": 0,
+      "surviving_self_report": 2,
+      "surviving_mechanical_override": 3,
+      "true_gap": null,
+      "false_open": null,
+      "credible_idea": null
+    },
+    "cross_domain_transfer": {
+      "new": 4,
+      "audited": 4,
+      "inconclusive": 1,
+      "surviving": 2,
+      "rejected": 1,
+      "other_status": 0,
+      "surviving_self_report": 1,
+      "surviving_mechanical_override": 1,
+      "true_gap": null,
+      "false_open": null,
+      "credible_idea": null
+    }
+  },
+  "q5_marginal_cost": {
+    "first_sweep_audited": 6,
+    "pending_sweep_audited": 1,
+    "mining_llm_calls": 42,
+    "mining_seconds": 1067.8,
+    "audit_seconds": 1818.7
+  },
+  "q6_survival_basis_2x2": {
+    "note": "surviving gaps split by the gate that admitted them; mechanical_override = auditor self-reported low novelty and the claim-coverage matrix overrode it upward. Rates are per candidate, so they are comparable across arms.",
+    "counts": {
+      "v6": {
+        "surviving_total": 6,
+        "self_report": 4,
+        "mechanical_override": 2,
+        "provisional": 0,
+        "unknown": 0
+      },
+      "v7": {
+        "surviving_total": 23,
+        "self_report": 11,
+        "mechanical_override": 12,
+        "provisional": 0,
+        "unknown": 0
+      },
+      "v7_only": {
+        "surviving_total": 20,
+        "self_report": 9,
+        "mechanical_override": 11,
+        "provisional": 0,
+        "unknown": 0
+      }
+    },
+    "rates": {
+      "v6": {
+        "candidates": 20,
+        "surviving_rate": 0.3,
+        "self_report_rate": 0.2,
+        "mechanical_override_rate": 0.1
+      },
+      "v7": {
+        "candidates": 35,
+        "surviving_rate": 0.657,
+        "self_report_rate": 0.314,
+        "mechanical_override_rate": 0.343
+      },
+      "v7_only": {
+        "candidates": 30,
+        "surviving_rate": 0.667,
+        "self_report_rate": 0.3,
+        "mechanical_override_rate": 0.367
+      }
+    },
+    "decomposition": {
+      "delta_surviving_rate": 0.357,
+      "delta_from_self_report": 0.114,
+      "delta_from_mechanical_override": 0.243,
+      "mechanical_share_of_gain": 0.681
+    },
+    "interpretation_rule": "the ontology claim requires delta_from_self_report > 0; a gain concentrated in delta_from_mechanical_override belongs to the audit gate, not to the 7-lens ontology"
+  },
+  "q7_p2_relevance_floor_counterfactual": {
+    "enabled": true,
+    "floor": 0.3,
+    "mechanical_floor": 0.5,
+    "override_traces_found": 14,
+    "arms": {
+      "v6": {
+        "candidates": 20,
+        "surviving_now": 6,
+        "surviving_after": 6,
+        "surviving_rate_now": 0.3,
+        "surviving_rate_after": 0.3,
+        "rate_delta": 0.0
+      },
+      "v7": {
+        "candidates": 35,
+        "surviving_now": 23,
+        "surviving_after": 16,
+        "surviving_rate_now": 0.657,
+        "surviving_rate_after": 0.457,
+        "rate_delta": -0.2
+      }
+    },
+    "dropped": [
+      {
+        "topic_id": "pe2e-013",
+        "arm": "v7",
+        "gap_id": "a1e42604-269b-42a5-9361-de01199e04ce",
+        "gap_type": "boundary_gap",
+        "novelty_after_floor": null,
+        "neighbor_relevance_median": null
+      },
+      {
+        "topic_id": "pe2e-013",
+        "arm": "v7",
+        "gap_id": "25ad78d6-7b07-444b-8fca-6c99146ea16d",
+        "gap_type": "untested_assumption",
+        "novelty_after_floor": null,
+        "neighbor_relevance_median": null
+      },
+      {
+        "topic_id": "pe2e-015",
+        "arm": "v7",
+        "gap_id": "8d850e70-6e54-4bef-8f39-593e0f81a041",
+        "gap_type": "mechanism_gap",
+        "novelty_after_floor": null,
+        "neighbor_relevance_median": null
+      },
+      {
+        "topic_id": "pe2e-019",
+        "arm": "v7",
+        "gap_id": "67841a4b-b7bc-4a21-a6ab-954861052e08",
+        "gap_type": "contradiction",
+        "novelty_after_floor": null,
+        "neighbor_relevance_median": null
+      },
+      {
+        "topic_id": "pe2e-019",
+        "arm": "v7",
+        "gap_id": "362a0f37-d5f5-45e3-9503-265d16f4a86c",
+        "gap_type": "untested_assumption",
+        "novelty_after_floor": null,
+        "neighbor_relevance_median": null
+      },
+      {
+        "topic_id": "pe2e-019",
+        "arm": "v7",
+        "gap_id": "39894da5-d710-46e6-82ef-23d6b318bd13",
+        "gap_type": "scaling_regime",
+        "novelty_after_floor": null,
+        "neighbor_relevance_median": null
+      },
+      {
+        "topic_id": "pe2e-019",
+        "arm": "v7",
+        "gap_id": "4e409776-412c-44a3-90f8-881b3529d98d",
+        "gap_type": "cross_domain_transfer",
+        "novelty_after_floor": null,
+        "neighbor_relevance_median": null
+      }
+    ],
+    "n_dropped": 7,
+    "note": "gaps admitted by self-report or provisional survive are unaffected by construction; only the mechanical override is gated by the relevance floor. A removed judgment can be a PARTIAL, so novelty may RISE for some gaps (observed: one gap 0.75 -> 0.88) — that is correct: an irrelevant neighbour's claim of partial coverage was never evidence, and dropping it leaves the claim genuinely uncovered."
+  },
+  "cross_type_clusters": {
+    "raw_opportunities": 30,
+    "clusters": 29,
+    "cluster_compression": 1.03,
+    "borderline_pairs": [
+      {
+        "pair": [
+          "59c18e90-7f59-490e-939c-9114242a269b",
+          "ca495ca2-a876-455e-9bbc-524dbf97692a"
+        ],
+        "types": [
+          "scaling_regime",
+          "scaling_regime"
+        ],
+        "similarity": 0.71,
+        "deltas": [
+          "Identifies the specific context length threshold where zero-shot inference fails compared to fine-tuned approaches, isol",
+          "Determines if the 'scaling law' of test-time compute holds for long contexts, or if a regime boundary exists around 10K "
+        ]
+      },
+      {
+        "pair": [
+          "56bdadfa-d337-4e91-8cf7-4d419ec9dd31",
+          "ca495ca2-a876-455e-9bbc-524dbf97692a"
+        ],
+        "types": [
+          "scaling_regime",
+          "scaling_regime"
+        ],
+        "similarity": 0.723,
+        "deltas": [
+          "Identifies the specific compute threshold (e.g., >500 token generations per query) where adaptive strategies cease to im",
+          "Determines if the 'scaling law' of test-time compute holds for long contexts, or if a regime boundary exists around 10K "
+        ]
+      },
+      {
+        "pair": [
+          "db131a6d-ad77-4ba7-9fc7-c9eb26905fa0",
+          "4e409776-412c-44a3-90f8-881b3529d98d"
+        ],
+        "types": [
+          "untested_assumption",
+          "cross_domain_transfer"
+        ],
+        "similarity": 0.738,
+        "deltas": [
+          "Introducing a causal-relevance filter for retrieval reduces hallucination rates in scientific hypothesis generation by >",
+          "Shifts the paradigm from 'knowledge retrieval and synthesis' to 'causal structure learning', reducing hallucination rate"
+        ]
+      },
+      {
+        "pair": [
+          "4e409776-412c-44a3-90f8-881b3529d98d",
+          "63393e70-74f9-4b85-a6f7-5a2047115471"
+        ],
+        "types": [
+          "cross_domain_transfer",
+          "cross_domain_transfer"
+        ],
+        "similarity": 0.702,
+        "deltas": [
+          "Shifts the paradigm from 'knowledge retrieval and synthesis' to 'causal structure learning', reducing hallucination rate",
+          "Transforms hypothesis generation from a passive retrieval/synthesis task to an active experimental design task, reducing"
+        ]
+      }
+    ],
+    "method": "production embedding, union-find at cosine>=0.78"
+  },
+  "v6_totals_context": {
+    "gap_candidates": 20,
+    "surviving": 6,
+    "ideas": 33,
+    "note": "budgeted-production terminal state — context only, not a like-for-like comparator for the v7 full-jury funnel"
+  },
+  "pending_human_steps": [
+    "blind prior-art audit of v7_only_opportunities.jsonl (human_prior_art_verdict: FULL / PARTIAL / NONE)",
+    "record mechanical-vs-self-reported novelty disagreements as a 2x2 against the human verdict (fields already on each row)",
+    "fill q2/q3/q4 human columns, then freeze the report"
+  ]
+}

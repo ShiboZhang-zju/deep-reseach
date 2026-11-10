@@ -1,0 +1,30 @@
+{
+  "warning": "SEALED until verdicts are written.",
+  "note": "Out-of-sample topics: never used to derive the conjunction rule or the 46% PARTIAL figure.",
+  "units": {
+    "val-001": {
+      "topic_id": "pe2e-003",
+      "gap_id": "c20c632d-d836-416d-bf30-3bb4ca075f29"
+    },
+    "val-002": {
+      "topic_id": "pe2e-008",
+      "gap_id": "82dee03f-7e0b-4e80-8d04-610d89f566bc"
+    },
+    "val-003": {
+      "topic_id": "pe2e-008",
+      "gap_id": "10d51d39-f7c2-497b-8716-4671995e75b6"
+    },
+    "val-004": {
+      "topic_id": "pe2e-008",
+      "gap_id": "47c7eda1-0d0c-4620-bfd5-3988d2ae9265"
+    },
+    "val-005": {
+      "topic_id": "pe2e-008",
+      "gap_id": "25a4b9af-d449-4e95-95c7-9f5a4030c345"
+    },
+    "val-006": {
+      "topic_id": "pe2e-003",
+      "gap_id": "c47b93e6-a436-4ef7-aee6-b4b48a010aab"
+    }
+  }
+}

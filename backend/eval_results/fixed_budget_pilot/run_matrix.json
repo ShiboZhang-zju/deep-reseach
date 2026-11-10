@@ -1,0 +1,325 @@
+{
+  "experiment": "v7.2 fixed-budget production value pilot",
+  "design_doc": "EXPERIMENT_DESIGN.md (frozen 2026-10-31, before any run)",
+  "created_at": "2026-10-31",
+  "arms": {
+    "A": {
+      "service_port": 8001,
+      "mining_policy": "opportunity-ontology-v7.2",
+      "env": {}
+    },
+    "B": {
+      "service_port": 8002,
+      "mining_policy": "evidence-admission-v6-exp",
+      "env": {
+        "GAP_MINING_LEGACY_V6_MODE": "true"
+      }
+    }
+  },
+  "shared_config": {
+    "budgeted_audit": true,
+    "max_gaps_to_deep_audit": 2,
+    "max_remediation_rounds_total": 3,
+    "db": "shared deep_research.db (WAL)"
+  },
+  "run_order": [
+    {
+      "run": 1,
+      "topic_id": "pe2e-001",
+      "stratum": "narrow_mature",
+      "topic": "Context compression for retrieval-augmented generation with long documents",
+      "arm_order": [
+        "B",
+        "A"
+      ],
+      "task_ids": {
+        "B": "3d954c12-d799-4c07-b5a8-a905089220c5",
+        "A": "94d9f66d-44a8-4738-833d-48ef66f908ba"
+      },
+      "outcomes": {
+        "B": {
+          "status": "more_research_required",
+          "stop_reason": "no_intervention_passed_hard_gates",
+          "papers": 254,
+          "gaps": {
+            "boundary_gap/candidate": 1,
+            "boundary_gap/confirmed_runner_up": 2,
+            "boundary_gap/surviving": 1,
+            "missing_evaluation/confirmed_runner_up": 1
+          },
+          "ideas": {}
+        },
+        "A": {
+          "status": "waiting_for_user_review",
+          "stop_reason": "evidence_grounded_ideas_ready",
+          "papers": 270,
+          "gaps": {
+            "boundary_gap/confirmed_runner_up": 1,
+            "boundary_gap/surviving": 1,
+            "cross_domain_transfer/candidate": 1,
+            "mechanism_gap/candidate": 2,
+            "missing_evaluation/candidate": 1,
+            "scaling_regime/candidate": 1,
+            "untested_assumption/candidate": 2
+          },
+          "ideas": {
+            "executable_candidate": 1,
+            "research_direction_only": 3
+          }
+        }
+      }
+    },
+    {
+      "run": 2,
+      "topic_id": "pe2e-007",
+      "stratum": "narrow_mature",
+      "topic": "Position bias (lost-in-the-middle) in long-context language models",
+      "arm_order": [
+        "A",
+        "B"
+      ],
+      "task_ids": {
+        "A": "3f927d03-82eb-4459-a498-1489556fc490",
+        "B": "d2c57b7c-94db-4c66-bd46-5072be72b1d9"
+      },
+      "outcomes": {
+        "A": {
+          "status": "waiting_for_user_review",
+          "stop_reason": "evidence_grounded_ideas_ready",
+          "papers": 204,
+          "gaps": {
+            "boundary_gap/candidate": 2,
+            "contradiction/candidate": 1,
+            "cross_domain_transfer/inconclusive": 1,
+            "cross_domain_transfer/surviving": 1,
+            "mechanism_gap/candidate": 1,
+            "missing_evaluation/candidate": 2,
+            "scaling_regime/candidate": 2,
+            "untested_assumption/candidate": 2
+          },
+          "ideas": {
+            "executable_candidate": 1,
+            "research_direction_only": 9
+          }
+        },
+        "B": {
+          "status": "abstained",
+          "stop_reason": "no_minimal_experiment_generated",
+          "papers": 303,
+          "gaps": {
+            "boundary_gap/candidate": 3,
+            "boundary_gap/confirmed_runner_up": 2,
+            "boundary_gap/surviving": 1,
+            "missing_evaluation/confirmed_runner_up": 2,
+            "missing_evaluation/inconclusive": 1
+          },
+          "ideas": {
+            "conditional_review": 2,
+            "research_direction_only": 3
+          }
+        }
+      }
+    },
+    {
+      "run": 3,
+      "topic_id": "pe2e-013",
+      "stratum": "emerging_sparse",
+      "topic": "Test-time training for adaptive inference in language models",
+      "arm_order": [
+        "A",
+        "B"
+      ],
+      "task_ids": {
+        "A": "e30125bc-eb3f-459f-86d3-45c43ef94f4d",
+        "B": "17859054-93fb-4595-9926-f6999ecd0beb"
+      },
+      "outcomes": {
+        "A": {
+          "status": "waiting_for_user_review",
+          "stop_reason": "evidence_grounded_ideas_ready",
+          "papers": 315,
+          "gaps": {
+            "boundary_gap/candidate": 2,
+            "contradiction/candidate": 1,
+            "cross_domain_transfer/surviving": 1,
+            "scaling_regime/candidate": 2,
+            "untested_assumption/candidate": 1,
+            "untested_assumption/confirmed_runner_up": 1
+          },
+          "ideas": {
+            "executable_candidate": 2,
+            "research_direction_only": 6
+          }
+        },
+        "B": {
+          "status": "more_research_required",
+          "stop_reason": "no_intervention_passed_hard_gates",
+          "papers": 379,
+          "gaps": {
+            "boundary_gap/candidate": 1,
+            "boundary_gap/confirmed_runner_up": 1,
+            "boundary_gap/surviving": 1,
+            "missing_evaluation/candidate": 1,
+            "missing_evaluation/inconclusive": 1
+          },
+          "ideas": {
+            "research_direction_only": 1
+          }
+        }
+      }
+    },
+    {
+      "run": 4,
+      "topic_id": "pe2e-015",
+      "stratum": "emerging_sparse",
+      "topic": "Mechanistic interpretability of mixture-of-experts routing decisions",
+      "arm_order": [
+        "B",
+        "A"
+      ],
+      "task_ids": {
+        "B": "37a7e83d-fa69-4b6a-bbf3-909a5fc3930b",
+        "A": "21b2f97a-11c3-42d1-b68e-0f72237ed426"
+      },
+      "outcomes": {
+        "B": {
+          "status": "more_research_required",
+          "stop_reason": "no_intervention_passed_hard_gates",
+          "papers": 415,
+          "gaps": {
+            "boundary_gap/candidate": 1,
+            "boundary_gap/confirmed_runner_up": 3,
+            "missing_evaluation/confirmed_runner_up": 1,
+            "missing_evaluation/surviving": 1
+          },
+          "ideas": {}
+        },
+        "A": {
+          "status": "waiting_for_user_review",
+          "stop_reason": "evidence_grounded_ideas_ready",
+          "papers": 325,
+          "gaps": {
+            "boundary_gap/candidate": 2,
+            "contradiction/candidate": 1,
+            "cross_domain_transfer/candidate": 1,
+            "mechanism_gap/candidate": 2,
+            "missing_evaluation/candidate": 2,
+            "scaling_regime/candidate": 1,
+            "scaling_regime/surviving": 1,
+            "untested_assumption/confirmed_runner_up": 1
+          },
+          "ideas": {
+            "executable_candidate": 2,
+            "research_direction_only": 4
+          }
+        }
+      }
+    },
+    {
+      "run": 5,
+      "topic_id": "pe2e-019",
+      "stratum": "broad_ambiguous",
+      "topic": "How to improve the scientific discovery capability of large language models",
+      "arm_order": [
+        "A",
+        "B"
+      ],
+      "task_ids": {
+        "A": "7020b582-d43d-4f34-ac1c-8e4435c15e0e",
+        "B": "75bd0f55-1796-490d-90f3-c807d406c990"
+      },
+      "outcomes": {
+        "A": {
+          "status": "waiting_for_user_review",
+          "stop_reason": "evidence_grounded_ideas_ready",
+          "papers": 350,
+          "gaps": {
+            "boundary_gap/candidate": 2,
+            "contradiction/candidate": 2,
+            "cross_domain_transfer/candidate": 1,
+            "cross_domain_transfer/confirmed_runner_up": 1,
+            "mechanism_gap/candidate": 2,
+            "scaling_regime/candidate": 2,
+            "untested_assumption/surviving": 1
+          },
+          "ideas": {
+            "executable_candidate": 2,
+            "research_direction_only": 3
+          }
+        },
+        "B": {
+          "status": "waiting_for_user_review",
+          "stop_reason": "evidence_grounded_ideas_ready",
+          "papers": 152,
+          "gaps": {
+            "boundary_gap/confirmed_runner_up": 1,
+            "boundary_gap/surviving": 1,
+            "missing_evaluation/candidate": 1
+          },
+          "ideas": {
+            "executable_candidate": 2,
+            "research_direction_only": 3
+          }
+        }
+      }
+    },
+    {
+      "run": 6,
+      "topic_id": "pe2e-024",
+      "stratum": "broad_ambiguous",
+      "topic": "General-purpose uncertainty quantification for deep learning",
+      "arm_order": [
+        "B",
+        "A"
+      ],
+      "task_ids": {
+        "B": "128fb689-add1-49e9-9633-f30a6b27884f",
+        "A": "c7d866e6-dd6c-450b-ae0a-f9d53217a7af"
+      },
+      "outcomes": {
+        "B": {
+          "status": "more_research_required",
+          "stop_reason": "no_intervention_passed_hard_gates",
+          "papers": 356,
+          "gaps": {
+            "boundary_gap/candidate": 1,
+            "boundary_gap/inconclusive": 1,
+            "missing_evaluation/confirmed_runner_up": 1,
+            "missing_evaluation/inconclusive": 2,
+            "missing_evaluation/surviving": 1
+          },
+          "ideas": {
+            "research_direction_only": 3
+          }
+        },
+        "A": {
+          "status": "waiting_for_user_review",
+          "stop_reason": "evidence_grounded_ideas_ready",
+          "papers": 303,
+          "gaps": {
+            "boundary_gap/candidate": 1,
+            "boundary_gap/confirmed_runner_up": 1,
+            "contradiction/candidate": 1,
+            "cross_domain_transfer/candidate": 1,
+            "mechanism_gap/candidate": 2,
+            "scaling_regime/candidate": 2,
+            "untested_assumption/candidate": 1,
+            "untested_assumption/surviving": 1
+          },
+          "ideas": {
+            "conditional_review": 1,
+            "executable_candidate": 1,
+            "research_direction_only": 5
+          }
+        }
+      }
+    }
+  ],
+  "notes": [
+    "Arm order was fixed in EXPERIMENT_DESIGN.md before any run started.",
+    "task_ids are filled in as runs start; this file is the run log of record.",
+    "Interruption rule (design 7.5): a run ending in an engineering failure",
+    "(failed / stuck phase, not an honest abstain) invalidates its PAIR -",
+    "fix, then re-run both arms of that topic."
+  ]
+}

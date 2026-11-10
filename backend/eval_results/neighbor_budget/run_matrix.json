@@ -1,0 +1,515 @@
+{
+  "experiment": "neighbour-budget contrast (3 vs 8)",
+  "design_doc": "EXPERIMENT_DESIGN.md (frozen 2026-11-03, before any run)",
+  "created_at": "2026-11-03",
+  "arms": {
+    "C": {
+      "service_port": 8001,
+      "env": {
+        "AUDIT_NEIGHBORS_OVERRIDE": "0",
+        "RECOVER_TASKS_ON_STARTUP": "false"
+      },
+      "expected_neighbors": 3
+    },
+    "D": {
+      "service_port": 8002,
+      "env": {
+        "AUDIT_NEIGHBORS_OVERRIDE": "8",
+        "RECOVER_TASKS_ON_STARTUP": "false"
+      },
+      "expected_neighbors": 8
+    }
+  },
+  "shared_config": {
+    "gap_audit_budgeted": true,
+    "queries": 4,
+    "candidates": 10,
+    "fulltext": 4,
+    "killer_queries": 3,
+    "gap_relevance_min_neighbor": 0.3,
+    "audit_corpus_recall_enabled": true,
+    "audit_screen_before_cap": true,
+    "gap_audit_disabled_ablation": false,
+    "db": "shared deep_research.db (WAL)",
+    "note": "config verified per-process via GET /experiment-config on both ports; only `neighbors` differs (3 vs 8)"
+  },
+  "aborted_runs": [
+    {
+      "pair": "pe2e-001 pair 1",
+      "reason": "engineering: services restarted to load RECOVER_TASKS_ON_STARTUP=false (guard against cross-arm task recovery). Tasks were 3 minutes into search_round_1 and their driving process had already exited.",
+      "armC_task_id": "1b2c6545-9f01-4faf-9689-b84b2d895768",
+      "armD_task_id": "dfb9b6c8-dff4-4ed7-8231-5774f12316ad",
+      "counted_in_metrics": false,
+      "protocol_clause": "7.5 interruption rule — engineering failures are excluded from metrics and the pair is re-run"
+    },
+    {
+      "pair": "pe2e-001 pair 2",
+      "reason": "INVALID — treatment not delivered. Audit traces show limit=8 but selected=2 and selected=5, cap_bound=False, candidate_pool_size=10. Root cause: select_gap_specific_neighbors ranked only query-mapped papers and its fallback walked only collect_same_question_neighbors, so corpus-recall hits could enter the pool but never be SELECTED. Fixed in audit_gaps.py + tests/test_neighbor_selection_from_recall.py (4 tests fail before the fix, pass after).",
+      "secondary_reason": "arm C failed readiness: extract_evidence_round_1 never completed (running 8+ min vs arm D 5 min) while both arms ran concurrently, so no coverage snapshot existed -> readiness_failed after 12 retries. Concurrent execution on one SQLite DB with EVIDENCE_EXTRACT_CONCURRENCY=4 per task is the suspected cause.",
+      "armC_task_id": "5bc9c7af-71b7-42b0-b804-73852fa1433f",
+      "armD_task_id": "44a28777-d2e2-4061-9406-a7e651a98c88",
+      "counted_in_metrics": false,
+      "protocol_clause": "7.4 no-dose exclusion + 7.5 interruption rule"
+    },
+    {
+      "pair": "pe2e-013 arm C (operator error)",
+      "reason": "I started this arm while pe2e-007 arm C was still running, violating the sequential-execution rule recorded in 8.0(a). Two concurrent tasks on one service reproduced the exact contention failure the rule exists to prevent: extract_evidence_round_1 sat in `running` for 17+ min (normal ~5) and the uvicorn event loop became unresponsive (even /health and /api/debug/asyncio timed out). Task was stopped and its DB status set to `stopped`; it produced 0 gaps and contributes nothing.",
+      "root_cause": "scheduling discipline, not code: I polled with a 1800s wait that was cancelled by idle timeout, then acted on a stale reading and launched the next arm before confirming the previous one had finished.",
+      "armC_task_id": "5f840f4c-64c1-48b8-997d-e38860de1056",
+      "counted_in_metrics": false,
+      "consequence": "also forced a restart of the 8001 service, which interrupted pe2e-007 arm C mid-run (it had completed interventions + minimal experiments, then re-entered mine_gaps). That arm was resumed via /start and is being re-checked for completeness before it is accepted as a valid pair member."
+    }
+  ],
+  "run_order": [
+    {
+      "run": 1,
+      "topic_id": "pe2e-001",
+      "stratum": "narrow_mature",
+      "topic": "Context compression for retrieval-augmented generation with long documents",
+      "arm_order": [
+        "C",
+        "D"
+      ],
+      "task_ids": {
+        "C": "bd1365d1-46a5-4d37-acfd-df058f1ecc9d",
+        "D": "041d22e3-09e0-455e-8417-db1ef29a5551"
+      },
+      "outcomes": {
+        "C": {
+          "status": "waiting_for_user_review",
+          "final_round": 1,
+          "papers": 139,
+          "evidence": 164,
+          "gaps": 10,
+          "audits": 2,
+          "ideas": 12,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "uncertain",
+              "novelty": null,
+              "neighbors": 0
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.9400000000000001,
+              "neighbors": 3
+            }
+          ]
+        },
+        "D": {
+          "status": "waiting_for_user_review",
+          "final_round": 2,
+          "papers": 223,
+          "evidence": 425,
+          "gaps": 12,
+          "audits": 2,
+          "ideas": 4,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.74,
+              "neighbors": 8
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.78,
+              "neighbors": 8
+            }
+          ]
+        }
+      },
+      "dose_delivered": true,
+      "pair_valid": true
+    },
+    {
+      "run": 2,
+      "topic_id": "pe2e-007",
+      "stratum": "narrow_mature",
+      "topic": "Position bias (lost-in-the-middle) in long-context language models",
+      "arm_order": [
+        "D",
+        "C"
+      ],
+      "task_ids": {
+        "D": "202a5d20-2a3e-43fb-b16a-ec27c7877828",
+        "C": "7b2131f8-e6de-4fab-b5d2-18406fd7591b"
+      },
+      "outcomes": {
+        "D": {
+          "status": "waiting_for_user_review",
+          "final_round": 2,
+          "papers": 203,
+          "evidence": 509,
+          "gaps": 13,
+          "audits": 2,
+          "ideas": 10,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.82,
+              "neighbors": 8
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.55,
+              "neighbors": 8
+            }
+          ]
+        },
+        "C": {
+          "status": "waiting_for_user_review",
+          "final_round": 1,
+          "papers": 379,
+          "evidence": 379,
+          "gaps": 23,
+          "audits": 4,
+          "ideas": 23,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.42,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.42,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.9,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.8800000000000001,
+              "neighbors": 3
+            }
+          ]
+        }
+      },
+      "pair_valid": false,
+      "validity_note": "arm C was interrupted by my operator error mid-mine_gaps (concurrent launch of pe2e-013 C on the same service, event loop became unresponsive) and resumed via /start. It then mined 10 extra gaps (11->23) and ran remediation round 6. Doses are still correct on both arms (C 3/3 x4, D 8/8 x2) but arm C's work volume is inflated by the resume, so this pair is NOT comparable as a clean pair.",
+      "dose_delivered": true
+    },
+    {
+      "run": 3,
+      "topic_id": "pe2e-013",
+      "stratum": "emerging_sparse",
+      "topic": "Test-time training for adaptive inference in language models",
+      "arm_order": [
+        "C",
+        "D"
+      ],
+      "task_ids": {
+        "C": "94692b21-afaa-4fa4-a328-08d67ea944fe",
+        "D": "b26dffdd-d245-46fb-99e9-d7aa61e4005b"
+      },
+      "outcomes": {
+        "C": {
+          "status": "waiting_for_user_review",
+          "final_round": 2,
+          "papers": 348,
+          "evidence": 778,
+          "gaps": 16,
+          "audits": 4,
+          "ideas": 7,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "uncertain",
+              "novelty": 0.35,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.25,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.76,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.42,
+              "neighbors": 3
+            }
+          ]
+        },
+        "D": {
+          "status": "waiting_for_user_review",
+          "final_round": 2,
+          "papers": 267,
+          "evidence": 437,
+          "gaps": 11,
+          "audits": 2,
+          "ideas": 4,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.7,
+              "neighbors": 8
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.35,
+              "neighbors": 8
+            }
+          ]
+        }
+      },
+      "pair_valid": true,
+      "dose_delivered": true
+    },
+    {
+      "run": 4,
+      "topic_id": "pe2e-015",
+      "stratum": "emerging_sparse",
+      "topic": "Mechanistic interpretability of mixture-of-experts routing decisions",
+      "arm_order": [
+        "D",
+        "C"
+      ],
+      "task_ids": {
+        "D": "9fb83e25-790e-477b-9390-652e4e109814",
+        "C": "d873d7fe-af96-404b-853a-6867acfb328b"
+      },
+      "outcomes": {
+        "D": {
+          "status": "waiting_for_user_review",
+          "final_round": 1,
+          "papers": 243,
+          "evidence": 484,
+          "gaps": 7,
+          "audits": 2,
+          "ideas": 4,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.8,
+              "neighbors": 8
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.625,
+              "neighbors": 8
+            }
+          ]
+        },
+        "C": {
+          "status": "waiting_for_user_review",
+          "final_round": 1,
+          "papers": 412,
+          "evidence": 572,
+          "gaps": 14,
+          "audits": 6,
+          "ideas": 21,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.42,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.9,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.8800000000000001,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.7,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.9,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.5,
+              "neighbors": 3
+            }
+          ]
+        }
+      },
+      "pair_valid": true,
+      "dose_delivered": true
+    },
+    {
+      "run": 5,
+      "topic_id": "pe2e-019",
+      "stratum": "broad_ambiguous",
+      "topic": "How to improve the scientific discovery capability of large language models",
+      "arm_order": [
+        "C",
+        "D"
+      ],
+      "task_ids": {
+        "C": "a50e4f05-d4b6-46f3-80e4-8e235c845361",
+        "D": "cb51c8ba-94a1-4919-b61a-722cd1578a39"
+      },
+      "outcomes": {
+        "C": {
+          "status": "waiting_for_user_review",
+          "final_round": 1,
+          "papers": 223,
+          "evidence": 534,
+          "gaps": 10,
+          "audits": 2,
+          "ideas": 6,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.9,
+              "neighbors": 3
+            },
+            {
+              "result": "uncertain",
+              "novelty": 0.35,
+              "neighbors": 3
+            }
+          ]
+        },
+        "D": {
+          "status": "waiting_for_user_review",
+          "final_round": 1,
+          "papers": 168,
+          "evidence": 373,
+          "gaps": 9,
+          "audits": 2,
+          "ideas": 6,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.9,
+              "neighbors": 8
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.55,
+              "neighbors": 8
+            }
+          ]
+        }
+      },
+      "pair_valid": true,
+      "dose_delivered": true
+    },
+    {
+      "run": 6,
+      "topic_id": "pe2e-024",
+      "stratum": "broad_ambiguous",
+      "topic": "General-purpose uncertainty quantification for deep learning",
+      "arm_order": [
+        "D",
+        "C"
+      ],
+      "task_ids": {
+        "D": "b2fd220a-77ce-4288-b53a-a9fda1a4de23",
+        "C": "833aea15-d8aa-438a-8b88-a79a775c1853"
+      },
+      "outcomes": {
+        "D": {
+          "status": "waiting_for_user_review",
+          "final_round": 1,
+          "papers": 330,
+          "evidence": 677,
+          "gaps": 17,
+          "audits": 4,
+          "ideas": 18,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.42,
+              "neighbors": 8
+            },
+            {
+              "result": "uncertain",
+              "novelty": 0.35,
+              "neighbors": 8
+            },
+            {
+              "result": "uncertain",
+              "novelty": 0.35,
+              "neighbors": 8
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.7,
+              "neighbors": 8
+            }
+          ]
+        },
+        "C": {
+          "status": "waiting_for_user_review",
+          "final_round": 2,
+          "papers": 309,
+          "evidence": 860,
+          "gaps": 10,
+          "audits": 2,
+          "ideas": 7,
+          "dose_ok": true,
+          "audit_results": [
+            {
+              "result": "confirmed",
+              "novelty": 0.68,
+              "neighbors": 3
+            },
+            {
+              "result": "confirmed",
+              "novelty": 0.82,
+              "neighbors": 3
+            }
+          ]
+        }
+      },
+      "pair_valid": true,
+      "dose_delivered": true
+    }
+  ],
+  "execution_mode_change": {
+    "from": "concurrent (both arms started within 1s)",
+    "to": "sequential per pair (arm_order still randomised; arms no longer overlap in time)",
+    "why": "arm C hit readiness_failed with extract_evidence_round_1 stuck running while the other arm ran; overlapping runs contend for PDF/embedding concurrency and one arm silently loses a phase. Sequential execution preserves the single-variable design (neighbour count) while removing a resource-contention confound that is not part of the hypothesis.",
+    "cost": "wall-clock roughly doubles vs concurrent; accepted."
+  },
+  "protocol_addendum": {
+    "rule": "never start an arm until the paired arm's task status is terminal AND no other task on that service is non-terminal",
+    "why": "execution is concurrent across the two services but must be serial WITHIN a run pair; an unresponsive event loop is indistinguishable from a slow phase until it stops answering /health"
+  },
+  "work_asymmetry_finding": {
+    "pe2e-001": "arm D did more (round 2 vs round 1)",
+    "pe2e-007": "arm C did more (rounds 1+6 vs round 2)",
+    "interpretation": "asymmetry direction REVERSES across pairs, so it is not correlated with the treatment arm; it inflates variance but does not systematically bias delta T. This is the known unresolved issue from the no-audit protocol (10.1) and must be reported, not hidden.",
+    "mitigation_for_analysis": "report T as a rate over audited gaps with per-pair paired table; never compare raw idea/gap counts across arms"
+  },
+  "confound_correction": {
+    "what_protocol_6_3_predicted": "neighbour count up -> more coverage found -> novelty_confidence down -> _LOW_NOVELTY_CONFIRMED=0.4 triggers confirmed->uncertain DOWNGRADE, changing the downstream gap SET between arms",
+    "what_the_code_actually_does": {
+      "config": "gap_audit_budgeted=True AND audit_low_novelty_provisional_survive=True",
+      "path": "audit_gaps.py ~2341: when provisional_survive is on, a low-novelty confirmed does NOT become uncertain. It takes the LOW_NOVELTY_PROVISIONAL_SURVIVE branch: gap.status='surviving', failure code recorded, trace gap_audit_low_novelty_provisional_survive.",
+      "downstream": "generate_interventions._NOVELTY_CONFIDENCE_WARN_BELOW = 0.5 caps such a gap's interventions at tier B/conditional_review",
+      "verified": "gap_audit_low_novelty_downgrade traces = 0 in both arms of pe2e-013, despite confirmed nov=0.25 and 0.35; observations match this path"
+    },
+    "corrected_confound": "the confound is TIER ASSIGNMENT, not gap-set membership. Both arms keep the gap, but the treated arm's extra coverage lowers novelty and pushes more gaps under the 0.5 tier-A threshold.",
+    "consequence_for_analysis": "report (a) gap-set-level T, (b) tier distribution per arm, and (c) T restricted to gaps that cleared the 0.5 novelty warn line. The 6.3 requirement to report pre/post-downgrade T is MIS-SPECIFIED and is replaced by these three views; judgement rules in 7 are unchanged."
+  }
+}

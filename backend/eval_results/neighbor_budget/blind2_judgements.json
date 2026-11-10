@@ -1,0 +1,91 @@
+{
+  "_note": "Independent blind hand-judgement, round 2. Judged from unit content + evidence ONLY. v2 verdicts not consulted (blind2_key.json unopened until these were written). Pool excluded all 11 units whose v2 verdict I had already seen.",
+  "_rubric_used": "v2: (A) adjacency != coverage; NONE = no work tests the delta; PARTIAL = substantial part established under transferable conditions; FULL = delta established.",
+  "judged_at": "2026-11-09",
+  "judgements": {
+    "nb-002": {
+      "verdict": "NONE",
+      "delta_restated": "The validity range of the selection-frequency specialization proxy (where it decouples from causal expert importance) under increased balancing pressure is undocumented.",
+      "adjacent_work_exists": true,
+      "why": "Evidence shows frequency-based analysis, ablation studies, and negative ablation results as SEPARATE lines. No evidence unit tests the proxy's validity across balancing pressure levels. Adjacency is dense but the delta (the validity boundary) is untested."
+    },
+    "nb-012": {
+      "verdict": "NONE",
+      "delta_restated": "An isolated, token-budget-matched test of whether raising information density >20% changes faithfulness beyond measurement noise.",
+      "adjacent_work_exists": true,
+      "why": "Evidence covers compressor comparisons and the fact that SelCon degrades at small backbones. None isolates density at fixed token budget. The mechanism assertion is untested."
+    },
+    "nb-017": {
+      "verdict": "NONE",
+      "delta_restated": "TTT quality is non-monotone in update count, saturating or reversing beyond a measurable threshold.",
+      "adjacent_work_exists": true,
+      "why": "Evidence establishes that TTT helps and reports efficiency, but no unit sweeps iteration count to find saturation/reversal. The monotonicity claim is assumed away, exactly as stated."
+    },
+    "nb-028": {
+      "verdict": "NONE",
+      "delta_restated": "A downstream-validated protocol measuring the novelty-feasibility-truthfulness trade-off differs in ranking from citation-alignment benchmarks by >15%.",
+      "adjacent_work_exists": true,
+      "why": "Benchmarks exist (InnovatorBench with 20 curated tasks, DiscoveryBench), and limitations of existing benchmarks are documented. But no evidence compares such a protocol's ranking against existing benchmarks, so the comparison claim is untested. Note: much scaffolding exists, residual is narrow."
+    },
+    "nb-032": {
+      "verdict": "PARTIAL",
+      "delta_restated": "For the majority of shift settings, OOD confidence drops by <15% while accuracy falls >20%.",
+      "adjacent_work_exists": true,
+      "why": "Evidence directly reports that pretrained/ABNN/Whitebox show <=15% confidence drop between ID and shifted inputs while remaining overconfident OOD, and that standard ensembles stay overconfident in unseen scenarios. That IS the substantive claim (confidence fall << accuracy fall) for specific settings. What remains is the systematic fraction across settings — a quantifiable extension, not an untested mechanism."
+    },
+    "nb-040": {
+      "verdict": "NONE",
+      "delta_restated": "A multi-agent discovery pipeline beats both single-LLM and LLM-RAG baselines by >10pp on >=2 standard benchmarks.",
+      "adjacent_work_exists": true,
+      "why": "Evidence is architecture description plus explicit 'future work should compare'. No unit reports the comparison. The pipeline's advantage is asserted, never measured — so no work establishes the delta."
+    },
+    "nb-045": {
+      "verdict": "NONE",
+      "delta_restated": "First quantified false-premise-rejection and control-variable-preservation rates for end-to-end research agents on >=40 tasks.",
+      "adjacent_work_exists": true,
+      "why": "Benchmarks exist for artifact generation and general QA robustness, but no evidence reports these two specific metrics for end-to-end agents. Untested measurement."
+    },
+    "nb-062": {
+      "verdict": "NONE",
+      "delta_restated": "Prospective pre-registered scoring cuts the LLM-judge-inflated model-vs-human novelty advantage by >=50% vs retrospective scoring.",
+      "adjacent_work_exists": true,
+      "why": "Evidence establishes that LLM judges inflate model novelty ('novelty illusion') and that someone proposed a pre-registration repository. Establishing the mechanism is not establishing that pre-registration reduces the gap by 50% — that intervention effect is untested."
+    },
+    "nb-065": {
+      "verdict": "NONE",
+      "delta_restated": "In LLM TTT, a >10% relative drop in adaptation loss corresponds to <2% accuracy gain for at least one input-derived objective.",
+      "adjacent_work_exists": true,
+      "why": "Evidence shows TTT variants improve OOD accuracy and reports one large gain. None measures the loss-vs-accuracy coupling. The weak-alignment claim (and its contradiction of the inherited assumption) is untested."
+    },
+    "nb-081": {
+      "verdict": "NONE",
+      "delta_restated": "Relaxing the memory budget by >2x changes accuracy by >5pp, isolating the efficiency mechanism causally.",
+      "adjacent_work_exists": true,
+      "why": "Evidence reports 9.5x speed / 12.61x memory and calls comparisons correlational; the existing_coverage field itself states these are 'not causal isolation'. No unit varies budget at fixed objective. Untested causal claim."
+    },
+    "nb-096": {
+      "verdict": "PARTIAL",
+      "delta_restated": "The rank correlation between selection-frequency and ablation-causal-effect rankings across >100 experts and >=8 layers in a single MoE is unquantified.",
+      "adjacent_work_exists": true,
+      "why": "Evidence says Engmann et al. audited whether group-routing summaries predict ablation causal importance across OLMoE/Qwen/DeepSeek and found observational metrics insufficient. That directly addresses the same disagreement at scale, so a substantial part is established. Residual: the specific coefficient across >100 experts within one model."
+    },
+    "val-002": {
+      "verdict": "NONE",
+      "delta_restated": "Self-consistency is mediated by agreement-graph transitivity, not mean similarity; spectral centrality separates transitive consensus from hub artifacts.",
+      "adjacent_work_exists": true,
+      "why": "Evidence covers lexical similarity, entailment-graph consistency, semantic entropy — all reduce pairwise comparisons to means or counts. None applies spectral centrality/rank-aggregation. The specific mediation claim is untested."
+    },
+    "val-005": {
+      "verdict": "PARTIAL",
+      "delta_restated": "Consistency-based detection fails through a knowledge-coverage boundary: preserved above a factual-coverage level, collapsing abruptly below it because all samples converge on one wrong cluster.",
+      "adjacent_work_exists": true,
+      "why": "Evidence explicitly documents the single-cluster zero-score failure (HSE=0 when all samples are identically wrong despite a wrong answer) and states semantic entropy fails entirely in single-cluster cases. That is the mechanism half. What is not established is the BOUNDARY as a function of fact rarity with a threshold — a quantification of a documented failure mode."
+    },
+    "val-006": {
+      "verdict": "NONE",
+      "delta_restated": "The PEFT retention advantage is not caused by the low-rank constraint but mediated by representational-subspace occupancy; the advantage vanishes at narrow aligned subspace regardless of rank.",
+      "adjacent_work_exists": true,
+      "why": "Evidence compares LoRA to weight decay/dropout and flags scale-dependence as unresolved future work. None tests subspace occupancy as mediator. The mediation claim is untested."
+    }
+  }
+}

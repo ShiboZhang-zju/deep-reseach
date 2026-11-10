@@ -1,0 +1,30 @@
+{
+  "warning": "SEALED. Probe expectations were fixed in RUBRIC_V2_PREREG.md before any v2 run.",
+  "gates": {
+    "G1_forward_min_none": 1,
+    "G2_reverse_min_full": 3,
+    "G3_verdict_vs_delta_established": ">=4/5"
+  },
+  "probes": {
+    "p2v-N1": {
+      "expected": "NONE",
+      "rationale": "The assertion is that implementation language does not mediate learned weights once the FP operation sequence and seed are fixed. Adjacent work is abundant (floating-point non-associativity, cross-hardware divergence), but none tests the language variable with the operation sequence held byte-identical, so adjacency exists while the delta does not."
+    },
+    "p2v-N2": {
+      "expected": "NONE",
+      "rationale": "Most papers measure whether load balancing reduces specialization. None isolates the balance gradient as the causal variable while holding data, schedule, and all other hyperparameters fixed, so the causal assertion is untested despite a very busy topic."
+    },
+    "p2v-R1": {
+      "expected": "FULL",
+      "rationale": "Vaswani et al. 2017 establishes exactly this."
+    },
+    "p2v-R2": {
+      "expected": "FULL",
+      "rationale": "Hu et al. 2021 (LoRA) establishes exactly this."
+    },
+    "p2v-R3": {
+      "expected": "FULL",
+      "rationale": "Wei et al. 2022 (Chain-of-Thought) establishes exactly this."
+    }
+  }
+}

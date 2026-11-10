@@ -1,0 +1,111 @@
+{
+  "warning": "SEALED. Do not open until the sheet is fully judged.",
+  "sampled": 21,
+  "units": {
+    "nb-010": {
+      "arm": "C",
+      "topic_id": "pe2e-015",
+      "unit_type": "gap"
+    },
+    "nb-099": {
+      "arm": "C",
+      "topic_id": "pe2e-001",
+      "unit_type": "gap"
+    },
+    "nb-015": {
+      "arm": "C",
+      "topic_id": "pe2e-015",
+      "unit_type": "gap"
+    },
+    "nb-035": {
+      "arm": "C",
+      "topic_id": "pe2e-001",
+      "unit_type": "idea"
+    },
+    "nb-001": {
+      "arm": "C",
+      "topic_id": "pe2e-024",
+      "unit_type": "idea"
+    },
+    "nb-091": {
+      "arm": "C",
+      "topic_id": "pe2e-024",
+      "unit_type": "idea"
+    },
+    "nb-050": {
+      "arm": "C",
+      "topic_id": "pe2e-019",
+      "unit_type": "idea"
+    },
+    "nb-058": {
+      "arm": "C",
+      "topic_id": "pe2e-013",
+      "unit_type": "idea"
+    },
+    "nb-047": {
+      "arm": "C",
+      "topic_id": "pe2e-019",
+      "unit_type": "idea"
+    },
+    "nb-103": {
+      "arm": "C",
+      "topic_id": "pe2e-019",
+      "unit_type": "idea"
+    },
+    "nb-003": {
+      "arm": "C",
+      "topic_id": "pe2e-015",
+      "unit_type": "idea"
+    },
+    "nb-023": {
+      "arm": "C",
+      "topic_id": "pe2e-015",
+      "unit_type": "idea"
+    },
+    "nb-033": {
+      "arm": "C",
+      "topic_id": "pe2e-013",
+      "unit_type": "idea"
+    },
+    "nb-039": {
+      "arm": "D",
+      "topic_id": "pe2e-024",
+      "unit_type": "gap"
+    },
+    "nb-022": {
+      "arm": "D",
+      "topic_id": "pe2e-024",
+      "unit_type": "gap"
+    },
+    "nb-016": {
+      "arm": "D",
+      "topic_id": "pe2e-024",
+      "unit_type": "idea"
+    },
+    "nb-036": {
+      "arm": "D",
+      "topic_id": "pe2e-024",
+      "unit_type": "idea"
+    },
+    "nb-064": {
+      "arm": "D",
+      "topic_id": "pe2e-015",
+      "unit_type": "idea"
+    },
+    "nb-014": {
+      "arm": "D",
+      "topic_id": "pe2e-019",
+      "unit_type": "idea"
+    },
+    "nb-038": {
+      "arm": "D",
+      "topic_id": "pe2e-013",
+      "unit_type": "idea"
+    },
+    "nb-076": {
+      "arm": "D",
+      "topic_id": "pe2e-019",
+      "unit_type": "idea"
+    }
+  }
+}

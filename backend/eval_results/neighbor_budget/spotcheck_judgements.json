@@ -1,0 +1,32 @@
+{
+  "_note": "Human spot-check of 21 stratified units (19.8% of 106), judged blind against the SAME anonymised record the adjudicator saw. Judged before opening spotcheck_key.json. The arm of each unit is NOT known to the judge and is not needed for agreement: agreement is measured per unit, then split by arm afterwards.",
+  "judged_at": "2026-11-06",
+  "judge": "assistant (careful manual reading of unit + evidence, no retrieval re-run)",
+  "criterion": {
+    "gap": "NONE = no prior work covers the claimed delta; PARTIAL = part covered / different setting / re-parameterisation, residual novelty remains; FULL = claimed delta already established",
+    "idea": "fund / maybe / no"
+  },
+  "judgements": {
+    "nb-010": {"verdict": "PARTIAL", "why": "load-balancing effects on specialization are covered; the specific routing-behaviour characterisation under changed balancing regime is not."},
+    "nb-099": {"verdict": "PARTIAL", "why": "many compression frameworks exist, none runs the claimed 3-signal x 2-rate factorial mediation ablation."},
+    "nb-015": {"verdict": "PARTIAL", "why": "phenomenon well documented (incl. loss-free bias-only balancing); causal decomposition into router-parameter vs expert-representation channels is not done."},
+    "nb-035": {"verdict": "maybe", "why": "OS locality analogy is a genuinely different angle; retrieved work does not cover document compression for multi-hop QA, but premise partly undermined."},
+    "nb-001": {"verdict": "maybe", "why": "ECE/NLL decomposition is a known idea in forecasting; applying it as a UQ ranking diagnostic is plausible but adjacent territory is crowded."},
+    "nb-091": {"verdict": "maybe", "why": "ECE flaws and perturbation probes both exist separately; the specific monotonicity diagnostic is not directly reported but easy to derive."},
+    "nb-050": {"verdict": "maybe", "why": "arm-matched factuality harness: motivation is well established, the harness itself is engineering rather than a new claim."},
+    "nb-058": {"verdict": "maybe", "why": "controlled drift-stream characterisation with breakpoint detection is a measurement study; components exist, the sweep is not reported."},
+    "nb-047": {"verdict": "maybe", "why": "the 'verification agents inherit generator bias' framing is explicitly already articulated in retrieved work, which damages novelty."},
+    "nb-103": {"verdict": "maybe", "why": "factorial boundary-mapping over architecture x budget x agent count is largely covered; threshold fitting adds little."},
+    "nb-003": {"verdict": "maybe", "why": "premise strongly confirmed by retrieved work; frequency-matched permutation null is a modest methodological addition."},
+    "nb-023": {"verdict": "maybe", "why": "no retrieved work does scale-ladder change-point on null-calibrated concentration, so delta is real but narrow."},
+    "nb-033": {"verdict": "maybe", "why": "oracle-known vs estimated sigma under drift is not directly established; several hits substantially overlap."},
+    "nb-039": {"verdict": "PARTIAL", "why": "coverage loss under non-exchangeability is well covered; WHERE the discipline happens across architectures is not."},
+    "nb-022": {"verdict": "PARTIAL", "why": "scoring-rule calibration/sharpness decomposition exists in forecasting; the transfer plus conditional reliability across tasks is only partly covered."},
+    "nb-016": {"verdict": "maybe", "why": "within-model self-consistency residual is adjacent to existing work; not directly executed."},
+    "nb-036": {"verdict": "maybe", "why": "premise confirmed, but mapping the regime boundary of worst-group vs pooled ECE is not reported."},
+    "nb-064": {"verdict": "maybe", "why": "capacity-matched permutation control is sharper than retrieved work, but the surrounding territory is heavily occupied."},
+    "nb-014": {"verdict": "maybe", "why": "no retrieved study maps exposure dose-response to novelty advantage; the ledger itself is process, not a research claim."},
+    "nb-038": {"verdict": "maybe", "why": "narrow but well-scoped sweep; no retrieved work executes this exact sweep."},
+    "nb-076": {"verdict": "maybe", "why": "resource-axis convergence thresholds are partly covered; specific sweep not reported."}
+  }
+}

@@ -1,0 +1,152 @@
+{
+  "v7r-001": {
+    "gap_id": "1ccab82b-b738-4e2e-b238-7b31969e2e4a",
+    "topic_id": "pe2e-024",
+    "gap_type": "mechanism_gap"
+  },
+  "v7r-002": {
+    "gap_id": "94673a15-9a97-441f-ae61-7e3afd3cb6f2",
+    "topic_id": "pe2e-013",
+    "gap_type": "contradiction"
+  },
+  "v7r-003": {
+    "gap_id": "8d850e70-6e54-4bef-8f39-593e0f81a041",
+    "topic_id": "pe2e-015",
+    "gap_type": "mechanism_gap"
+  },
+  "v7r-004": {
+    "gap_id": "4352915b-f47c-4b1d-bc16-b0a57f90413a",
+    "topic_id": "pe2e-019",
+    "gap_type": "boundary_gap"
+  },
+  "v7r-005": {
+    "gap_id": "ea4b38e0-7a2e-4c22-9733-0f0b8da9b4bf",
+    "topic_id": "pe2e-015",
+    "gap_type": "mechanism_gap"
+  },
+  "v7r-006": {
+    "gap_id": "db131a6d-ad77-4ba7-9fc7-c9eb26905fa0",
+    "topic_id": "pe2e-019",
+    "gap_type": "untested_assumption"
+  },
+  "v7r-007": {
+    "gap_id": "05f9d937-7478-4c9e-8463-52b8ba34fb71",
+    "topic_id": "pe2e-015",
+    "gap_type": "boundary_gap"
+  },
+  "v7r-008": {
+    "gap_id": "39f8c109-7475-4c9d-8326-41e3abecf35a",
+    "topic_id": "pe2e-001",
+    "gap_type": "contradiction"
+  },
+  "v7r-009": {
+    "gap_id": "3b926d04-132b-4371-8483-7b81640e8e2e",
+    "topic_id": "pe2e-007",
+    "gap_type": "scaling_regime"
+  },
+  "v7r-010": {
+    "gap_id": "25ad78d6-7b07-444b-8fca-6c99146ea16d",
+    "topic_id": "pe2e-013",
+    "gap_type": "untested_assumption"
+  },
+  "v7r-011": {
+    "gap_id": "25f87bc6-e1a7-45cd-bf79-c7baa0acb48b",
+    "topic_id": "pe2e-015",
+    "gap_type": "cross_domain_transfer"
+  },
+  "v7r-012": {
+    "gap_id": "0dd3d92c-7b1c-4e43-a0a4-42f4382bbe74",
+    "topic_id": "pe2e-019",
+    "gap_type": "mechanism_gap"
+  },
+  "v7r-013": {
+    "gap_id": "87e4e98c-3716-451f-a1c4-81c053d08fa2",
+    "topic_id": "pe2e-015",
+    "gap_type": "contradiction"
+  },
+  "v7r-014": {
+    "gap_id": "59c18e90-7f59-490e-939c-9114242a269b",
+    "topic_id": "pe2e-007",
+    "gap_type": "scaling_regime"
+  },
+  "v7r-015": {
+    "gap_id": "3cf7b490-c020-49d8-a699-780bfd636a47",
+    "topic_id": "pe2e-015",
+    "gap_type": "boundary_gap"
+  },
+  "v7r-016": {
+    "gap_id": "24462cf5-ddb9-4f5b-b2d2-b616f54a8026",
+    "topic_id": "pe2e-015",
+    "gap_type": "cross_domain_transfer"
+  },
+  "v7r-017": {
+    "gap_id": "39894da5-d710-46e6-82ef-23d6b318bd13",
+    "topic_id": "pe2e-019",
+    "gap_type": "scaling_regime"
+  },
+  "v7r-018": {
+    "gap_id": "d066bd83-3a54-4018-a1db-5fea7e9f311c",
+    "topic_id": "pe2e-015",
+    "gap_type": "scaling_regime"
+  },
+  "v7r-019": {
+    "gap_id": "64883f30-c882-4646-8252-d475cb337ede",
+    "topic_id": "pe2e-013",
+    "gap_type": "mechanism_gap"
+  },
+  "v7r-020": {
+    "gap_id": "4e409776-412c-44a3-90f8-881b3529d98d",
+    "topic_id": "pe2e-019",
+    "gap_type": "cross_domain_transfer"
+  },
+  "v7r-021": {
+    "gap_id": "56bdadfa-d337-4e91-8cf7-4d419ec9dd31",
+    "topic_id": "pe2e-013",
+    "gap_type": "scaling_regime"
+  },
+  "v7r-022": {
+    "gap_id": "ca495ca2-a876-455e-9bbc-524dbf97692a",
+    "topic_id": "pe2e-013",
+    "gap_type": "scaling_regime"
+  },
+  "v7r-023": {
+    "gap_id": "a1e42604-269b-42a5-9361-de01199e04ce",
+    "topic_id": "pe2e-013",
+    "gap_type": "boundary_gap"
+  },
+  "v7r-024": {
+    "gap_id": "67841a4b-b7bc-4a21-a6ab-954861052e08",
+    "topic_id": "pe2e-019",
+    "gap_type": "contradiction"
+  },
+  "v7r-025": {
+    "gap_id": "eb38313b-4ce2-4b6c-9cfa-48bdc4fbb61b",
+    "topic_id": "pe2e-024",
+    "gap_type": "scaling_regime"
+  },
+  "v7r-026": {
+    "gap_id": "8a4a6456-5607-4414-8193-289df1dd01e1",
+    "topic_id": "pe2e-007",
+    "gap_type": "untested_assumption"
+  },
+  "v7r-027": {
+    "gap_id": "bfbf7559-58df-42a1-b210-482193c3847d",
+    "topic_id": "pe2e-013",
+    "gap_type": "missing_evaluation"
+  },
+  "v7r-028": {
+    "gap_id": "c8a3b571-73c6-444b-99df-d9a00b9d0e7e",
+    "topic_id": "pe2e-007",
+    "gap_type": "missing_evaluation"
+  },
+  "v7r-029": {
+    "gap_id": "0ef4b563-09f6-4948-bc70-5e96d2c01dcc",
+    "topic_id": "pe2e-013",
+    "gap_type": "missing_evaluation"
+  },
+  "v7r-030": {
+    "gap_id": "63393e70-74f9-4b85-a6f7-5a2047115471",
+    "topic_id": "pe2e-019",
+    "gap_type": "cross_domain_transfer"
+  }
+}
