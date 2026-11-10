@@ -281,7 +281,31 @@ def _evaluate_hard_gates(gap, audit, evidence_ids, candidate, contract) -> dict:
     novelty_confidence = getattr(audit, "novelty_confidence", None) if audit else None
     novelty_status = "UNKNOWN"
     novelty_reason = "缺少完成的近邻审计"
-    if audit:
+    # V2-no-audit ablation (2026-11-02): in this arm no audit judgement exists by
+    # construction, so "no novelty verdict" is the treatment, not a missing
+    # field. Left as UNKNOWN it would cap every intervention at tier B and the
+    # arm would lose on executable count for a purely mechanical reason — the
+    # comparison would measure bookkeeping. PASS-by-ablation is explicit and
+    # traceable (`ABLATION_NO_AUDIT`) so the arm stays interpretable.
+    #
+    # The pass is scoped to the ABLATION arm's own records. A real audit that
+    # happens to sit on this gap (e.g. a task resumed after the switch was
+    # flipped, or a contaminated mixed run) carries an actual verdict, and the
+    # switch must not erase it — turning `closed` into PASS would silently
+    # resurrect gaps the auditor killed.
+    from app.agent.steps.audit_gaps import ABLATION_SEARCH_POLICY_VERSION
+    from app.config import settings as _settings_mod
+    _ablation_arm = bool(_settings_mod.gap_audit_disabled_ablation)
+    _audit_is_ablation = (
+        audit is not None
+        and getattr(audit, "search_policy_version", None)
+        == ABLATION_SEARCH_POLICY_VERSION)
+    if _ablation_arm and (audit is None or _audit_is_ablation):
+        novelty_status = "PASS"
+        novelty_reason = ("V2-no-audit 消融臂：本臂不执行对抗审计，"
+                          "新颖性闸门按消融约定显式放行（ABLATION_NO_AUDIT），"
+                          "该结论不代表新颖性已被验证")
+    elif audit:
         if audit.audit_result == "confirmed" and audit.remaining_delta:
             # P0-1a (task d6f64087): a "confirmed" verdict only means no
             # neighbor covered the claim — absence of a hit, not presence of
@@ -306,6 +330,43 @@ def _evaluate_hard_gates(gap, audit, evidence_ids, candidate, contract) -> dict:
                 novelty_reason = (
                     f"近邻审计 confirmed（{neighbor_count} 篇近邻，"
                     f"novelty_confidence={novelty_confidence}，存在 remaining delta）")
+        elif audit.audit_result == "confirmed":
+            # Probe 0e695ea5 (2026-10-31): a confirmed audit with an EMPTY
+            # remaining_delta used to fall through to UNKNOWN — the gate
+            # skipped novelty_confidence entirely and capped every intervention
+            # at tier B, so the run produced zero executable candidates while
+            # its winner gap was audited at novelty 0.90. remaining_delta is
+            # the auditor's prose about what is still open; it is not a
+            # precondition for reading the confidence score the SAME audit
+            # reported. A missing delta weakens the "what exactly is open"
+            # narrative (the gap's own residual_gap carries it), so it must
+            # not silently discard a confident verdict. Judge on the score and
+            # note the missing prose.
+            delta_note = ("（该次审计未填写 remaining_delta，"
+                          "残余缺口以 gap.residual_gap 为准）")
+            if novelty_confidence is None:
+                novelty_status = "UNKNOWN"
+                novelty_reason = (
+                    "近邻审计判 confirmed 但未给出 novelty_confidence，"
+                    "无法判断新颖性强度" + delta_note)
+            elif novelty_confidence < _NOVELTY_CONFIDENCE_FAIL_BELOW:
+                novelty_status = "FAIL"
+                novelty_reason = (
+                    f"近邻审计判 confirmed 但 novelty_confidence={novelty_confidence:.2f}"
+                    f"（<{_NOVELTY_CONFIDENCE_FAIL_BELOW}）：审计自身不确信新颖性主张"
+                    + delta_note)
+            elif novelty_confidence < _NOVELTY_CONFIDENCE_WARN_BELOW:
+                novelty_status = "WARN"
+                novelty_reason = (
+                    f"近邻审计判 confirmed（{neighbor_count} 篇近邻），但 "
+                    f"novelty_confidence={novelty_confidence:.2f}"
+                    f"（<{_NOVELTY_CONFIDENCE_WARN_BELOW}）偏低，新颖性主张需复审确认"
+                    + delta_note)
+            else:
+                novelty_status = "PASS"
+                novelty_reason = (
+                    f"近邻审计 confirmed（{neighbor_count} 篇近邻，"
+                    f"novelty_confidence={novelty_confidence}）" + delta_note)
         elif audit.audit_result == "closed":
             novelty_status = "FAIL"
             novelty_reason = f"近邻审计显示核心 claim 已被覆盖（{neighbor_count} 篇近邻）"

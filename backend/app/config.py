@@ -438,7 +438,7 @@ class Settings(BaseSettings):
     #   1 次主审计/gap + 1 次 killer search，无 re-audit/remediation；
     #   4 查询（砍 benchmark 族）× 3 源（S2/OpenAlex/arXiv）→ Top-10 摘要筛选 →
     #   Top-3 邻 claim 判断 → 0-2 篇全文（疑似 killer 优先，按 relevance_score）→
-    #   killer search ≤3 查询 → STOP；Top-1 gap 竞争（max_gaps_to_deep_audit）；
+    #   killer search ≤3 查询 → STOP；Top-2 gap 竞争（max_gaps_to_deep_audit）；
     #   超时（GAP_AUDIT_TIMEOUT_SECONDS=600）→ insufficient_evidence，不补救。
     gap_audit_budgeted: bool = False
     budgeted_audit_max_queries: int = 4
@@ -447,7 +447,98 @@ class Settings(BaseSettings):
     budgeted_audit_fulltext_max_papers: int = 2
     budgeted_killer_search_max_queries: int = 3
     budgeted_audit_sources: str = "semantic_scholar,openalex,arxiv"
-    max_gaps_to_deep_audit: int = 1
+
+    # --- Neighbour-budget experiment (2026-11-03) ---------------------------
+    # EXPERIMENT ARM SWITCH — leave None outside the experiment. 0 disables.
+    #
+    # Why: the audit judges novelty against `budgeted_audit_neighbors` papers
+    # (production: 3). Measured on the fixed-budget pilot's 37 reviewed gaps,
+    # the corpus-recall ordering puts the reviewer's own killer paper at
+    # (n=71 in-corpus killers):
+    #
+    #     k=1  14.1%   k=2  28.2%   k=3  36.6%   k=5  53.5%
+    #     k=6  56.3%   k=8  60.6%   k=10 63.4%   k=15 69.0%   k=20 76.1%
+    #
+    # So at the production budget the audit cannot see roughly two thirds of
+    # the papers that would falsify it. The biggest single step is k=3 -> k=5
+    # (+12 killers, +16.9pp); k=8 captures 60.6% and is where the curve bends
+    # hard (k=8 -> k=10 buys only +2.8pp).
+    #
+    # Cost is NOT linear in this knob and that matters for the comparison:
+    # the audit decision is ONE llm.chat_json call with every neighbour in the
+    # prompt (`_AUDIT_USER.neighbors=_format_neighbors(db, neighbors)`), so a
+    # larger budget lengthens one prompt instead of adding calls or timeout
+    # exposure. Full-text extraction is separately capped by
+    # `budgeted_audit_fulltext_max_papers` and does not scale with neighbours.
+    #
+    # When set, overrides `budgeted_audit_neighbors` for this process and stamps
+    # audit traces with the value so the two arms stay separable.
+    audit_neighbors_override: int = 0
+
+    # Noise guard for the larger budget: NOT a new mechanism.
+    #
+    # Extending the neighbour list reaches further down the relevance ordering,
+    # which raises an obvious objection — "more neighbours just add low-quality
+    # papers, and a PARTIAL judgment from a junk paper is enough to make a real
+    # gap look covered". The existing `gap_relevance_min_neighbor=0.3` already
+    # answers this: in `_mechanical_novelty_score`, any judgment from a
+    # neighbour below the floor is demoted to UNCERTAIN (never coverage, never
+    # novelty). So the guard is ALREADY in force and must stay identical in
+    # both arms, otherwise the comparison would move two variables at once
+    # (count AND relevance policy).
+    #
+    # What the larger budget does need is VISIBILITY: at k=3 the demotion count
+    # is almost always 0, at k=8 it can be non-zero and could silently cap the
+    # arm's novelty. `audit_neighbors_override` traces therefore always carry
+    # the effective neighbour count plus the below-floor count, so "the arm did
+    # worse" can be separated from "the arm's extra neighbours were demoted".
+    audit_neighbor_noise_guard_documented: bool = True
+
+    # --- Multi-service experiment isolation (2026-11-03) --------------------
+    # `recover_interrupted_tasks()` runs on EVERY service startup and resets
+    # every task in an interrupted status (`searching`, `extracting_evidence`,
+    # ...) back to `pending` — it has no notion of WHICH service owns which
+    # task. In a two-service experiment (arms on 8001/8002 sharing one DB) that
+    # means restarting arm C marks arm D's in-flight task as interrupted and
+    # flips its running phase rows to failed. The damage is silent: the task
+    # simply stops advancing, or resumes later under whatever arm happens to
+    # pick it up — i.e. an arm's result can be produced by the other arm's
+    # configuration.
+    #
+    # Set to false for experiment services. Recovery is a convenience for
+    # interactive use; during a controlled comparison the protocol's
+    # interruption rule (pause, fix, re-run the pair) must take precedence over
+    # automatic resume. Leave true for normal single-service operation.
+    recover_tasks_on_startup: bool = True
+    # 2 (2026-10-30, probe df744606): Top-1 clipped the 7-lens fan-out to a
+    # single audited gap per cycle — 21 accepted candidates saw 3 audits and
+    # ALL ideas hung off one surviving gap (100% single-gap concentration).
+    # A full audit costs ~250s against a 119-minute run, so the clip's savings
+    # were immaterial next to the breadth it destroyed. Top-2 keeps both
+    # audits complete before the winner is chosen (no "first through the
+    # gate wins"), same as the non-budgeted competition default.
+    max_gaps_to_deep_audit: int = 2
+
+    # Starvation control (probe 0ae1a146, 2026-10-30): 16 of 20 gaps stayed at
+    # `candidate` because each competition re-ranked the same stable pool and
+    # the same losers lost again. Two mechanisms:
+    #   1. a small deferred-rounds bonus in the cheap rank (capped +0.09) so a
+    #      near-tied candidate eventually gets its turn;
+    #   2. retirement after this many competitions without selection, so
+    #      "never audited" becomes an explicit terminal state instead of an
+    #      ever-growing backlog of auditable-looking candidates. 0 disables
+    #      retirement (bonus stays active).
+    gap_starvation_deferral_limit: int = 3
+
+    # Incremental coverage matching (2026-10-30, probe df744606): coverage
+    # re-matched the whole evidence pool against every question each round
+    # (measured 246 -> 398 -> 509 -> 667s, monotonic with pool size), although
+    # (question, evidence) verdicts are stable — evidence rows are immutable
+    # and question text never changes after decompose. When enabled, only
+    # evidence created after the previous coverage snapshot goes to the LLM;
+    # already-judged pairs are replayed from their links. Turn off to restore
+    # full re-matching (e.g. after changing the matching prompt semantics).
+    coverage_incremental_matching: bool = True
     # 低证据补搜（2026-09-04，用户选项 A：目的是产出可用 Idea，证据不足先补证据）。
     # v16 budgeted 快进快出：低证据主题（冷门/检索面窄）带着很薄的证据池进入
     # mining，只产出 1 个薄 gap，被审计拒绝后直接 abstain（task 0eca528a：
@@ -544,6 +635,182 @@ class Settings(BaseSettings):
     # failures degrade to a trace, never a demotion.
     idea_novelty_check_enabled: bool = True
     idea_novelty_check_top_k: int = 5
+
+    # v7.2 (pilot adjudication 2026-10-29): scaling_regime candidates undergo a
+    # claim-level precedent retrieval at mining admission — 4/7 pilot
+    # scaling_regime opportunities were false-open (the claimed "untested
+    # range" was already measured outside the evidence pool). A "covered"
+    # verdict rejects the candidate (SCALING_RANGE_ALREADY_MEASURED);
+    # retrieval-infrastructure failures degrade to a trace, never a rejection.
+    gap_mining_precedent_check_enabled: bool = True
+    gap_mining_precedent_check_top_k: int = 5
+
+    # Semantic recall (2026-11-02, fixed-budget pilot adjudication failure).
+    # Keyword search cannot express a conjunction such as "router intervention
+    # x hydra-effect compensation": the pilot's clearest case (fbp-089, MoE
+    # routing) retrieved 12 results and ZERO were about its topic, while the
+    # queries themselves were reasonable. So: over-retrieve by keyword, then
+    # filter/rerank by embedding similarity to the claim.
+    #
+    # The 0.41 threshold was measured, not chosen (scripts/_calibrate_sim.py,
+    # 37 real gaps): claim-vs-own-audit-neighbour similarity has median 0.507
+    # (p10 0.376), while claim-vs-known-noise has max 0.408. At 0.41 the filter
+    # keeps 82% of real neighbours and admits 0% of the known off-topic pool.
+    # Because 18% of true neighbours fall below it, this is a SOFT filter whose
+    # kept/filtered counts must be disclosed by every consumer — lowering it
+    # trades noise for recall, and 0.0 disables filtering while keeping rerank.
+    semantic_recall_enabled: bool = True
+    semantic_recall_threshold: float = 0.41
+    semantic_recall_overfetch: int = 3
+
+    # --- Audit comparison-pool supply (2026-11-02, killer-funnel diagnosis) ---
+    # Measured on the fixed-budget pilot's 37 reviewed gaps: of the 82 killer
+    # papers the independent reviewer named that were ALREADY in the task corpus
+    # (title match), only 4 (4.9%) were ever shown to the audit as neighbours.
+    # The rest split into: screened but not selected (6), in the audit pool but
+    # cut by the 10-paper cap BEFORE the gap-relevance screen (17), and — the
+    # dominant loss — in the corpus but NEVER admitted to any pool (55, 67.1%).
+    # Root cause: the candidate pool is built from the gap's adversarial search
+    # plus `collect_same_question_neighbors`, which only walks the evidence links
+    # of the gap's own questions. A killer that the task corpus contains but that
+    # never got linked to those questions was therefore invisible, and the audit
+    # reported "confirmed" on a 3-paper pool that omitted it. Hence the pilot's
+    # 33 confirmed -> 0 NONE collapse.
+    #
+    # Fix: top up the pool with a corpus-wide semantic recall over the task's own
+    # papers (title+abstract vs the gap's claim). Cheap (one embedding pass) and
+    # it directly attacks the 67.1% bucket. Threshold is the soft, disclosed kind
+    # — recall diagnostics go into the trace, never silently dropped.
+    audit_corpus_recall_enabled: bool = True
+    audit_corpus_recall_threshold: float = 0.45
+    # Hard ceiling on papers embedded per gap; the task corpus can hold 150-420
+    # papers, all of which is still affordable in one batch.
+    audit_corpus_recall_max_papers: int = 450
+    # Number of corpus-recall hits unioned into the audit candidate pool.
+    audit_corpus_recall_top_k: int = 15
+    # Screen audit candidates with the gap-relevance model BEFORE the candidate
+    # cap, and cap by gap relevance instead of TaskPaper.final_score. The old
+    # order capped first (by a TASK-level relevance score) and screened the
+    # survivors, so a direct killer ranked 11th by task relevance was discarded
+    # without ever being judged against THIS gap (17 of 82 in the pilot).
+    audit_screen_before_cap: bool = True
+
+    # --- V2-no-audit ablation (capability attribution, 2026-11-02) ---
+    # EXPERIMENT ARM SWITCH — leave False outside the ablation.
+    #
+    # production_e2e_v1 only ever measured the V2 *bundle* against simple
+    # baselines, so "how much does the adversarial audit itself contribute" has
+    # never been identified. The pilot makes this urgent: the audit's own
+    # `confirmed` verdict predicted publishable novelty at essentially zero rate
+    # (33 confirmed -> 0 NONE), and its `novelty_confidence` does not separate
+    # covered from uncovered gaps (AUC 0.61 over 37 gaps).
+    #
+    # When True, `audit_gap_candidates` performs NO adversarial retrieval and NO
+    # falsification judgement: every gap selected by the competition is marked
+    # surviving and stamped with its own search-policy version, and the
+    # intervention novelty gate is made explicitly PASS-by-ablation rather than
+    # silently UNKNOWN. That last part is what makes the arm interpretable: an
+    # un-audited gap must not land in tier B merely because a field is missing,
+    # otherwise the arm is guaranteed to lose on executable count for a purely
+    # mechanical reason and the comparison measures bookkeeping, not the gate.
+    gap_audit_disabled_ablation: bool = False
+
+    # Legacy v6 mining mode (fixed-budget experiment, 2026-10-31; see
+    # eval_results/fixed_budget_pilot/EXPERIMENT_DESIGN.md). EXPERIMENT ARM
+    # SWITCH — leave False outside the experiment.
+    #
+    # When True, gap mining reproduces the v6 two-type policy on the current
+    # (debugged) stack: only boundary_gap / missing_evaluation lenses with
+    # v6-faithful prompts (no v7.2 outcome-target wording), question-level
+    # blockers restored (NO_LIMITATION_SIGNAL / UNRESOLVED_VERIFIED_
+    # CONTRADICTION), the global limitation-or-negative_result citation rule,
+    # and the v7.2 admission gates disabled. Everything downstream (audit,
+    # budget, competition, interventions, ideas) is shared with arm A so the
+    # mining policy is the only difference between arms. Candidates are
+    # stamped `evidence-admission-v6-exp` so experiment rows stay separable
+    # from the 281 historical `evidence-admission-v6` rows.
+    #
+    # Structural differences from historical v6 (disclosed, deliberate):
+    #   - two per-type lens calls instead of one two-type menu call (the
+    #     shared validation/dedup/trace machinery is per-lens);
+    #   - runs on the current stack, i.e. WITH all post-v6 bug fixes
+    #     (novelty-gate short-circuit, winner selection, Top-2 competition) —
+    #     that is the point: the comparison isolates the mining policy, not
+    #     the era's bugs.
+    gap_mining_legacy_v6_mode: bool = False
+
+    # v7.3 CANDIDATE GATE — OFF by default, deliberately.
+    #
+    # Rejects a claimed_delta that is an unexecuted measurement template rather
+    # than a mechanism gap: measurement-verb lead + multi-deliverable conjunction
+    # + no mechanism vocabulary. Motivation (fixed-budget pilot, 37 reviewed
+    # gaps): 26 of 37 deltas had exactly that shape, and independent review gave
+    # them 3 FULL / 23 PARTIAL / 0 NONE — the reviewer's residual notes repeated
+    # "the specific operationalisation is not directly reported, but the
+    # substantive delta is executed by [n]".
+    #
+    # It ships disabled because the 60% false-open precision it showed was
+    # measured on the SAME 37 units the rule was derived from. That is post-hoc
+    # fitting, not validation. Turning it on requires an out-of-sample check on
+    # the 24-topic production_e2e pool; without that, enabling it would repeat
+    # the exact failure this project's pre-registration discipline exists to
+    # prevent (shipping a mechanism because it looks good on the sample that
+    # suggested it).
+    gap_mining_operationalization_gate: bool = False
+
+    # Conjunction-only delta gate (2026-11-06, neighbour-budget experiment).
+    #
+    # OFF by default, deliberately. Independent blind review of 28 audited gaps
+    # returned NONE=0 / PARTIAL=26 / FULL=2, so the primary metric
+    # T=NONE/(...) was 0.0% in BOTH arms and the 3-vs-8 contrast could not be
+    # measured at all.
+    #
+    # CORRECTION (2026-11-09): an earlier version of this comment said the
+    # ingredients-covered-not-the-combination argument was the top PARTIAL
+    # reason at 12/26 = 46%. That was inflated by a loose regex (counting any
+    # "both"/"together"/"combines") and by summing non-exclusive categories.
+    # Strict matching: 2/26 = 8%. The actual top reasons are "partially covers
+    # the claim" (50%) and "adjacent work exists, but in a different setting"
+    # (50%) — the latter being the rubric's own catch-all clause.
+    #
+    # A calibration probe settled the question: an absurd claim with zero
+    # adjacent work (LLM inference under lunar gravity) was returned as NONE,
+    # while a realistic claim came back PARTIAL. And an out-of-sample run with
+    # the new mining prompt produced 24 deltas with no numbers and no
+    # configuration phrasing (was 74% / 59%), yet blind review still returned
+    # 6/6 PARTIAL, NONE=0. SHAPE CHANGED, THE VERDICT DID NOT.
+    #
+    # So this gate is NOT the fix for NONE=0, and no gate at the mining layer
+    # can be: the unreachability lives in the adjudication rubric. A pure
+    # conjunction remains structurally unanswerable as NONE, which is why the
+    # rule is kept, but it is a secondary effect. See
+    # eval_results/neighbor_budget/GAP_SUPPLY_VALIDATION.md.
+    #
+    # The detector fires on 5.2% of the 116 gaps (6/6 of them genuinely
+    # conjunction-shaped), so it is precise but LOW-RECALL. NOT enabled: the
+    # rule was derived from the same 28 units it would be scored on, so
+    # enabling it without an out-of-sample check would repeat the v7.3 mistake
+    # documented above the operationalization gate.
+    gap_mining_conjunction_gate: bool = False
+
+    # Idea score go-line (2026-10-31, distribution analysis over 595 scored
+    # ideas / 94 tasks — see scripts/idea_score_distribution.py).
+    #
+    # This was a hardcoded 0.70 in three places. The analysis shows it is
+    # calibrated to the v3–v7 population and NOT to v7.2:
+    #   historical (v3-v7, n=579): median 0.711, 61.3% clear 0.70
+    #   v7.2 probes  (n=16)     : median 0.654, 12.5% clear 0.70
+    #     - and 0 of the 4 v7.2 executable_candidates clear it
+    # So in v7.2 the line fires almost never — it reads as "the rubric says
+    # everything is mediocre" when it actually says "the line moved".
+    #
+    # It is now one setting instead of three magic numbers. Left at 0.70 on
+    # purpose: lowering it to the v7.2 median (~0.65) is a POLICY decision
+    # (absolute-quality bar vs relative ranking within a run) that needs its
+    # own justification, not a side effect of a refactor. The point of this
+    # change is that the number is now visible, shared, and adjustable.
+    idea_score_go_line: float = 0.70
+    idea_score_revise_line: float = 0.50
 
     @property
     def effective_openalex_rate_per_min(self) -> int:

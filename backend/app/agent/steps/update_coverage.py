@@ -18,7 +18,7 @@ from app.agent.evidence_relations import (
 from app.agent.state import ResearchState
 from app.db.models import (
     EvidenceUnit, ResearchQuestion, CoverageRecord,
-    QuestionEvidenceLink, Paper, TaskPaper,
+    QuestionEvidenceLink, Paper, PhaseRun, TaskPaper,
 )
 from app.db.repositories import paper_repo
 from app.db.lock_retry import flush_with_retry
@@ -74,6 +74,53 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
         ).all():
             prev_coverage[cr.question_id] = cr.coverage_score
 
+    # --- Incremental matching (2026-10-30, probe df744606) ------------------
+    # Coverage cost grew monotonically with the pool (measured 246 -> 398 ->
+    # 509 -> 667s): every round re-matched ALL evidence against every question,
+    # although (question, evidence) judgments are stable — evidence rows are
+    # immutable once created, and question text never changes after decompose.
+    # Only evidence created after the previous coverage run is new; pairs
+    # already judged (they carry a link — irrelevant pairs deliberately leave
+    # none) are reused verbatim instead of re-asked.
+    #
+    # The watermark comes from phase_runs.completed_at of the previous
+    # coverage phase, NOT from coverage_records.created_at: coverage_records
+    # is upserted per (task, question, round) and its created_at is stamped
+    # once and never refreshed, so using it pinned the watermark to round 1
+    # forever — which silently re-matched every later round in full (verified
+    # 2026-10-30: r6 reported reused=1804, exactly r2's count).
+    from app.config import settings as _settings
+
+    run_started = _utcnow()
+    prev_snapshot_time = db.query(func.max(PhaseRun.completed_at)).filter(
+        PhaseRun.task_id == task_id,
+        PhaseRun.phase_name.like("update_coverage%"),
+        PhaseRun.completed_at.isnot(None),
+        PhaseRun.completed_at < run_started,
+    ).scalar()
+
+    # Snapshot the settled (question, evidence) judgments BEFORE the delete.
+    existing_links = db.query(QuestionEvidenceLink).filter(
+        QuestionEvidenceLink.question_id.in_([q.id for q in questions]),
+    ).all()
+    settled = {(l.question_id, l.evidence_id): (l.relation_type, l.relevance_score)
+               for l in existing_links}
+
+    if (_settings.coverage_incremental_matching
+            and prev_snapshot_time is not None and settled):
+        new_evidence = [e for e in all_evidence
+                        if e.created_at and e.created_at > prev_snapshot_time]
+        if not new_evidence:
+            # Nothing new: reuse every settled pair verbatim. Evidence with a
+            # settled judgment of "irrelevant" left no link last round, so it
+            # would otherwise be re-asked forever — an explicit no-op path
+            # keeps "no new evidence" genuinely free.
+            new_evidence = []
+    else:
+        # First run (no previous coverage phase), the escape hatch is off, or
+        # the link table was wiped: match everything, exactly the old behaviour.
+        new_evidence = list(all_evidence)
+
     # Clear old links for this round (but keep previous rounds' links)
     db.query(QuestionEvidenceLink).filter(
         QuestionEvidenceLink.question_id.in_([q.id for q in questions]),
@@ -85,6 +132,11 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
     # the LLM for semantic relevance replaces the old English-only keyword
     # substring matcher, which produced zero matches for Chinese claims.
     evidence_index = list(all_evidence)  # stable order;1-based index in prompt
+    new_id_set = {e.id for e in new_evidence}
+    # Positions within evidence_index of the evidence that still needs an LLM
+    # judgment this round; everything else is reused from `settled`.
+    new_positions = [i for i, e in enumerate(evidence_index) if e.id in new_id_set]
+    reused_total = 0
 
     for question in questions:
         supporting = 0
@@ -97,7 +149,22 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
 
         # (#12) LLM-based semantic matching: one batched call (or a few) per
         # question decides which evidence items are relevant and how.
-        matched = await _llm_match_evidence(llm, question, evidence_index)
+        # Incremental: only NEW evidence goes to the LLM; pairs already judged
+        # in an earlier coverage round are replayed from the settled snapshot
+        # (identical question text x immutable evidence row => same verdict).
+        matched: list[tuple[int, str, float]] = []
+        for pos, eu in enumerate(evidence_index):
+            if eu.id in new_id_set:
+                continue
+            settled_pair = settled.get((question.id, eu.id))
+            if settled_pair is not None:
+                matched.append((pos, settled_pair[0], settled_pair[1]))
+                reused_total += 1
+        if new_positions:
+            new_matched = await _llm_match_evidence(
+                llm, question, [evidence_index[p] for p in new_positions])
+            for local_idx, relation_type, relevance in new_matched:
+                matched.append((new_positions[local_idx], relation_type, relevance))
 
         for eu_idx, relation_type, relevance in matched:
             eu = evidence_index[eu_idx]
@@ -258,6 +325,8 @@ async def update_coverage_matrix(db, state: ResearchState, llm, task_id: str,
                           output_data={
                               "questions_updated": len(questions),
                               "total_evidence": len(all_evidence),
+                              "new_evidence_matched": len(new_id_set),
+                              "settled_pairs_reused": reused_total,
                               "round": round_number,
                               "deltas": coverage_deltas,
                           })

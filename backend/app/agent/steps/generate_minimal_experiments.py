@@ -13,6 +13,7 @@ from app.config import settings
 from app.db.models import GapCandidate, GapPhenomenonPlan, InterventionCandidate
 from app.db.repositories import paper_repo
 from app.services import embedding_service
+from app.services.timing import StageTimings
 
 logger = logging.getLogger(__name__)
 
@@ -1444,6 +1445,11 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
     if not contract:
         return MinimalExperimentResult([], [])
 
+    # Sub-stage attribution (probe df744606: this phase cost 631-896s with only
+    # a phase-level number, so cluster vs triage vs per-idea scoring vs idea
+    # novelty retrieval were indistinguishable).
+    timings = StageTimings()
+
     interventions = db.query(InterventionCandidate).filter(
         InterventionCandidate.task_id == task_id,
         InterventionCandidate.contract_id == contract.id,
@@ -1511,7 +1517,8 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             gap.residual_gap or "", (audit.remaining_delta if audit else "") or "",
         ])
 
-        clusters = await _cluster_interventions_by_hypothesis(llm, phenomenon, gap_interventions)
+        with timings.stage("hypothesis_cluster"):
+            clusters = await _cluster_interventions_by_hypothesis(llm, phenomenon, gap_interventions)
         paper_repo.save_trace(db, task_id, "hypothesis_cluster", "decision", output_data={
             "gap_id": gap_id,
             "clustered": clusters is not None,
@@ -1539,8 +1546,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
         # budget, it never vetoes the hard gates. No verdict (degraded /
         # ID mismatch / <=K clusters) funds everything, exactly the pre-triage
         # behaviour.
-        triage_entries = await _triage_clusters_by_scientific_value(
-            db, llm, task_id, gap, phenomenon, audit, clusters)
+        with timings.stage("scientific_triage"):
+            triage_entries = await _triage_clusters_by_scientific_value(
+                db, llm, task_id, gap, phenomenon, audit, clusters)
         if triage_entries is not None:
             ranked = sorted(
                 clusters,
@@ -1831,7 +1839,8 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             ci = plan.construct_identification
             try:
                 from app.agent.steps.generate_ideas import _score_idea
-                score = await _score_idea(db, state, llm, idea)
+                with timings.stage("idea_scoring"):
+                    score = await _score_idea(db, state, llm, idea)
                 idea_score_val = (
                     0.20 * score.novelty + 0.20 * score.feasibility + 0.20 * score.significance +
                     0.20 * score.evidence_support + 0.10 * score.differentiation +
@@ -1846,9 +1855,10 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 # the cluster's hypothesis + primary mechanism; a direct prior-
                 # art implementation demotes the idea to conditional_review.
                 # Infrastructure failures degrade to a trace and never demote.
-                novelty_verdict, matched_paper_id, mechanism_relevant_ids = await _check_idea_novelty(
-                    db, state, llm, task_id, gap,
-                    cluster["hypothesis"], intervention, paper_ids)
+                with timings.stage("idea_novelty_check"):
+                    novelty_verdict, matched_paper_id, mechanism_relevant_ids = await _check_idea_novelty(
+                        db, state, llm, task_id, gap,
+                        cluster["hypothesis"], intervention, paper_ids)
                 if novelty_verdict == "already_implemented":
                     decision = "conditional_review"
                     quality_reason_codes.append("METHOD_ALREADY_PUBLISHED")
@@ -1908,6 +1918,30 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                 elif matched_paper_id and matched_paper_id not in paper_ids:
                     paper_ids.append(matched_paper_id)
                     idea.related_paper_ids_json = json.dumps(paper_ids, ensure_ascii=False)
+                # P4 (probe 0ae1a146, 2026-10-30): decision and final_score are
+                # TWO INDEPENDENT AXES — `decision` comes from the hard-gate
+                # tier (code), `final_score` from the LLM rubric. A live idea
+                # read `executable_candidate` at 0.697, below the 0.70 go line,
+                # which reads as a contradiction unless the axes are labelled.
+                # Record the disagreement explicitly instead of leaving the
+                # next reader to infer it from two numbers.
+                from app.config import settings as _score_settings
+                score_gate_line = _score_settings.idea_score_go_line
+                axes_note = {
+                    "decision_axis": "hard_gates",
+                    "score_axis": "llm_rubric",
+                    "score_above_go_line": final_score >= score_gate_line,
+                    "decision_above_go_line":
+                        decision == "executable_candidate",
+                }
+                if (decision == "executable_candidate"
+                        and final_score < score_gate_line):
+                    quality_reason_codes.append(
+                        "GATE_PASS_SCORE_BELOW_LINE")
+                elif (decision != "executable_candidate"
+                        and final_score >= score_gate_line):
+                    quality_reason_codes.append(
+                        "GATE_BLOCK_SCORE_ABOVE_LINE")
                 idea.quality_reason_codes_json = json.dumps(quality_reason_codes, ensure_ascii=False)
                 paper_repo.update_idea_scores(db, idea.id, score.model_dump(), final_score, decision)
                 paper_repo.save_trace(db, task_id, "idea_quality_gate", "decision", output_data={
@@ -1918,6 +1952,9 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
                     "cluster_hypothesis": cluster["hypothesis"] or None,
                     "status": decision,
                     "confidence_tier": tier,
+                    "final_score": round(final_score, 4),
+                    "score_go_line": score_gate_line,
+                    "axes": axes_note,
                     "reason_codes": quality_reason_codes,
                     "construct_identification": ci.model_dump(),
                 })
@@ -1994,11 +2031,13 @@ async def generate_minimal_experiments(db, state: ResearchState, llm, task_id: s
             # writes all starved while a sibling task sat inside this loop).
             db.commit()
 
+    with timings.stage("diversity_gate"):
+        await _apply_idea_diversity_gate(db, task_id)
     paper_repo.save_trace(db, task_id, "generate_minimal_experiments", "action", output_data={
         "idea_count": len(idea_ids),
         "experiment_count": len(experiment_ids),
+        "stage_timings": timings.as_dict(),
     })
-    await _apply_idea_diversity_gate(db, task_id)
     db.commit()
     return MinimalExperimentResult(idea_ids, experiment_ids, direction_only_idea_ids)
 

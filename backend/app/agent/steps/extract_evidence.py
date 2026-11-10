@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 
 from sqlalchemy.exc import OperationalError
 from app.agent.state import ResearchState
@@ -153,7 +154,9 @@ async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
     # the corpus a settled input: by the time extraction runs, availability is
     # already known and disclosed.
     if settings.enable_pdf_prewarm:
+        _t_prewarm = time.perf_counter()
         prewarm = await prewarm_pdfs(papers, task_id)
+        prewarm_seconds = round(time.perf_counter() - _t_prewarm, 1)
         logger.info(
             "Task %s: prewarm complete — %d/%d retrievable, %d unavailable "
             "(%s); extraction proceeds with what is on disk",
@@ -161,10 +164,14 @@ async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
             prewarm["unavailable"],
             ", ".join("{}={}".format(k, v) for k, v in sorted(prewarm["reasons"].items())) or "none",
         )
+    else:
+        prewarm_seconds = 0.0
 
     # (#4) Download PDFs first (before extraction)
+    _t_download = time.perf_counter()
     pdf_paths = await _download_pdfs(
         papers, task_id, concurrency=settings.pdf_prewarm_concurrency)
+    download_seconds = round(time.perf_counter() - _t_download, 1)
 
     # One shared semaphore spanning the whole paper set, rather than a fresh
     # per-batch one.
@@ -185,10 +192,24 @@ async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
     total_evidence = 0
     done = 0
 
+    # Per-paper wall-clock timing (probe df744606, 2026-10-30): one O2 round
+    # spent 1211s extracting 19 papers with only phase-level visibility — the
+    # slow stage (prewarm retries vs LLM extraction vs a single hung PDF)
+    # could not be attributed afterwards. Timing each paper pins it.
+    paper_timings: list[tuple[str, float]] = []
+
+    async def _timed_extract(paper, tp):
+        started = time.perf_counter()
+        try:
+            count = await _extract_from_paper_safe(
+                task_id, paper, tp, pdf_paths.get(paper.id), llm, round_number, semaphore
+            )
+            return count
+        finally:
+            paper_timings.append((paper.id, round(time.perf_counter() - started, 1)))
+
     results = await asyncio.gather(*[
-        _extract_from_paper_safe(
-            task_id, paper, tp, pdf_paths.get(paper.id), llm, round_number, semaphore
-        )
+        _timed_extract(paper, tp)
         for paper, tp in papers
     ], return_exceptions=True)
 
@@ -216,6 +237,26 @@ async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
     # Classify paper roles
     await _classify_paper_roles_safe(db, task_id, papers)
 
+    # Make "never assessed" explicit for papers outside the candidate set
+    # (probe df744606: 130 low-priority papers carried NULL extraction_status,
+    # indistinguishable from pre-0034 historical rows). NULL now survives only
+    # for rows written before this convention existed.
+    try:
+        from sqlalchemy import update
+        db.execute(
+            update(TaskPaper)
+            .where(TaskPaper.task_id == task_id,
+                   TaskPaper.extraction_status.is_(None),
+                   TaskPaper.priority.notin_(["high", "medium"]))
+            .values(extraction_status="not_assessed",
+                    extraction_gap_reason="below_priority_floor")
+        )
+        db.commit()
+    except Exception as exc:
+        logger.debug("Task %s: not_assessed backfill failed (non-fatal): %s",
+                     task_id[:8], exc)
+        db.rollback()
+
     logger.info("Task %s: extracted %d evidence units from %d papers (round %d)",
                 task_id[:8], total_evidence, len(papers), round_number)
 
@@ -225,6 +266,16 @@ async def extract_evidence_units(db, state: ResearchState, llm, task_id: str,
                               "total_evidence": total_evidence,
                               "papers_processed": len(papers),
                               "round": round_number,
+                              "stage_timings": {
+                                  "prewarm_s": prewarm_seconds,
+                                  "download_s": download_seconds,
+                              },
+                              "slowest_papers_s": [
+                                  {"paper_id": pid, "seconds": secs}
+                                  for pid, secs in sorted(paper_timings,
+                                                          key=lambda t: t[1],
+                                                          reverse=True)[:5]
+                              ],
                           })
     db.commit()
     return total_evidence

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 import re
 import logging
 import re
@@ -14,13 +15,15 @@ from app.config import settings
 from app.agent.state import ResearchState
 from app.agent.steps.generate_queries import SearchQueryExecution
 from app.agent.steps.search_papers import search_and_save_papers
-from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION
+from app.agent.steps.mine_gaps import current_mining_policy_version
 from app.agent.steps.gap_relevance import score_all_gap_candidates
+from app.agent.steps.corpus_recall import recall_corpus_neighbors
 from app.db.models import (EvidenceUnit, GapAudit, GapCandidate, GapPaperRelevance,
                           Paper, QuestionEvidenceLink,
                           SearchQueryPaper, SearchQueryRecord, SearchRawResult, TaskPaper)
 from app.db.repositories import gap_repo, paper_repo, task_repo
 from app.db.repositories.search_query_repo import save_search_query
+from app.services.timing import StageTimings
 
 logger = logging.getLogger(__name__)
 
@@ -113,10 +116,53 @@ _AUDIT_TEXT_CONFLICT_RE = re.compile(
 # neighbor full-text extraction; P0-2 full-text extraction admits work in
 # waves and stops once the verdict-ceiling requirement is met. The version
 # string bumps with the flag so persisted audit records are attributable.
+# The ablation arm's stamp. Declared as a constant (not derived from the switch)
+# so consumers can identify an ablation record by its STORED value, whatever the
+# switch happens to be when they read it back.
+ABLATION_SEARCH_POLICY_VERSION = "gap-search-ablation-none-v1"
+
 GAP_SEARCH_POLICY_VERSION = (
+    ABLATION_SEARCH_POLICY_VERSION if settings.gap_audit_disabled_ablation else
     "gap-search-budgeted-v16" if settings.gap_audit_budgeted else
     "gap-search-admission-v15" if settings.gap_audit_progressive
     else "gap-search-admission-v14")
+
+
+def audit_disabled() -> bool:
+    """True when the V2-no-audit ablation arm is active.
+
+    Read through a function (not the import-time constant) so tests and the
+    ablation service can flip it per process without reimporting the module.
+    """
+    from app.config import settings as _settings
+    return bool(_settings.gap_audit_disabled_ablation)
+
+
+def current_search_policy_version() -> str:
+    """The stamp to WRITE on a new audit record, resolved at call time.
+
+    `GAP_SEARCH_POLICY_VERSION` is an import-time constant, so it cannot express
+    a switch flipped after import. The ablated path must stamp
+    `gap-search-ablation-none-v1` for the arm's records to be separable from
+    real audits (`_latest_decided_audit` filters on this value), and getting it
+    wrong would silently let a no-audit row stand in for a real verdict.
+    """
+    from app.config import settings as _settings
+    if _settings.gap_audit_disabled_ablation:
+        return ABLATION_SEARCH_POLICY_VERSION
+    return GAP_SEARCH_POLICY_VERSION
+
+
+def effective_neighbor_budget(default: int) -> int:
+    """Neighbour budget with the experiment override applied, resolved at call time.
+
+    `audit_neighbors_override` is read here rather than folded into the module
+    constants because the same process must be able to report what it actually
+    used (the trace needs the effective value, not the configured default), and
+    because tests flip it without reimporting.
+    """
+    override = int(getattr(settings, "audit_neighbors_override", 0) or 0)
+    return max(override, 1) if override > 0 else max(default, 1)
 
 
 def _audit_budget() -> dict:
@@ -124,14 +170,19 @@ def _audit_budget() -> dict:
 
     Budgeted mode hard-caps every expensive dimension: 4 queries x 3 sources,
     Top-10 candidates, Top-3 neighbors, <=2 full-text papers (suspect killers
-    first), killer search <=3 queries, Top-1 gap competition. Legacy mode
+    first), killer search <=3 queries, Top-2 gap competition. Legacy mode
     returns the v14 knobs unchanged.
+
+    Only the neighbour count is overridable (`audit_neighbors_override`): it is
+    the one dimension the killer-funnel diagnosis identified as the binding
+    constraint, and the neighbour-budget experiment needs exactly that single
+    variable to move.
     """
     if settings.gap_audit_budgeted:
         return {
             "queries": max(settings.budgeted_audit_max_queries, 1),
             "candidates": max(settings.budgeted_audit_max_candidate_papers, 1),
-            "neighbors": max(settings.budgeted_audit_neighbors, 1),
+            "neighbors": effective_neighbor_budget(settings.budgeted_audit_neighbors),
             "fulltext": max(settings.budgeted_audit_fulltext_max_papers, 0),
             "killer_queries": max(settings.budgeted_killer_search_max_queries, 1),
             "sources": [s.strip() for s in
@@ -141,7 +192,7 @@ def _audit_budget() -> dict:
     return {
         "queries": settings.gap_audit_max_queries,
         "candidates": settings.gap_audit_max_candidate_papers,
-        "neighbors": _MAX_NEIGHBORS,
+        "neighbors": effective_neighbor_budget(_MAX_NEIGHBORS),
         "fulltext": settings.audit_neighbor_evidence_max_papers,
         "killer_queries": settings.killer_search_max_queries,
         "sources": None,
@@ -872,6 +923,21 @@ async def generate_english_adversarial_queries(db, llm, gap: GapCandidate) -> li
     return specs
 
 
+def collect_gap_support_papers(db, gap) -> list[str]:
+    """Papers behind the evidence this gap was derived from.
+
+    These are the gap's PREMISES, not its prior art: a claim cannot be
+    falsified by the papers that established it. Shared by neighbour selection
+    and by corpus-wide recall so both apply the same exclusion.
+    """
+    paper_ids = []
+    for link in gap_repo.list_gap_evidence(db, gap.id):
+        unit = db.get(EvidenceUnit, link.evidence_id)
+        if unit and unit.paper_id:
+            paper_ids.append(unit.paper_id)
+    return paper_ids
+
+
 def collect_same_question_neighbors(db, gap) -> list[str]:
     """Papers already in the corpus that speak to the same research questions.
 
@@ -1030,8 +1096,26 @@ def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS,
     # because they carry no adversarial-search signal, and are ordered by the
     # task's own relevance score.
     seen = {paper.id for paper in neighbors}
+    # Corpus-recall hits must be able to BECOME neighbours, not merely enter the
+    # candidate pool. Before this, the fallback only walked
+    # `collect_same_question_neighbors` (evidence links of the gap's own
+    # questions), so a paper surfaced by corpus recall sat in
+    # `candidate_paper_ids` (counted by admission, visible in
+    # `candidate_pool_size`) but could never be selected — measured on the
+    # neighbour-budget run: limit=8, pool=10, selected=2, cap_bound=False.
+    # Recall without selection is the same 67.1% loss bucket, just relocated.
+    fallback_ids: list[str] = list(collect_same_question_neighbors(db, gap))
+    # Recall hits are ranked by their persisted gap relevance (the same signal
+    # the screen uses), falling back to the task-level score for unscored ones.
+    recall_ids = [pid for pid in (allowed_ids or ())
+                  if pid not in stats and pid not in seen]
+    rel_map_all = {row.paper_id: row.relevance_score
+                   for row in gap_repo.list_gap_paper_relevance(db, gap.id)}
+    for paper_id in recall_ids:
+        if paper_id not in fallback_ids:
+            fallback_ids.append(paper_id)
     fallback = []
-    for paper_id in collect_same_question_neighbors(db, gap):
+    for paper_id in fallback_ids:
         if allowed_ids is not None and paper_id not in allowed_ids:
             continue
         if paper_id in seen or paper_id in stats:
@@ -1041,7 +1125,9 @@ def select_gap_specific_neighbors(db, gap, query_ids, limit=_MAX_NEIGHBORS,
             continue
         tp = db.query(TaskPaper).filter(TaskPaper.task_id == gap.task_id,
                                        TaskPaper.paper_id == paper_id).first()
-        fallback.append(((tp.final_score or 0.0) if tp else 0.0, paper))
+        # Gap relevance first (it is gap-specific), task score as tie-break.
+        fallback.append(((rel_map_all.get(paper_id, -1.0),
+                          (tp.final_score or 0.0) if tp else 0.0), paper))
     fallback.sort(key=lambda item: item[0], reverse=True)
     neighbors.extend(paper for _, paper in fallback[:limit - len(neighbors)])
     return neighbors
@@ -1171,7 +1257,7 @@ async def audit_gap_candidates(
     query = db.query(GapCandidate).filter(
         GapCandidate.task_id == task_id,
         GapCandidate.contract_id == state.contract_id,
-        GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
+        GapCandidate.mining_policy_version == current_mining_policy_version(),
         GapCandidate.status.in_(["candidate", "auditing", "audited"]),
     )
     if gap_ids is not None:
@@ -1180,7 +1266,12 @@ async def audit_gap_candidates(
     results = []
     from app.config import settings
     timeout_seconds = max(float(settings.gap_audit_timeout_seconds), 0.001)
+    # Per-gap attribution (probe df744606: `audit_gaps` cost 171-1057s with no
+    # breakdown across gaps, and one slow gap was indistinguishable from many
+    # slow gaps). One bucket per gap keeps the trace readable.
+    timings = StageTimings()
     for gap in gaps:
+        started = time.perf_counter()
         try:
             results.append(await asyncio.wait_for(
                 audit_gap_candidate(db, state, llm, task_id, gap, perform_search),
@@ -1191,6 +1282,12 @@ async def audit_gap_candidates(
             refreshed_gap = gap_repo.get_gap(db, gap.id)
             results.append(_record_audit_timeout(db, task_id, refreshed_gap, state.current_round + 1))
             logger.warning("Gap %s audit exceeded %.1fs and was capped", gap.id[:8], timeout_seconds)
+        finally:
+            timings.add(f"gap:{gap.id[:8]}", time.perf_counter() - started)
+    paper_repo.save_trace(db, task_id, "gap_audit_stage_timings", "action",
+                          round_number=state.current_round,
+                          output_data={"gap_count": len(gaps),
+                                       "stage_timings": timings.as_dict()})
     # Read the surviving set back from the database rather than from this batch:
     # when only some gaps are re-audited (e.g. after narrowing), gaps confirmed
     # by an earlier batch are still surviving and must not be dropped from the
@@ -1198,12 +1295,57 @@ async def audit_gap_candidates(
     state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
         GapCandidate.task_id == task_id,
         GapCandidate.contract_id == state.contract_id,
-        GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
+        GapCandidate.mining_policy_version == current_mining_policy_version(),
         GapCandidate.status == "surviving",
     ).all()]
     task_repo.save_state(db, task_id, state)
     db.commit()
     return results
+
+def _ablate_audit(db, state: ResearchState, task_id: str,
+                  gap: GapCandidate) -> GapAuditResult:
+    """V2-no-audit ablation arm: pass every selected gap through unchanged.
+
+    What this deliberately does NOT do: generate adversarial queries, search any
+    source, extract neighbour evidence, or judge novelty. What it must still do
+    is leave a record a reader can attribute — so the gap is stamped surviving
+    with a distinct `search_policy_version` (`gap-search-ablation-none-v1`) and
+    an `ABLATION_NO_AUDIT` failure code, and `audit_result` is `confirmed` only
+    because "no falsification was attempted" must not be encoded as `uncertain`
+    (that would make the arm abstain by construction instead of measuring what
+    the pipeline produces without an auditor).
+
+    `remaining_delta` is filled with the gap's own claimed delta, so downstream
+    prompts receive real text rather than an empty field, and no neighbour ids
+    are offered (there are none).
+    """
+    gap.status = "surviving"
+    gap_repo.create_gap_audit(
+        db, gap_id=gap.id, task_id=task_id, adversarial_queries=[],
+        audit_result="confirmed",
+        neighbor_paper_ids=[],
+        recommended_action="continue",
+        audit_round=state.current_round + 1,
+        novelty_confidence=None,
+        remaining_delta=gap.claimed_delta or None,
+        search_policy_version=current_search_policy_version(),
+        search_admission_status="PASS",
+        search_admission_reasons=["ABLATION_NO_AUDIT"],
+        search_query_ids=[],
+        audited_claimed_delta=gap.claimed_delta or "",
+        failure_reason_codes=["ABLATION_NO_AUDIT"],
+        evidence_delta={"query_count": 0, "candidate_paper_count": 0,
+                        "new_paper_count": 0, "new_evidence_count": 0},
+    )
+    db.commit()
+    paper_repo.save_trace(db, task_id, "gap_audit_ablation_pass", "decision",
+                          output_data={"gap_id": gap.id,
+                                       "gap_type": gap.gap_type,
+                                       "policy": GAP_SEARCH_POLICY_VERSION,
+                                       "searched": False,
+                                       "judged": False})
+    return GapAuditResult(gap.id, "confirmed", "continue", "")
+
 
 def _latest_decided_audit(db, gap_id: str) -> GapAudit | None:
     """The most recent audit that actually had comparison material to judge.
@@ -1374,6 +1516,9 @@ async def audit_gap_candidate(
     if gap.task_id != task_id:
         raise ValueError("Gap does not belong to task")
 
+    if settings.gap_audit_disabled_ablation:
+        return _ablate_audit(db, state, task_id, gap)
+
     gap.status = "auditing"
     atomic_claims = await _ensure_atomic_claims(db, llm, gap, task_id)
     audit_round = state.current_round + 1
@@ -1473,19 +1618,87 @@ async def audit_gap_candidate(
     # (Task 9e56a131: 7/9 audits timed out with everything lost.)
     db.commit()
     admission = evaluate_gap_search_admission(db, gap, [item.query_id for item in executions])
+    # Corpus-wide semantic recall (2026-11-02, killer-funnel diagnosis): the
+    # pool used to be the gap's adversarial search plus the evidence-linked
+    # papers of its OWN questions. Of the 82 killer papers the independent
+    # reviewer named that the task corpus already held, 55 (67.1%) were never
+    # admitted to any pool — so the audit judged novelty on a 3-paper slice that
+    # structurally could not contain them. Union recall hits in BEFORE the cap
+    # so they compete on gap relevance rather than being cut on arrival.
+    if admission.status == "PASS" or admission.candidate_paper_ids:
+        recall_ids, recall_diag = recall_corpus_neighbors(db, gap, task_id)
+        recall_diag["gap_id"] = gap.id
+        recall_diag["pool_size_before"] = len(admission.candidate_paper_ids)
+        if recall_ids:
+            unioned = list(dict.fromkeys(
+                list(admission.candidate_paper_ids) + list(recall_ids)))
+            admission = replace(
+                admission,
+                candidate_paper_ids=sorted(unioned),
+                external_neighbor_ids=sorted(set(admission.external_neighbor_ids)
+                                             | set(recall_ids)),
+            )
+        recall_diag["pool_size_after"] = len(admission.candidate_paper_ids)
+        paper_repo.save_trace(db, task_id, "gap_audit_corpus_recall", "decision",
+                              output_data=recall_diag)
     candidate_cap = max(audit_budget["candidates"], 1)
     original_candidate_count = len(admission.candidate_paper_ids)
-    if original_candidate_count > candidate_cap:
+    # Screen BEFORE capping when configured: the cap used TaskPaper.final_score,
+    # which measures task/RQ relevance, not closeness to THIS gap. In the pilot,
+    # 17 of 82 in-corpus killers were dropped by that cap without ever being
+    # scored against the gap they would have falsified.
+    pre_screen_applied = False
+    if settings.audit_screen_before_cap and original_candidate_count > candidate_cap:
+        try:
+            pre_screen = await score_all_gap_candidates(
+                db, llm, gap, admission.candidate_paper_ids, task_id)
+            if pre_screen:
+                pre_screen_applied = True
+                rel = {pid: score for pid, score, _ in pre_screen}
+                admission = replace(
+                    admission,
+                    candidate_paper_ids=sorted(
+                        admission.candidate_paper_ids,
+                        key=lambda pid: (-rel.get(pid, -1.0), pid))[:candidate_cap],
+                )
+                paper_repo.save_trace(db, task_id, "gap_audit_screen_before_cap",
+                                      "decision", output_data={
+                                          "gap_id": gap.id,
+                                          "cap": candidate_cap,
+                                          "pool_size": original_candidate_count,
+                                          "scored": len(pre_screen),
+                                          "kept": len(admission.candidate_paper_ids),
+                                          "kept_top_relevance": [
+                                              rel.get(pid) for pid in
+                                              admission.candidate_paper_ids[:5]],
+                                      })
+        except Exception as exc:
+            logger.warning("Gap %s: pre-cap relevance screen failed (non-fatal, "
+                           "falling back to score-based cap): %s",
+                           gap.id[:8], exc)
+    if not pre_screen_applied and original_candidate_count > candidate_cap:
         capped_ids = _cap_gap_candidate_papers(db, admission.candidate_paper_ids, candidate_cap)
-        capped_set = set(capped_ids)
-        capped_external = [pid for pid in admission.external_neighbor_ids if pid in capped_set]
+        admission = replace(admission, candidate_paper_ids=capped_ids)
+        paper_repo.save_trace(db, task_id, "gap_audit_candidate_cap", "decision", output_data={
+            "gap_id": gap.id, "configured_limit": candidate_cap,
+            "original_count": original_candidate_count, "capped_count": len(capped_ids),
+            "reason_code": "AUDIT_CANDIDATE_CAP_REACHED",
+        })
+    if len(admission.candidate_paper_ids) < original_candidate_count:
+        # Whichever path shrank the pool (pre-cap screen or score-based cap) has
+        # to re-derive admission: the external-neighbour and minimum-count
+        # guarantees were evaluated on the pre-cap pool, so a cap that removed
+        # every external paper must not leave a stale PASS behind.
+        kept_set = set(admission.candidate_paper_ids)
+        capped_external = [pid for pid in admission.external_neighbor_ids
+                           if pid in kept_set]
         capped_reasons = list(admission.reason_codes) + ["AUDIT_CANDIDATE_CAP_REACHED"]
         constrained = settings.constrained_retrieval_mode
         min_admitted_papers = (
             settings.gap_admission_min_gap_papers_constrained
             if constrained else settings.gap_admission_min_gap_papers
         )
-        if len(capped_ids) < min_admitted_papers:
+        if len(admission.candidate_paper_ids) < min_admitted_papers:
             capped_reasons.append("INSUFFICIENT_GAP_SPECIFIC_PAPERS")
         if not capped_external:
             capped_reasons.append("NO_EXTERNAL_NEIGHBOR")
@@ -1494,15 +1707,9 @@ async def audit_gap_candidate(
         admission = replace(
             admission,
             status="PASS" if not blocking_reasons else "UNKNOWN",
-            candidate_paper_ids=capped_ids,
             external_neighbor_ids=capped_external,
             reason_codes=sorted(set(capped_reasons)),
         )
-        paper_repo.save_trace(db, task_id, "gap_audit_candidate_cap", "decision", output_data={
-            "gap_id": gap.id, "configured_limit": candidate_cap,
-            "original_count": original_candidate_count, "capped_count": len(capped_ids),
-            "reason_code": "AUDIT_CANDIDATE_CAP_REACHED",
-        })
     _save_search_admission_trace(db, task_id, admission)
     if admission.status != "PASS":
         gap.status = "auditing"
@@ -1555,6 +1762,36 @@ async def audit_gap_candidate(
         candidate_paper_ids=admission.candidate_paper_ids,
         limit=audit_budget["neighbors"],
     )
+    # Neighbour-budget experiment instrumentation (2026-11-03). The arms differ
+    # ONLY in `limit` above, so the trace must record what was actually used and
+    # how much of the retrieved pool it could see — otherwise a null result
+    # cannot be separated from "the extra neighbours were low-relevance noise"
+    # or "the cap never bound because the pool was small".
+    try:
+        _rel_rows = gap_repo.list_gap_paper_relevance(db, gap.id)
+        _rel_map = {row.paper_id: row.relevance_score for row in _rel_rows}
+        _floor = settings.gap_relevance_min_neighbor
+        _below = sum(1 for paper in neighbors
+                     if _rel_map.get(paper.id) is not None
+                     and _rel_map[paper.id] < _floor) if _floor > 0 else 0
+        paper_repo.save_trace(db, task_id, "gap_audit_neighbor_budget", "decision",
+                              output_data={
+                                  "gap_id": gap.id,
+                                  "configured_default":
+                                      settings.budgeted_audit_neighbors,
+                                  "override": int(getattr(
+                                      settings, "audit_neighbors_override", 0) or 0),
+                                  "effective_limit": audit_budget["neighbors"],
+                                  "selected_count": len(neighbors),
+                                  "cap_bound": len(neighbors) >= audit_budget["neighbors"],
+                                  "candidate_pool_size":
+                                      len(admission.candidate_paper_ids),
+                                  "relevance_floor": _floor,
+                                  "selected_below_floor": _below,
+                              })
+    except Exception as exc:
+        logger.warning("Gap %s: neighbour-budget trace failed (non-fatal): %s",
+                       gap.id[:8], exc)
     # v15 P0-1 (progressive mode): repeated-round stop signals run BEFORE
     # full-text extraction. Legacy mode keeps the post-extraction check below
     # so v14 semantics are untouched while the 24-topic run is in flight.
@@ -1903,6 +2140,57 @@ async def audit_gap_candidate(
     # and claim-derived confirmed verdicts.
     _apply_audit_verdict_ceiling(
         db, task_id, gap, decision, failure_codes, killer_work, neighbors)
+
+    # P1 (probe df744606, 2026-10-30): an uncertain verdict gets ONE
+    # killer-directed search before it may enter the remediation loop. The
+    # probe's two uncertain audits both recorded "the direct-hit prior work
+    # was not retrieved" while their own killer descriptions named exactly
+    # what to look for — and each of those verdicts bought a ~20-minute O2
+    # remediation round that ended uncertain again. Searching the named
+    # killer is the cheapest possible resolution: a hit CLOSES the gap
+    # (prior art found, remediation cancelled); no hit leaves the verdict
+    # untouched. Only runs when the confirmed-path killer search did not
+    # already execute this round (record without query_terms).
+    if (decision.audit_result == "uncertain"
+            and decision.recommended_action == "more_search"
+            and killer_work.get("skipped") == "guard"
+            and perform_search):
+        uncertain_killer = await _run_killer_search(
+            db, state, task_id, gap, decision, neighbors, audit_round,
+            perform_search=True, for_uncertain=True)
+        # Trace BOTH outcomes: without the miss record a run cannot distinguish
+        # "guard skipped the search" from "search ran and found nothing" (the
+        # first verification run of this guard had exactly that blind spot).
+        paper_repo.save_trace(db, task_id, "gap_audit_uncertain_killer_search",
+                              "action", output_data={
+                                  "gap_id": gap.id,
+                                  "ran": not uncertain_killer.get("skipped"),
+                                  "skip_reason": uncertain_killer.get("skipped"),
+                                  "hit_count": len(uncertain_killer.get("killer_hits") or []),
+                                  "query_terms": uncertain_killer.get("query_terms"),
+                                  "examined_paper_ids": uncertain_killer.get("retrieved_paper_ids"),
+                                  "search_degraded": bool(uncertain_killer.get("search_degraded")),
+                              })
+        if uncertain_killer.get("killer_hits"):
+            failure_codes.append("UNCERTAIN_KILLER_FOUND")
+            decision.audit_result = "closed"
+            decision.recommended_action = "reject"
+            decision.novelty_confidence = min(decision.novelty_confidence, 0.2)
+            decision.rejection_reason = (
+                "uncertain killer search recalled strongly matching prior work "
+                "for the audit's own killer description: "
+                + "; ".join(h["paper_id"] for h in uncertain_killer["killer_hits"][:3])
+            )
+            paper_repo.save_trace(db, task_id, "gap_audit_uncertain_killer_found",
+                                  "decision", output_data={
+                                      "gap_id": gap.id,
+                                      "hits": uncertain_killer["killer_hits"],
+                                      "original_verdict": "uncertain/more_search",
+                                      "closed_to": "closed/reject",
+                                  })
+            logger.warning("Gap %s: uncertain killer search hit %d paper(s); "
+                           "closing instead of remediating", gap.id[:8],
+                           len(uncertain_killer["killer_hits"]))
 
     action = decision.recommended_action
     # P1 (run10 review): diminishing-return stop. The existing undecidable
@@ -2436,7 +2724,8 @@ def _killer_query_source_distribution(gap: GapCandidate, llm_terms: list[str],
 
 
 async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
-                             audit_round, perform_search: bool = True) -> dict:
+                             audit_round, perform_search: bool = True,
+                             for_uncertain: bool = False) -> dict:
     """One final adversarial search for the audit's own named killer (P1.2).
 
     The verdict names the paper that would kill the gap; searching for exactly
@@ -2454,6 +2743,13 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
     never matches the coined term. Neighbor titles are the cheapest source
     of real community terminology, so salient title phrases closest to the
     killer description complement the LLM's terms.
+
+    for_uncertain (2026-10-30, probe df744606): also run for
+    uncertain/more_search verdicts. The probe's two uncertain audits both
+    said "the direct-hit prior work was not retrieved" — the audit NAMED the
+    killer but never searched for it, because this guard used to admit only
+    confirmed verdicts. The uncertain path searches the same description; a
+    hit closes the gap instead of entering the remediation loop.
     """
     terms = [t.strip() for t in (decision.killer_query_terms or []) if t.strip()]
     record = {
@@ -2464,7 +2760,10 @@ async def _run_killer_search(db, state, task_id, gap, decision, neighbors,
     }
     if (decision.killer_found or not terms
             or not (decision.closest_killer_work or "").strip()
-            or decision.audit_result != "confirmed"):
+            or (decision.audit_result != "confirmed" and not for_uncertain)):
+        # Explicit marker: the record still carries the LLM's query_terms, so
+        # callers must NOT use their presence to infer the search ran.
+        record["skipped"] = "guard"
         return record
     if not perform_search:
         record["skipped"] = "perform_search_disabled"

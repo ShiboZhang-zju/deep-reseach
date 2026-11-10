@@ -17,6 +17,8 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from pydantic import BaseModel, Field
+
 from app.agent.evidence_relations import (
     CONTRADICTING_RELATIONS,
     MIN_RELATION_RELEVANCE,
@@ -27,6 +29,7 @@ from app.db.models import EvidenceUnit, QuestionEvidenceLink, ResearchContract, 
 from app.db.repositories import gap_repo, paper_repo
 from app.schemas.schemas import GapCandidateList
 from app.services.embedding_service import cosine_similarity, embed_texts
+from app.services.timing import StageTimings
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +90,57 @@ _MAX_CONTRADICTING_PER_QUESTION = 2
 # explicitly (>=1 source-domain mechanism unit + >=1 target-domain problem
 # unit via the source_domain_evidence_ids / target_evidence_ids schema
 # fields), not merely two arbitrary papers.
-GAP_MINING_POLICY_VERSION = "opportunity-ontology-v7.1"
+# v7.2 (2026-10-30, pilot adjudication 2026-10-29): two admission fixes driven
+# by the blind-review false-open breakdown —
+#   1. boundary_gap rejects PERFORMANCE_TARGET_DELTA: a claimed_delta led by
+#      an outcome verb ("achieves >10% accuracy", "improves X by >25%") states
+#      a performance target, not a boundary condition. Both human-true
+#      survivors of the pilot were exactly this shape, and the reviewer
+#      flagged them target_only ("NONE does not mean a credible gap").
+#   2. scaling_regime admission gains a claim-level precedent retrieval
+#      (SCALING_RANGE_ALREADY_MEASURED): 4 of 7 v7-only scaling_regime
+#      opportunities were false-open because the claimed "untested range" had
+#      already been measured by work outside the evidence pool. Adversarial
+#      queries -> retrieval -> conservative verdict; infra failures degrade
+#      to a trace and never reject (same contract as the idea novelty check).
+GAP_MINING_POLICY_VERSION = "opportunity-ontology-v7.2"
+
+# Legacy v6 mining mode (fixed-budget experiment arm B, 2026-10-31). Distinct
+# from the historical "evidence-admission-v6" stamp so experiment rows are
+# separable from the 281 historical ones.
+V6_EXPERIMENTAL_POLICY_VERSION = "evidence-admission-v6-exp"
+
+
+def current_mining_policy_version() -> str:
+    """The policy stamp this process stamps and filters candidates by.
+
+    Import-time constants cannot express a mode switch, and every consumer
+    (mining stamps, audit candidate filters, runner gap selection) must agree
+    on ONE value per process — the experiment's arm services resolve this
+    differently (arm A: v7.2, arm B: v6-exp) but never mix within a process.
+    """
+    from app.config import settings
+    if settings.gap_mining_legacy_v6_mode:
+        return V6_EXPERIMENTAL_POLICY_VERSION
+    return GAP_MINING_POLICY_VERSION
+
+
+def _settings_v6_mode() -> bool:
+    """Read the v6 control-arm switch (imported lazily for test monkeypatching)."""
+    from app.config import settings
+    return bool(settings.gap_mining_legacy_v6_mode)
+
+
+def _settings_operationalization_gate() -> bool:
+    """Read the v7.3 candidate gate switch (OFF by default, see the rule)."""
+    from app.config import settings
+    return bool(settings.gap_mining_operationalization_gate)
+
+
+def _settings_conjunction_gate() -> bool:
+    """Read the conjunction-only gate switch (OFF by default, see the rule)."""
+    from app.config import settings
+    return bool(settings.gap_mining_conjunction_gate)
 
 # Max candidates accepted from a single opportunity lens — the fan-out's total
 # breadth stays bounded (7 lenses x 2 = 14 per round before gates), and the
@@ -103,6 +156,344 @@ _PLACEHOLDER_OPERAND_RE = re.compile(
     r"|\b[XYN]\s*%"
     r"|\b[XYN]\s+(?:samples?|papers?|parameters?|examples?|labels?|units?)\b",
 )
+
+# v7.2 (pilot adjudication 2026-10-29): a boundary_gap's claimed_delta must
+# state WHERE/WHEN existing work fails or was never tested. A delta led by an
+# outcome verb ("Achieves >10% higher accuracy ... while maintaining <5%
+# latency overhead") is a performance target — the two human-true survivors of
+# the pilot's false-open-heavy pool were both exactly this shape, and the
+# reviewer flagged them target_only ("NONE does not mean a credible gap": an
+# unprecedent performance number is not a research boundary). The check is
+# deliberately conservative: it only fires on an outcome-verb LEAD and exempts
+# any delta that also carries boundary language ("fails", "not evaluated",
+# "no prior work", ...), so legitimate boundary statements phrased around a
+# measurement ("methods degrade beyond 10% noise") pass untouched.
+_PERFORMANCE_TARGET_LEAD_RE = re.compile(
+    r"^\W*(?:achiev\w*|attain\w*|reach(?:es)?|improv\w*|outperform\w*|boost\w*|"
+    r"increas\w*|reduc\w*|lower\w*|deliver\w*|yield\w*|obtain\w*|enhanc\w*)\b",
+    re.IGNORECASE,
+)
+_BOUNDARY_LANGUAGE_RE = re.compile(
+    r"\b(?:fail\w*|degrad\w*|break\w*|boundar\w*|limitation\w*|untested|unexplored|"
+    r"not\s+(?:been\s+)?(?:evaluat|test|stud|explor|measure|report)\w*|"
+    r"no\s+(?:prior\s+|previous\s+)?(?:work|study|studies|evaluation|report)\w*|"
+    r"remains?\s+(?:untested|unknown|unexplored)|unknown\s+(?:whether|if)|"
+    r"never\s+(?:been\s+)?(?:evaluat|test|stud)\w*|stops?\s+working|"
+    r"未(?:曾|经)?(?:评测|评估|测试|研究|探索)|无(?:先例|先前工作|相关工作)|"
+    r"(?:失|退|崩|泛化)化|边界|局限)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_performance_target_delta(claimed_delta: str) -> bool:
+    """True when a boundary_gap delta is an outcome target, not a boundary."""
+    text = (claimed_delta or "").strip()
+    if not text:
+        return False
+    if _BOUNDARY_LANGUAGE_RE.search(text):
+        return False
+    return bool(_PERFORMANCE_TARGET_LEAD_RE.search(text))
+
+
+# --- v7.3 candidate: operationalization-only delta (OFF by default) ---------
+# Diagnosis (2026-11-02, fixed-budget pilot's 37 reviewed gaps): 26 of 37 deltas
+# lead with a measurement verb ("Provide the first quantitative estimate...",
+# "Quantify ... for at least 3 methods") and carry no mechanism vocabulary.
+# Independent review returned 3 FULL / 23 PARTIAL / 0 NONE on that group: the
+# reviewer kept writing "the specific operationalisation is not directly
+# reported, but the substantive delta is executed by [n]". That is not a gap —
+# it is an unexploited template over material that already exists.
+#
+# The rule below fires on measurement-verb lead + at least one conjunction of
+# deliverables + no mechanism vocabulary. On the same 37 units it fires on 5
+# (3 FULL, 2 PARTIAL) with 60.0% false-open vs a 10.8% base rate, and loses no
+# NONE. That is a SMALL, POST-HOC-FIT sample: the rule was derived from the same
+# units it is scored on, so it is not evidence that it generalises.
+#
+# Therefore it ships DISABLED. Enabling it requires an out-of-sample check
+# (the 24-topic production_e2e pool), and it must never be enabled together
+# with a claim that it improves credibility — that is exactly the unvalidated
+# mechanism the project's own pre-registration discipline forbids.
+_OPERATIONAL_LEAD_RE = re.compile(
+    r"^\W*(?:provide|quantify|measure|characteri[sz]e|estimate|report|map|"
+    r"extend|establish|offer|deliver|present|evaluate|benchmark)\b",
+    re.IGNORECASE,
+)
+_MECHANISM_VOCAB_RE = re.compile(
+    r"\b(?:mechanism|causal|because|why|attribut\w*|mediate\w*|drives?|"
+    r"govern\w*|underlying|explain\w*|intervention|procedure|protocol)\b",
+    re.IGNORECASE,
+)
+_MULTI_ELEMENT_RE = re.compile(
+    r"\b(?:and\s+(?:test|show|compare|evaluate|quantify|report)|as well as|"
+    r"for at least \w+|across (?:at least )?\w+ "
+    r"(?:methods|domains|families|scales|disciplines)|combined|jointly)\b",
+    re.IGNORECASE,
+)
+
+
+# --- conjunction-only delta (2026-11-06, neighbour-budget experiment) -------
+# Diagnosis. In the 3-vs-8 run, independent blind review returned
+#   NONE=0, PARTIAL=26, FULL=2 over 28 audited gaps (RESULTS.md §2),
+# so the primary metric T=NONE/(...) was 0.0% in BOTH arms: no headroom.
+#
+# CORRECTION (2026-11-09). An earlier version of this comment claimed the
+# ingredients-covered-but-not-the-combination argument was the dominant PARTIAL
+# reason at "12/26 = 46%". That figure was inflated by a loose regex that
+# counted any occurrence of "both" / "together" / "combines", and by summing
+# non-exclusive categories. Strict matching gives 2/26 = 8%.
+#
+# What the PARTIAL rationales actually say (32 PARTIALs, incl. out-of-sample):
+#   "partially covers the claim"                     50%
+#   "adjacent work exists, but in a different setting" 50%   <-- the rubric's
+#                                                              catch-all
+#   ingredients-covered-not-combination (strict)      8%
+#
+# So the conjunction shape is NOT the main driver. The main driver is the
+# rubric clause "covers it in a different setting", which any adjacent paper
+# satisfies — and every real topic has adjacent papers. A calibration probe
+# settled it: an absurd claim with ZERO adjacent work (LLM inference under
+# lunar gravity) was returned as NONE; a realistic claim was returned PARTIAL.
+# See eval_results/neighbor_budget/GAP_SUPPLY_VALIDATION.md §4.
+#
+# Out-of-sample check of the prompt fix: 24 newly mined deltas carried no
+# numbers and no configuration phrasing (was 74%/59%), yet blind review returned
+# 6/6 PARTIAL, NONE=0. Shape changed; the verdict did not.
+#
+# The rule below is therefore NOT the fix for NONE=0. It is kept only because a
+# pure conjunction is still structurally unanswerable as NONE (every ingredient
+# is published) — a narrow, real, but secondary effect.
+#
+# An earlier attempt in this session stripped numeric/configuration material
+# and fired on 0/116 — it was measuring the wrong shape and is not shipped.
+#
+# SHIPS DISABLED, same discipline as the operationalization gate above: the
+# rule was derived from the same 28 units it would be scored on, and enabling
+# it without an out-of-sample check would repeat the v7.3 mistake.
+_CONJ_ENUM_RE = re.compile(
+    r"(?:\(\s*(?:i{1,3}|iv|v|[a-d]|[1-4])\s*\))"      # (i) (ii) / (1) (2)
+    # 3+ conjoined clauses within one sentence. The gaps between the "and"s are
+    # generous (160 chars) because real deltas pad each clause with its own
+    # qualifier ("on 2 tasks and under 3 graded OOD-shift levels"). The
+    # separator excludes sentence-final punctuation but NOT a period that is
+    # part of a decimal ("1.5x"), otherwise ordinary numeric deltas never fire.
+    r"|(?:\band\b(?:(?<!\d)\.|[\s,;:()\w%<>=~\-]){0,160}?\band\b"
+    r"(?:(?<!\d)\.|[\s,;:()\w%<>=~\-]){0,160}?\band\b)",
+    re.IGNORECASE,
+)
+_CONJ_WORD_RE = re.compile(
+    r"\b(?:combin\w*|conjunct\w*|jointly|simultaneous\w*|at once|"
+    r"all of (?:the )?(?:three|four)|"
+    r"(?:two|three|four)\s+(?:components?|aspects?|dimensions?|signals?|"
+    r"conditions?|channels?|stages?|axes))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_conjunction_only_delta(claimed_delta: str, missing_capability: str = "") -> bool:
+    """True when a delta is an arrangement of already-published ingredients.
+
+    Fires on an explicit enumeration/conjunction marker in `claimed_delta`.
+    Deliberately does NOT fire on a delta that merely contains one "and": the
+    three-clause pattern and the enumeration/combination vocabulary are what
+    the reviewed failures actually had.
+    """
+    text = (claimed_delta or "").strip()
+    if not text:
+        return False
+    if _CONJ_WORD_RE.search(text):
+        return True
+    return bool(_CONJ_ENUM_RE.search(text))
+
+
+def _is_operationalization_only_delta(claimed_delta: str) -> bool:
+    """True when a delta asks for a particular measurement, not a mechanism.
+
+    Conservative on purpose: requires a measurement-verb lead AND a
+    multi-deliverable conjunction AND no mechanism vocabulary. A delta that
+    merely quantifies ONE thing ("measure ECE under drift") does not fire — that
+    can be a real missing evaluation.
+    """
+    text = (claimed_delta or "").strip()
+    if not text:
+        return False
+    if _MECHANISM_VOCAB_RE.search(text):
+        return False
+    if not _OPERATIONAL_LEAD_RE.search(text):
+        return False
+    return bool(_MULTI_ELEMENT_RE.search(text))
+
+
+# --- v7.2: claim-level precedent retrieval for scaling_regime --------------
+# Modelled on the idea novelty quick-check (generate_minimal_experiments):
+# adversarial queries -> retrieval -> conservative verdict. ONLY a positive
+# "covered" verdict rejects the candidate; every infrastructure failure
+# degrades to a trace (an external-source outage is not evidence about the
+# claim) — mirroring the idea novelty check's fail-open contract.
+
+_SCALING_PRECEDENT_QUERIES_SYSTEM = """You generate adversarial search queries that would retrieve prior work already measuring inside a claimed untested scale or regime range.
+Rules:
+- Output English only.
+- At most 2 queries, 3-8 words each.
+- Anchor on the claimed range's dimensions (scale, sequence length, memory/budget, model size, frequency) together with the behaviour, e.g. "long documents beyond 32k tokens efficiency", "sub-1B parameter retrieval augmentation".
+- The goal is FALSIFICATION: find work that already measured in the claimed range."""
+
+_SCALING_PRECEDENT_VERDICT_SYSTEM = """You are a conservative judge deciding whether a retrieved paper already reports measurements inside a claimed untested scale/regime range.
+Set range_already_measured=true ONLY if the paper clearly reports evaluating the same behaviour in the claimed range or an overlapping one (the abstract must show the measurement, not just propose or discuss it).
+A paper studying the behaviour in a DIFFERENT range, or only proposing methods without measuring, is NOT coverage — answer false.
+If true, set evidence_paper_id to that paper's id from the provided list."""
+
+
+class ScalingPrecedentQueriesSchema(BaseModel):
+    queries: list[str] = Field(default_factory=list)
+
+
+class ScalingPrecedentVerdictSchema(BaseModel):
+    range_already_measured: bool = False
+    evidence_paper_id: str | None = None
+
+
+async def _scaling_regime_precedent_check(db, state, llm, task_id, candidate):
+    """Claim-level precedent retrieval for one scaling_regime candidate.
+
+    Pilot adjudication (2026-10-29): 4 of 7 v7-only scaling_regime opportunities
+    were blind-judged false-open — the claimed "untested range" had already
+    been measured by prior work the evidence pool never saw. The per-type
+    admission contract therefore gains this check.
+
+    Returns (verdict, matched_paper_id) with verdict one of:
+    - "disabled":           check turned off by configuration
+    - "covered":            a retrieved paper already measures in the claimed
+                            range -> reject SCALING_RANGE_ALREADY_MEASURED
+    - "passed":             retrieval succeeded, no covering measurement found
+    - "passed_no_results":  retrieval succeeded but returned nothing
+    - "degraded":           infrastructure failure (LLM/search). NEVER rejects.
+    """
+    from app.config import settings
+
+    if not settings.gap_mining_precedent_check_enabled:
+        return "disabled", None
+    from app.agent.steps.generate_queries import SearchQueryExecution
+    from app.agent.steps.search_papers import search_and_save_papers
+    from app.db.models import Paper, SearchQueryPaper
+    from app.db.repositories.search_query_repo import save_search_query
+
+    claim = (candidate.claimed_delta or "").strip()
+    if not claim:
+        return "passed", None
+
+    queries: list[str] = []
+    try:
+        spec = await llm.chat_json([
+            {"role": "system", "content": _SCALING_PRECEDENT_QUERIES_SYSTEM},
+            {"role": "user", "content": json.dumps({
+                "claimed_delta": claim,
+                "target_setting": candidate.target_setting or "",
+                "observed_problem": candidate.observed_problem or "",
+            }, ensure_ascii=False)},
+        ], ScalingPrecedentQueriesSchema)
+        queries = [q.strip() for q in (spec.queries if spec else [])
+                   if q and q.strip()][:2]
+    except Exception as exc:
+        logger.warning("Task %s: scaling precedent query generation degraded: %s",
+                       task_id[:8], exc)
+        paper_repo.save_trace(db, task_id, "scaling_precedent_check", "decision", output_data={
+            "claimed_delta": claim[:200], "verdict": "degraded",
+            "stage": "query_generation", "error": str(exc)[:200],
+        })
+        return "degraded", None
+    if not queries:
+        paper_repo.save_trace(db, task_id, "scaling_precedent_check", "decision", output_data={
+            "claimed_delta": claim[:200], "verdict": "degraded",
+            "stage": "query_generation", "error": "no queries returned",
+        })
+        return "degraded", None
+
+    round_num = state.current_round
+    # Bind each query to the candidate's first cited question (the execution
+    # record requires a non-null target; the gap row does not exist yet, so
+    # target_gap_id cannot be used here).
+    target_question_id = candidate.question_ids[0] if candidate.question_ids else None
+    executions = []
+    for idx, text in enumerate(queries):
+        record = save_search_query(
+            db, task_id, text, f"scaling_precedent_{idx + 1}",
+            target_question_id, "scaling_precedent", round_num,
+        )
+        executions.append(SearchQueryExecution(
+            query_id=record.id, query_text=text,
+            intent=f"scaling_precedent_{idx + 1}",
+            target_question_id=target_question_id,
+            expected_evidence_type=None,
+        ))
+    db.commit()
+    try:
+        await search_and_save_papers(db, state, executions, task_id, round_num)
+    except Exception as exc:
+        logger.warning("Task %s: scaling precedent retrieval degraded: %s",
+                       task_id[:8], exc)
+        paper_repo.save_trace(db, task_id, "scaling_precedent_check", "decision", output_data={
+            "claimed_delta": claim[:200], "queries": queries,
+            "verdict": "degraded", "stage": "retrieval", "error": str(exc)[:200],
+        })
+        return "degraded", None
+
+    top_rows = (
+        db.query(SearchQueryPaper, Paper)
+        .join(Paper, SearchQueryPaper.paper_id == Paper.id)
+        .filter(SearchQueryPaper.query_id.in_([e.query_id for e in executions]))
+        .order_by(SearchQueryPaper.rank)
+        .limit(settings.gap_mining_precedent_check_top_k * 3)
+        .all()
+    )
+    seen_ids: set[str] = set()
+    top_papers: list[Paper] = []
+    for _sqp, paper in top_rows:
+        if paper.id in seen_ids:
+            continue
+        seen_ids.add(paper.id)
+        top_papers.append(paper)
+        if len(top_papers) >= settings.gap_mining_precedent_check_top_k:
+            break
+    if not top_papers:
+        paper_repo.save_trace(db, task_id, "scaling_precedent_check", "decision", output_data={
+            "claimed_delta": claim[:200], "queries": queries,
+            "verdict": "passed_no_results",
+        })
+        return "passed_no_results", None
+
+    paper_list = [{
+        "id": p.id, "title": (p.title or "")[:150],
+        "abstract": (p.abstract or "")[:500],
+    } for p in top_papers]
+    try:
+        verdict = await llm.chat_json([
+            {"role": "system", "content": _SCALING_PRECEDENT_VERDICT_SYSTEM},
+            {"role": "user", "content": json.dumps({
+                "claimed_untested_range": claim,
+                "papers": paper_list,
+            }, ensure_ascii=False)},
+        ], ScalingPrecedentVerdictSchema)
+    except Exception as exc:
+        logger.warning("Task %s: scaling precedent verdict degraded: %s",
+                       task_id[:8], exc)
+        paper_repo.save_trace(db, task_id, "scaling_precedent_check", "decision", output_data={
+            "claimed_delta": claim[:200], "queries": queries,
+            "verdict": "degraded", "stage": "verdict", "error": str(exc)[:200],
+        })
+        return "degraded", None
+
+    matched = None
+    if (verdict is not None and verdict.range_already_measured
+            and verdict.evidence_paper_id and verdict.evidence_paper_id in seen_ids):
+        matched = verdict.evidence_paper_id
+    final_verdict = "covered" if matched else "passed"
+    paper_repo.save_trace(db, task_id, "scaling_precedent_check", "decision", output_data={
+        "claimed_delta": claim[:200], "queries": queries,
+        "verdict": final_verdict, "covering_paper_id": matched,
+        "examined_paper_ids": sorted(seen_ids),
+    })
+    return final_verdict, matched
 
 # Semantic-dedup threshold: two gap candidates whose fingerprint (observed
 # problem + missing capability + claimed delta) embeds to a cosine similarity at
@@ -169,7 +560,13 @@ _OPPORTUNITY_CONTRACTS: tuple[OpportunityContract, ...] = (
         discovery_directive=(
             "Look for limitation or negative-result evidence: a method that "
             "stops working under a specific condition, a scale where it "
-            "degrades, or a setting its evaluation never covered."
+            "degrades, or a setting its evaluation never covered. The "
+            "claimed_delta must state the boundary condition — WHERE or WHEN "
+            "existing work fails or was never tested. NEVER phrase it as an "
+            "outcome target ('achieves >10% accuracy improvement', 'improves "
+            "X by >25%'): a performance number nobody has hit yet is a goal, "
+            "not a documented boundary, and will be rejected as "
+            "PERFORMANCE_TARGET_DELTA."
         ),
         citation_rule=(
             "cite at least one evidence unit whose Type is 'limitation' or "
@@ -319,6 +716,66 @@ _OPPORTUNITY_CONTRACTS: tuple[OpportunityContract, ...] = (
 _CONTRACTS_BY_TYPE = {spec.gap_type: spec for spec in _OPPORTUNITY_CONTRACTS}
 
 
+# --- v6 experimental control arm (fixed-budget experiment, 2026-10-31) ------
+# Reproduces the v6 two-type mining policy on the current stack. Contract text
+# is v6-faithful (checked against the git snapshot at 686f6d1):
+#   - definitions are IDENTICAL to v6 (v7 kept the wording verbatim);
+#   - discovery directives are deliberately NEUTRAL — v6 had no per-type
+#     directive, and v7.2's boundary directive carries the outcome-target
+#     prohibition which is part of the v7.2 hypothesis under test and must not
+#     leak into the control arm;
+#   - the citation rule is v6's GLOBAL rule (limitation or negative_result for
+#     BOTH types — v7.2's missing_evaluation contract widened it to include
+#     future_work, which is also part of the hypothesis).
+_V6_EXPERIMENT_CONTRACTS: tuple[OpportunityContract, ...] = (
+    OpportunityContract(
+        gap_type="boundary_gap",
+        definition=(
+            "an existing method or evaluation has a documented boundary, "
+            "failure condition, or untested setting."
+        ),
+        discovery_directive=(
+            "Identify candidate gaps of this fixed type that the supplied "
+            "evidence supports."
+        ),
+        citation_rule=(
+            "cite at least one evidence unit whose Type is 'limitation' or "
+            "'negative_result': a gap needs a documented shortcoming, not "
+            "only comparisons"
+        ),
+        required_evidence_types=frozenset({"limitation", "negative_result"}),
+        signal_rejection_code="CANDIDATE_LACKS_LIMITATION_SIGNAL",
+    ),
+    OpportunityContract(
+        gap_type="missing_evaluation",
+        definition=(
+            "existing work does not evaluate a concrete, important "
+            "capability, condition, cost, or risk."
+        ),
+        discovery_directive=(
+            "Identify candidate gaps of this fixed type that the supplied "
+            "evidence supports."
+        ),
+        citation_rule=(
+            "cite at least one evidence unit whose Type is 'limitation' or "
+            "'negative_result': a gap needs a documented shortcoming, not "
+            "only comparisons"
+        ),
+        required_evidence_types=frozenset({"limitation", "negative_result"}),
+        signal_rejection_code="CANDIDATE_LACKS_LIMITATION_SIGNAL",
+    ),
+)
+
+
+def _active_contracts() -> tuple[OpportunityContract, ...]:
+    """The contract set for THIS process: v7.2's seven lenses, or the v6
+    experimental control arm's two."""
+    from app.config import settings
+    if settings.gap_mining_legacy_v6_mode:
+        return _V6_EXPERIMENT_CONTRACTS
+    return _OPPORTUNITY_CONTRACTS
+
+
 def compute_evidence_fingerprint(db, task_id: str) -> str:
     """Stable content fingerprint of the evidence pool + question links.
 
@@ -437,6 +894,17 @@ def evaluate_gap_mining_admission(question, links, evidence_by_id) -> QuestionEv
     # the contradiction opportunity, not a defect of the question. Both
     # signals remain recorded on the admission for the trace and the prompt
     # ("Verified conflict" annotations).
+    #
+    # v6 experimental control arm (2026-10-31): the question-level blockers
+    # ARE restored — historical v6 refused to mine a question with no
+    # limitation signal or with an unresolved verified contradiction, and the
+    # control arm must reproduce that policy, not v7's per-type relaxation.
+    from app.config import settings as _settings
+    if _settings.gap_mining_legacy_v6_mode:
+        if not limiting:
+            reasons.append("NO_LIMITATION_SIGNAL")
+        if contradicting:
+            reasons.append("UNRESOLVED_VERIFIED_CONTRADICTION")
 
     # O5(b): full-text is no longer a hard requirement. Determine an evidence
     # tier instead:
@@ -494,6 +962,33 @@ For every opportunity:
   (">10% label noise", "<3B parameters"). NEVER emit placeholder operands like
   ">X%", "<Y parameters" or "N samples" — a hypothesis with an unquantified
   letter operand is rejected outright;
+- CLAIMED DELTA MUST NAME A MISSING MECHANISM OR CAPABILITY, NOT AN
+  ARRANGEMENT. Two shapes are FORBIDDEN because independent review can only
+  ever answer "partially covered" to them, never "nobody has done this":
+    (a) CONFIGURATION-ONLY: "at <=1B parameters", "on NarrativeQA",
+        "at >30% vs <10% compression rate", "with 3 seeds". These are grid
+        cells over a topic that is already fixed by existing work.
+    (b) CONJUNCTION-ONLY: "combine A + B + C", "jointly measure X, Y and Z",
+        "the first work to do (1) and (2) and (3)". Each ingredient is
+        individually published; the reviewer will (correctly) reply that the
+        ingredients are covered and only the combination is new. A combination
+        is a project plan, not a gap.
+  Measured on 116 mined gaps: 55% carry a numeric bound and 49% enumerate
+  >=3 conjoined elements. Both shapes are structurally unanswerable as NONE
+  (the topic exists; the cell/combination does not), so review can only reply
+  "partially covered".
+  If what you actually found is a configuration or a combination, write it in
+  `missing_capability` and DROP the candidate — do not re-badge it as a
+  capability;
+- State the delta as ONE assertion about how something works:
+  "X causes Y through Z" / "Z is not the mediator it is assumed to be" /
+  "the effect reverses because W". Mechanism, causal attribution, or a
+  refuted assumption — one of them, singly;
+- SELF-CHECK before returning: (1) delete every number, dataset name and model
+  size from `claimed_delta`; the remainder must still assert a mechanism.
+  (2) delete any one of its clauses; the delta must be FALSE or uninteresting
+  without it — if it survives intact as "A+B+C", it was a conjunction.
+  Fail either check -> drop the candidate;
 - do not propose a solution or invent paper findings;
 - write every field in English (target setting, observed problem, existing
   coverage, missing capability, claimed delta, falsification condition). The
@@ -707,12 +1202,12 @@ async def mine_gap_candidates(
 
     if input_version:
         existing = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, contract.id)
-                    if gap.mining_policy_version == GAP_MINING_POLICY_VERSION
+                    if gap.mining_policy_version == current_mining_policy_version()
                     and gap.mining_input_version == input_version
                     and gap.status not in {"rejected", "superseded"}]
     else:
         existing = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, contract.id)
-                    if gap.mining_policy_version == GAP_MINING_POLICY_VERSION
+                    if gap.mining_policy_version == current_mining_policy_version()
                     and gap.mining_round == state.current_round
                     and gap.status not in {"rejected", "superseded"}]
     if existing:
@@ -827,28 +1322,36 @@ async def mine_gap_candidates(
     rejected_candidates = []
     accepted_candidates = []
     lens_fanout = []
+    # Sub-stage attribution (probe df744606: `mine_gaps` cost 221-409s with no
+    # breakdown). Buckets: per-lens LLM call, per-lens embedding dedup, and the
+    # whole admission loop.
+    timings = StageTimings()
 
     # --- Opportunity lens fan-out (v7) ---------------------------------------
     # One call per opportunity type. A candidate returned by the wrong lens is
     # rejected as TYPE_LENS_MISMATCH without consuming an audit slot.
-    for contract_spec in _OPPORTUNITY_CONTRACTS:
-        result = await llm.chat_json([{
-            "role": "system", "content": _GAP_MINING_SYSTEM.format(
-                gap_type=contract_spec.gap_type,
-                definition=contract_spec.definition,
-                discovery_directive=contract_spec.discovery_directive,
-                citation_rule=contract_spec.citation_rule,
-            ),
-        }, {
-            "role": "user", "content": _GAP_MINING_USER.format(
-                topic=contract.topic, target_problem=contract.target_problem or "(not specified)",
-                target_setting=contract.target_setting or "(not specified)",
-                gap_type=contract_spec.gap_type,
-                questions=question_text,
-                evidence=_format_evidence(evidence, question_links_by_evidence),
-                existing_gaps=existing_gaps_block, max_gaps=max_gaps,
-            ),
-        }], GapCandidateList)
+    # v6 experimental control arm: `_active_contracts()` returns the two-type
+    # v6 set, so the fan-out (and everything downstream in this loop) only
+    # ever sees boundary_gap / missing_evaluation.
+    for contract_spec in _active_contracts():
+        with timings.stage(f"lens_llm:{contract_spec.gap_type}"):
+            result = await llm.chat_json([{
+                "role": "system", "content": _GAP_MINING_SYSTEM.format(
+                    gap_type=contract_spec.gap_type,
+                    definition=contract_spec.definition,
+                    discovery_directive=contract_spec.discovery_directive,
+                    citation_rule=contract_spec.citation_rule,
+                ),
+            }, {
+                "role": "user", "content": _GAP_MINING_USER.format(
+                    topic=contract.topic, target_problem=contract.target_problem or "(not specified)",
+                    target_setting=contract.target_setting or "(not specified)",
+                    gap_type=contract_spec.gap_type,
+                    questions=question_text,
+                    evidence=_format_evidence(evidence, question_links_by_evidence),
+                    existing_gaps=existing_gaps_block, max_gaps=max_gaps,
+                ),
+            }], GapCandidateList)
 
         candidate_objs = result.gaps[:max_gaps]
         typed_candidates = []
@@ -866,7 +1369,8 @@ async def mine_gap_candidates(
 
         candidate_fps = [_gap_fingerprint(c.observed_problem, c.missing_capability,
                                           c.claimed_delta) for c in typed_candidates]
-        lens_vecs_raw = await _embed_fingerprints(candidate_fps)
+        with timings.stage("dedup_embedding"):
+            lens_vecs_raw = await _embed_fingerprints(candidate_fps)
         lens_dedup_enabled = bool(lens_vecs_raw) and len(lens_vecs_raw) == len(candidate_fps)
         lens_vecs = lens_vecs_raw if lens_dedup_enabled else []
 
@@ -943,6 +1447,32 @@ async def mine_gap_candidates(
                 # lets the placeholder flow through narrowing into intervention and
                 # experiment prompts (observed verbatim on the surviving gap).
                 reason = "PLACEHOLDER_OPERAND_IN_HYPOTHESIS"
+            elif (contract_spec.gap_type == "boundary_gap"
+                    and not _settings_v6_mode()
+                    and _is_performance_target_delta(candidate.claimed_delta or "")):
+                # v7.2 (pilot adjudication 2026-10-29): "Achieves >10% higher
+                # accuracy ..." is an outcome target, not a boundary condition.
+                # Both human-true pilot survivors had exactly this shape and were
+                # reviewer-flagged target_only — an unprecedent performance
+                # number is a goal, not a documented boundary.
+                # Disabled in the v6 control arm: this gate is part of the
+                # v7.2 hypothesis under test.
+                reason = "PERFORMANCE_TARGET_DELTA"
+            elif (_settings_operationalization_gate()
+                    and not _settings_v6_mode()
+                    and _is_operationalization_only_delta(candidate.claimed_delta or "")):
+                # v7.3 candidate, DISABLED by default (see the rule's comment:
+                # the calibration sample is the same sample the rule was
+                # derived from). Fires only when explicitly enabled.
+                reason = "OPERATIONALIZATION_ONLY_DELTA"
+            elif (_settings_conjunction_gate()
+                    and not _settings_v6_mode()
+                    and _is_conjunction_only_delta(candidate.claimed_delta or "",
+                                                   candidate.missing_capability or "")):
+                # Conjunction-only delta, DISABLED by default for the same
+                # reason as the gate above: the 46%-of-PARTIAL figure and the
+                # detector were derived from the same 28 reviewed units.
+                reason = "CONJUNCTION_ONLY_DELTA"
             # v7: candidate.contradicting_evidence_ids no longer rejects the
             # candidate. Evidence that undermines the gap is recorded as a
             # "contradicts" gap-evidence link below and consumed by the
@@ -980,6 +1510,28 @@ async def mine_gap_candidates(
                 })
                 continue
 
+            # v7.2: scaling_regime candidates undergo a claim-level precedent
+            # retrieval before consuming an audit slot — 4/7 pilot
+            # scaling_regime opportunities were false-open because prior work
+            # outside the evidence pool had already measured the claimed
+            # range. Runs AFTER dedup so a reworded duplicate never spends
+            # retrieval budget. Only a positive "covered" verdict rejects;
+            # infrastructure failures fail open (degraded -> accept).
+            if contract_spec.gap_type == "scaling_regime":
+                with timings.stage("scaling_precedent_check"):
+                    precedent_verdict, covering_paper_id = await _scaling_regime_precedent_check(
+                        db, state, llm, task_id, candidate)
+                if precedent_verdict == "covered":
+                    rejected_candidates.append({
+                        "reason": "SCALING_RANGE_ALREADY_MEASURED",
+                        "lens": contract_spec.gap_type,
+                        "gap_type": candidate.gap_type,
+                        "question_ids": candidate.question_ids,
+                        "cited_evidence_ids": candidate.supporting_evidence_ids,
+                        "covering_paper_id": covering_paper_id,
+                    })
+                    continue
+
             # O5(b): full-text presence sets provenance tier rather than rejecting.
             # A-tier (complete) has a full-text-locatable span; B-tier (partial)
             # is abstract-strength only and must be confirmed by the downstream
@@ -996,7 +1548,7 @@ async def mine_gap_candidates(
                 question_ids=candidate.question_ids, mining_round=state.current_round,
                 novelty_score=candidate.novelty_score, feasibility_score=candidate.feasibility_score,
                 significance_score=candidate.significance_score,
-                mining_policy_version=GAP_MINING_POLICY_VERSION,
+                mining_policy_version=current_mining_policy_version(),
                 mining_input_version=input_version,
             )
             # Only admitted evidence gets linked; an unoffered ID would otherwise
@@ -1028,6 +1580,7 @@ async def mine_gap_candidates(
         "lens_fanout": lens_fanout,
         "accepted_candidates": accepted_candidates,
         "rejected_candidates": rejected_candidates,
+        "stage_timings": timings.as_dict(),
     })
     state.active_gap_ids = [gap.id for gap in created]
     paper_repo.save_trace(db, task_id, "mine_gap_candidates", "action", output_data={

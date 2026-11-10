@@ -31,7 +31,7 @@
 | Pipeline V2 重构 | 从"检索后编 Idea"转为证据驱动，六层结构化落库 | ✅ 完成 |
 | 链路优化（O 系列） | 闸门失败即补检索而非终止；分级产出；全文 RAG | ✅ 完成 |
 | 证据供给与运行时稳定性 | 让准入所需的证据类型真的能被抽到（chunk 按 section 轮转、关系语义统一、上下文预算） | ✅ 完成 |
-| 机会发现广度（v7 ontology） | 不再只认"作者自认的 limitation"，7 类 opportunity 各有准入契约 | ✅ 实现完成，pilot 已跑 |
+| 机会发现广度（v7 ontology） | 不再只认"作者自认的 limitation"，7 类 opportunity 各有准入契约 | ⚠️ pilot 复核后 NO-GO（[3] 不成立；LLM 评审，非独立人工） |
 | 系统价值验证（production_e2e_v1） | 三系统对照，回答"复杂 pipeline 到底有没有价值" | ✅ 24 主题跑完并完成盲评 |
 | v7 生产价值对照 | 固定预算下 v6 policy vs v7 policy 的产出价值 | ⬜ 未开始（明确推迟，不与 full-jury 漏斗混比） |
 
@@ -52,9 +52,246 @@
 - 召回面：v7 产出 35 个候选，其中 **30 个在 v6 中无对应物**（v7-only）。
 - 跨类型聚簇后 30 → 29 簇（压缩比 1.03），说明新增量不是同一发现的措辞变体。
 - 成本：mining 42 次 LLM 调用 / 1068s，审计 1819s。
-- **q2（边际机会精度）与 q3（边际可信 Idea 产出）仍是 PENDING**——需要人工盲评 `v7_only_opportunities.jsonl` 的 prior-art 覆盖情况。pilot 的 GO/NO-GO 门槛（≥1 个 v7-only 机会被人工判为真、且能产出可信 Idea、且新增机会不是以假 gap 为主）**尚未裁决**。
+- **q2/q3 已裁决（2026-10-29，第二轮联网复核后）**：q2 边际精度 **6.7%**（2 true / 21 partial / 7 false-open）；[1][2] MET，**[3] NOT MET** → 按预注册规则 **NO-GO**。第一轮的名义 GO 依赖的 v7r-005 经检索发现已被 arXiv 2607.28308（2026-07-30，早于预注册日）部分覆盖，改判 PARTIAL；剩下的 2 个 true 都是无机制的性能目标，且没有关联 Idea。判定由同一 LLM 评审完成（非独立人工、非盲）。`scaling_regime` 假阳性最高（4/7）。详见 `eval_results/v7_replay_pilot/adjudication_summary.md`。
 
-**工程状态**：`634` 个测试全部收集通过；Alembic 迁移到 `0034`；证据抽取已改为无条件覆盖全部候选论文（不再有每轮篇数上限），靠共享并发池 + PDF 预热把成本压回来。
+- **探针 C**（`1caa24c2`，同主题，第三/四轮修复后）：**116 分钟，终态 `abstained`**。P5/P2-①/增量覆盖度/Top-2/P4 逐项生效（增量覆盖度 r7 在 1058 条证据池上仅 106s；P2-① 计时立刻定位"单篇卡死 390s 决定整体上限"）；但暴露一个严重缺陷：**winner 选择只按 cheap rank 排序，让 novelty=0.9 的 gap 输给 novelty=0.42 的 gap（0.7335 vs 0.7567，差 0.023）**，导致全部 Idea 封顶 tier B、最终 abstain。已修（排序键改为 `(clears_novelty_gate, cheap_rank, novelty_confidence)`）+ 2 项回归。P1 killer 检索执行 2 次、命中 0，机制正确但收益待更多样本。完整对照：同一报告 §10。
+
+- **探针 D/E**（`0e695ea5` / `457dac9a`，同主题，2026-10-31）：D 确认 winner 修复无回归，但暴露**更基础的 bug**——审计 `remaining_delta` 为空时，`_evaluate_hard_gates` 整个 novelty 分支被跳过，同一审计里的 `novelty_confidence=0.9` 被完全忽略，全部干预封顶 tier B。已修 + 2 项回归。E（加载修复后）首次跑出 **`executable_candidate`（tier A）**，终态 `waiting_for_user_review`，验证通过。E 同时暴露一个**政策问题（未决）**：该 executable Idea 的 LLM 评分仅 0.4681（go 线 0.70），trace 如实打了 `GATE_PASS_SCORE_BELOW_LINE`——硬门禁与 rubric 两轴对同一 Idea 给出相反结论。详见报告 §11。
+
+**Idea 分数阈值全库校准分析（2026-10-31，595 个带分数 Idea / 94 个任务）**：`0.70` go 线原本硬编码在三处，且**只对历史分布有效、对 v7.2 不适用**——历史（v3–v7，n=579）median **0.711**、61.3% 过线；v7.2（n=16）median **0.654**、12.5% 过线，4 个 `executable_candidate` 全部 0 个过线。两轴不一致是常态（门禁 PASS+分数低 59 个，门禁 BLOCK+分数高 224 个），且分数落在离散网格上（0.7120×26、0.7405×23…），0.70 无特殊意义。已把阈值统一为 `IDEA_SCORE_GO_LINE` / `IDEA_SCORE_REVISE_LINE`（数值故意维持 0.70，下调属政策决策）。只读分析工具：`backend/scripts/idea_score_distribution.py`，存档 `eval_results/idea_score_distribution_2026-10-31.json`。
+
+**v7.2 固定预算生产价值实验（瓶颈 #7）——运行 + 盲评完成（2026-11-02）**：Phase 0 用 `GAP_MINING_LEGACY_V6_MODE` 在当前已调试栈重建 v6 两类挖掘（717 tests passed）。12 次运行（6 主题 × 2 臂）全部完成且完整性核查通过；91 个单元完成联网主评（pass 1），6 个检索失败单元做了修复重评（pass 2）。
+
+**裁决结果：T_A = T_B = 0.0%，delta = 0.0pp → TIE，按 §7.3 默认判 NO-GO**（无 v7.2 优势证据）。但这 TIE 是"**无区分力**"而非"已证明等价"：两臂各自 12/25 个 gap 中**没有一个**被独立评审判为可发表空白，指标没有余量去区分。
+
+判定过程有三轮，全部披露：pass 1 关键词检索给出 −4.0pp NO-GO，但整个差异由**一个检索失败的单元**（`fbp-089`，12 篇结果零篇相关）承载，剔除后为 0；pass 2 用近邻标题重建查询也失败；**pass 3 改用语义召回**（关键词过检索 + embedding 过滤，阈值 0.41 由 37 个真实 gap 实测标定：保留 82% 真近邻、滤除 100% 已知噪声），评审自述"检索无用"从 **6/37 降到 0/37**，`fbp-089` 的 NONE 消失，且修复后检索到的第一篇正是它的直接杀手文献。**§7 规则三轮逐字未改。**
+
+**本轮真正建立的结论**：管线自评的 `confirmed` 与独立评审的"存在可发表空白"几乎无关——**33 个 `confirmed` → 0 个 NONE**（28 个 PARTIAL + 5 个 uncertain→PARTIAL）。这条不依赖两臂对比，是最稳的结论。
+
+**不得引用的结论**：❌ "v7.2 优于 v6"（T 相同）❌ "v6 优于 v7.2"（FULL 3 vs 1、Idea fund 3 vs 0 是唯一信号，但 n=25 vs 12 且**审计量不对称**：A 每主题 2 个 gap、B 4–6 个）❌ "两臂等价"（T=0 是无力检测）❌ "本体论无效"（无法分离本体论与审计量效应）。
+
+**下一轮必须先修的设计缺陷**：审计量不对称（A 2 个 vs B 4–6 个）、T 指标无余量（两臂都 0 NONE，应改序数量表或比 FULL 率）、Idea 层不同质（方向性 vs 可执行需分层）。
+
+存档：**`backend/eval_results/fixed_budget_pilot/RESULTS_FINAL.md`（最终结论）**、`RESULTS_ADJUDICATION.md`（pass-1 审计轨迹，保留但已被取代）、`RESULTS_SECONDARY.md`、`EXPERIMENT_DESIGN.md`、`run_matrix.json`。§8.2 人工抽查（18/91 已抽样）**仍未执行**，检索已修、现在可做。**另一待修项**：饥饿机制在臂 A 未达目标（`candidate` 占比 80.3% vs <50%）；killer 检索锚点仍是 topic 而非 killer 描述（见 `RESULTS_FINAL.md` §7）。
+
+**工程状态**：`717` 个测试全部通过（2026-10-31）；Alembic 迁移到 `0034`；证据抽取已改为无条件覆盖全部候选论文（不再有每轮篇数上限），靠共享并发池 + PDF 预热把成本压回来。
+
+**killer 漏斗诊断 —— 33 confirmed → 0 NONE 的归因（2026-11-02）**：`scripts/killer_funnel_audit.py`（只读，存档 `eval_results/killer_funnel_2026-11-02.json`）把"管线 confirmed 与真实可发表性无关"归因到了**供给**而非判断。对 37 个受评 gap，取独立评审点名的 killer 论文并定位到任务语料库（标题 Jaccard ≥0.90）：
+
+| 漏斗层 | n | 占 82 篇库内 killer |
+|---|---:|---:|
+| 被选为审计近邻 | 4 | 4.9% |
+| 过相关性筛选但未入选 | 6 | 7.3% |
+| 进了审计池、被 10 篇上限截断（**未做相关性筛选**） | 17 | 20.7% |
+| **在语料库中，从未进入任何审计池** | 55 | **67.1%** |
+
+配套：**每次审计近邻数恒为 3**（37/37 等于 budgeted 上限）；审计自评 `novelty_confidence` 对"被覆盖/未覆盖"**几乎无区分力**（AUC(PARTIAL>FULL)=**0.610**）。根因是候选池 = 该 gap 对抗检索 ∪ `collect_same_question_neighbors`（只走该 gap 自身问题的证据链接）——从未关联到这些问题的库内 killer **结构上不可达**；再叠加"先按 `TaskPaper.final_score`（任务级相关性）截断到 10 篇、后做 gap 相关性筛选"的顺序错误。
+
+**已落地的两处供给修复**（`AUDIT_CORPUS_RECALL_ENABLED` / `AUDIT_SCREEN_BEFORE_CAP`，默认开）：① 语料库语义召回并入审计池（`steps/corpus_recall.py`，阈值 0.45，top_k 15，embedding 不可用 fail-open）；② 先按 gap 相关性筛选再截断，截断依据从任务级分数改为 gap 相关性。**实测上限（真实库 + 真实 embedding）**：库内 killer 召回 68.4%，但在全排序里进入 Top-3 的只有 **36.6%**、Top-15 之外仍占 31.0%——召回解决了"不可达"，**没有**解决"审计仍只看 3 篇"。
+
+**V2-no-audit 消融已实现、未运行**（`GAP_AUDIT_DISABLED_ABLATION`，`steps/audit_gaps.py::_ablate_audit`）：不检索、不抽近邻、不判新颖性，gap 直接 `surviving` 并打独立策略戳 `gap-search-ablation-none-v1` + `ABLATION_NO_AUDIT`。关键设计（均有回归）：策略戳必须与真实审计区分（同时它参与 `input_version` 哈希与 `_latest_decided_audit` 过滤）；开关在**调用时**解析而非 import 时常量（首版写错，被测试抓到）；干预 novelty 闸门在该臂**显式 PASS** 而非留 UNKNOWN（否则消融臂 executable 恒为 0，差异变成记账差异），且该 PASS **只作用于消融臂自己的记录**——真实 `closed` 结论不被开关抹除。预注册方案见 `eval_results/no_audit_ablation/EXPERIMENT_DESIGN.md`。
+
+**该方案的一条硬约束（§7.0）**：在 `neighbors=3` 下得到的阴性 `ΔT` **不得**用于"删审计"决策——必须先有 `neighbors=3 vs 8` 的固定预算对照，否则"审计无用"会是预算造成的假结论。
+
+**近邻预算对照 —— 已预注册、开关已实现、未运行（2026-11-03）**：`AUDIT_NEIGHBORS_OVERRIDE`（`config.py`）+ `effective_neighbor_budget()`（`audit_gaps.py`）+ `gap_audit_neighbor_budget` trace，方案见 `eval_results/neighbor_budget/EXPERIMENT_DESIGN.md`。
+
+剂量响应（37 个受评 gap、生产 embedding 实测，库内 killer n=71 在召回排序中的位置）：
+
+| k | 1 | 2 | **3（默认）** | 5 | 6 | **8（处理组）** | 10 | 15 | 20 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 累计命中 | 14.1% | 28.2% | **36.6%** | 53.5% | 56.3% | **60.6%** | 63.4% | 69.0% | 76.1% |
+
+**生产预算 3 只能看到约 1/3 的杀手文献**，这是"confirmed → 0 NONE"最直接的候选解释。取 8 而非 10：k=3→8 提升 +24.0pp，而 8→10 仅 +2.8pp（曲线在 8 之后趋平）。
+
+单变量保证：`test_override_raises_only_the_neighbour_count` 断言除 `neighbors` 外 `_audit_budget()` 逐键相等（查询 4 / 候选 10 / 全文 2 / killer 查询 3 / 源 全不变）。相关性下限两臂**必须同为 0.3**——既有的 `_mechanical_novelty_score` 已把低于下限的近邻判定降级为 UNCERTAIN，所以"更多近邻只是更多噪声"这一质疑已有既有防线覆盖，不需要（也不应该）在实验里再加一层。
+
+**成本非对称的实测结论**：审计判定是**一次** `llm.chat_json` 调用、所有近邻拼进同一 prompt，所以 k=8 只让 prompt 变长，**不增加调用次数与超时暴露**；全文抽取由 `budgeted_audit_fulltext_max_papers=2` 独立封顶，不随近邻数增长。
+
+**已识别的混杂因素（写入协议 §6.3，必须量化而非声明）**：近邻越多 → 越可能发现覆盖 → `novelty_confidence` 越低 → 越易触发 `_LOW_NOVELTY_CONFIRMED=0.4` 的 confirmed→uncertain 降级（trace `gap_audit_low_novelty_downgrade`），使两臂进入下游的 gap 集合不同。协议要求同时报告降级前后的两套 `T`；若两套口径给出相反的 `ΔT`，该实验不成立。
+
+**近邻预算实验已开跑，并在第一对就抓到两个会作废实验的缺陷（2026-11-03）**
+
+第一次真实审计 trace 直接暴露处理没生效：`limit=8 selected=2 cap_bound=False pool=10`——配置 8、池子 10、预算没用满，却只选 2 篇。若未发现，整个实验会得出"更多近邻无用"的假结论。
+
+1. **召回进池但选不上近邻（代码缺陷，已修）**：`select_gap_specific_neighbors` 的排序只覆盖有对抗检索映射的论文，fallback 只走 `collect_same_question_neighbors`（gap 自身问题的证据链接）。语料库召回命中的论文能进 `candidate_paper_ids`（计入准入、`candidate_pool_size` 看起来正常）却**永远无法被选为近邻**——这是 67.1% 损失桶的平移：trace 变了，审计读到的内容没变。同一批真实 gap 上修复后 2→8、5→8；回归 `test_neighbor_selection_from_recall.py` 修复前 4 项全失败、修复后全通过。
+2. **跨臂任务接管（可静默作废实验，已加开关）**：`recover_interrupted_tasks()` 在每个服务启动时把所有中断状态（含 `searching`）任务重置为 pending，**不区分归属**。双服务共享 DB 时，重启任一臂会中断另一臂在跑的任务并标 failed，之后该任务可能被**另一个臂的配置**接管续跑。实验服务一律 `RECOVER_TASKS_ON_STARTUP=false`（启动日志显式确认）。
+
+另：**并发改串行**。两任务同秒启动时臂 C 的 `extract_evidence_round_1` 卡 running 8 分钟以上（臂 D 5 分钟完成），覆盖快照未生成、readiness 重试 12 次失败。两任务各 `EVIDENCE_EXTRACT_CONCURRENCY=4` 共享 PDF/embedding 池，属资源争用；改串行后同主题臂 C 一次通过。
+
+**修复后的剂量交付已验证**（pe2e-001）：臂 C `3/3 cap_bound=True`、臂 D `8/8 cap_bound=True`——单变量剂量在两臂都真实交付。
+
+**首批机制读数（n=1 对，仅方向性）**：臂 C novelty 0.94（3 篇）、臂 D 0.74/0.78（8 篇），方向与预判混杂因素一致（看到更多→更不自信），但均远高于 0.4 降级线，本对未触发降级。臂 D 出现 `below_floor=2`，证实扩大近邻确实拉进低相关论文，而既有 `gap_relevance_min_neighbor=0.3` 已在拦截——这也说明原计划的"噪声防护新开关"是重复实现，已删除，改为只把该信号记入 trace。
+
+中期结果见 `eval_results/neighbor_budget/RESULTS_PARTIAL.md`（明确列出**不能**下的结论）。
+
+**近邻预算对照最终结果（2026-11-06 完成，5 对有效 + 1 对作废）**
+
+| 臂 | gap | NONE | PARTIAL | FULL | T |
+|---|---:|---:|---:|---:|---:|
+| C（3 篇） | 16 | 0 | 14 | 2 | **0.0%** |
+| D（8 篇） | 12 | 0 | 12 | 0 | **0.0%** |
+
+`ΔT = +0.0pp` → 按预注册规则 1 判 **预算不是天花板**。**但这条判定几乎不含信息**：两臂 NONE 都是 0，指标撞在 0% 地板上没有余量，`ΔT=0` 是"两边都测不出"而非"两边相等"——与 v7.2 的 TIE 是同一类缺陷。
+
+**Idea 层更强的阴性信号**：C 48 个 / D 30 个 Idea，被独立评审判为 `fund` 的**两臂均为 0**。
+
+**人工抽查 100% 一致率是假象**：gap 判定 92.9% 是 PARTIAL、idea 89.7% 是 maybe，人工样本也全落众数标签；gap/idea 分层 kappa 因零方差无法计算（期望一致率已达 100%）。抽查**没有发现分歧，但也没有证明评审器可靠**——它从未被要求区分两种判定。
+
+**评审仪器健康度可测**：`search_useful=false` 仅 1.9%（pilot pass 1 为 16.2%），零命中单元 0。此前我用参数名错误的坏仪器跑过 2 个单元（检索全失败 `hits=0`），它把 PARTIAL 误判成 **NONE**——坏仪器会**高估**真空白；这 2 条已归档不计入。
+
+**混杂因素预注册写错、已更正**：`audit_low_novelty_provisional_survive=True` 时低 novelty **不降级**，而是暂存并封顶 tier B；两臂 `low_novelty_downgrade` trace 均为 0。实测 C 臂 median novelty 0.700 / D 臂 0.662——**扩大近邻并未系统性压低自评**。
+
+**不会说的三件事**：8 篇优于 3 篇（无余量）；审计机制应删除（只测了一个参数，判删除需在有余量指标上重做消融）；抽查支持评审器可靠（一致率被众数抬高）。
+
+**本次真正产出**：①修复了一个在修复前影响**所有**任务的缺陷（召回进池但选不上近邻）；②确认 `NONE` 率作为主指标在 gap 供给不足时恒为 0，**必须改用有余量的量表**——这是下一轮要改的，而不是继续加机制。
+
+详见 `eval_results/neighbor_budget/RESULTS.md`。
+
+**指标改造（`METRIC_REDESIGN.md`，在现有数据上实测，未重跑管线）**
+
+候选 1「claim 平均覆盖率」**否决**：C 0.119 > D 0.084 看似处理组更差，实为算术必然——覆盖表是近邻×claim 完整笛卡尔积（D 臂 `judgements/claim=8.00`、C 臂 `=3.00`，逐对精确），多加的 5 篇为低相关论文；实测高相关半区覆盖率 0.311 vs 低相关半区 0.119。**凡以"每近邻判定"为分母的指标，跨近邻预算比较都不可用。**
+
+候选 2「每 claim 最大覆盖」通过，但**必须同口径截断**：
+
+| 比较 | 值 |
+|---|---:|
+| C（3 篇） | 0.437 |
+| D（**前 3 篇**） | 0.440 |
+| D（全 8 篇） | 0.583 |
+| `D(前3) − C` | **+0.003** |
+| 第 4–8 篇边际 | **+0.143** |
+
+**+0.003 是本次最有价值的数字之一**：同等近邻预算下两臂完全相等，证明实验操作干净、差异来自近邻数量本身（截断后出现一对 −0.083，也证明该指标非单调取巧）。**+0.143 说明额外 5 篇近邻确实带来覆盖发现，但未转化为任何被独立评审认可的可发表空白**——即协议 §7 规则 3 预测的**"看到了，但判不出来"**。
+
+新主指标分三层报告（机制层同口径边际增益 / 判定层有序分布 / 质量层 fund 计数），`T = NONE/(...)` **作为主指标废弃**。改造顺序不可颠倒：**先改度量 → 再修 gap 供给 → 最后做 no-audit 消融**。在无余量指标上做消融，得到的 TIE 无法区分"机制无用"与"仪器测不出"。
+
+**Gap 供给修复（`GAP_SUPPLY_FIX.md`，2026-11-06）**
+
+先排除三个假设：gap 类型分布均衡（7 类、116 个）、证据来源多样（9 类）、加近邻无效（`ΔT=+0.0pp`）。真正原因在 `claimed_delta` 的**表述形态**——**直接读 26 条 PARTIAL 的评审理由**（比正则可靠）：**46% 是"各成分被覆盖、但组合未被做"**；49% 的 delta 并列 ≥3 个子句。
+
+两种形态在结构上**不可能被判为 NONE**：
+
+| 形态 | 例子 | 为什么必然 PARTIAL |
+|---|---|---|
+| 配置型 | "在 ≤1B / NarrativeQA / >30% vs <10% 下" | 主题已覆盖，只是某格子没报 |
+| 合取型 | "首次同时做 A+B+C" | 每成分都发过，答案永远是"成分有、组合无" |
+
+而原 prompt 第 881 行**直接要求写具体数字**，等于在鼓励配置型。
+
+**主修复**：`_GAP_MINING_SYSTEM` 禁止两种形态、要求 delta 是**单一机制断言**、并加入自检（删掉数字后仍须断言机制；删掉任一子句后 delta 必须变假）。辅助的合取检测器**默认关闭**——它在要评分的 28 个单元上拟合，启用即重犯 v7.3 的错；实测触发 6.0%（低召回）、7/7 精确。第一次实现触发 0/116，测错形态，已删除。
+
+**修复中真实犯的两个错，都已加测试**：①prompt 里写 `{i}`/`{ii}` 占位，而该串经过 `str.format()`，直接 `KeyError: 'i'` 让**每个 lens 调用崩溃**（全量回归抓到）；②正则 `[^.;!?]` 排除句点，导致含小数的 delta 永不触发。
+
+**必须明确**：本次改动**没有任何证据表明会提高 NONE 率**。要证明需样本外重跑 + 盲评 + 观察 NONE 是否非零。当前只能说：造成 `NONE=0` 的结构性原因已被识别并针对性改动。
+
+**样本外验证结果：形态改了，判定没改（`GAP_SUPPLY_VALIDATION.md`，2026-11-09）**
+
+用 `production_e2e` 中**未参与规则拟合**的主题（pe2e-003 / pe2e-008）重跑。先修了一个会让验证失去意义的问题：服务是 11-03 起的，prompt 是 11-06 改的，**不重启就仍在跑旧 prompt**。
+
+| 特征 | 旧 prompt（116） | 新 prompt（24） |
+|---|---:|---:|
+| 含数字 | 74% | **0%** |
+| 含配方语（`>= / at least / X%`） | 59% | **0%** |
+
+新 delta 全是单一机制断言（"X 不是 Y 的属性，而是由 Z 决定"）。**但盲评 6/6 仍是 PARTIAL，`NONE` 仍为 0。**
+
+**决定性诊断：校准探针。** 喂入两个 gap：
+
+| 探针 | 判定 |
+|---|---|
+| "Transformer 推理在**月球重力**下是否改变" | **NONE** |
+| "训练脚本的**编程语言**是否影响权重" | PARTIAL |
+
+评审器**能**给 NONE——但只有在该领域**完全没有相邻工作时**。原因在 rubric 本身：`PARTIAL` 定义为"覆盖了一部分 delta、**在不同设定下覆盖**、或是已知工作的重新参数化"，中间那句被任何相邻论文满足，而真实主题永远有 300+ 篇相邻论文。
+
+**纠正我上一轮的一个错误**：先前报告的"46% 的 PARTIAL 理由是成分覆盖但组合没做"**是错的**，来自一个宽正则（把句中 "both"/"together"/"combines" 都计入）且把非互斥类别加总。严格匹配合计仅 **8%**。真实主流理由是"部分覆盖"(50%) 与"存在相邻工作"(50%)。已在代码注释、config、测试、文档四处的原位置加更正标注——**prompt 改动仍然正确保留**（配置型/合取型确实被消除），但它**不是** `NONE=0` 的解药。
+
+**真正的瓶颈是评测仪器，不是 gap 供给**。下一步必须先改 rubric 的 NONE/PARTIAL 边界并重跑校准探针，否则任何以 `T` 为主指标的实验（含 no-audit 消融）都会重演 v7.2 的 TIE。
+
+**785 个测试全部通过**（原 767 + 18）。
+
+---
+
+## Rubric v2：仪器修复（`RUBRIC_V2_RESULTS.md`，2026-11-09）
+
+诊断已明确——`NONE` 不可达是 **rubric 缺陷**，不是 gap 供给问题。v1 的 PARTIAL 含一句
+
+> "prior work covers PART of the delta, **covers it in a different setting**"
+
+中间这句由任何相邻论文满足，而真实主题永远有数百篇相邻论文 → `PARTIAL` 吸收一切，`NONE` 要求文献真空。
+
+**v2 三处改动**：①判断单位是 **delta（具体断言）而非 topic**，且必须先在 `delta_stated` 复述；②"不同设定"不再足以构成 PARTIAL；③新增"相邻 ≠ 覆盖"，显式映射到 NONE。另加 `delta_established` / `adjacent_work_exists` 两个诊断字段使改动可审计。v1 原样保留，历史数字可复现。
+
+**预注册在先**（`RUBRIC_V2_PREREG.md`），门槛冻结，且**同时防范反向退化**（用"永远 NONE"替换"永远 PARTIAL"同样无信息量）：
+
+| 门 | 条件 | 实测 |
+|---|---|---|
+| G1 | 正向探针 ≥1/2 判 NONE | **1/2** PASS |
+| G2 | 反向探针 3/3 判 FULL 且无 NONE | **3/3** PASS |
+| G3 | verdict 与 delta_established 一致 ≥4/5 | **5/5** PASS |
+
+反向探针用经典论文（Transformer / LoRA / CoT）验证不退化——**3/3 判 FULL**。正向探针 `p2v-N2` 我预期 NONE 但实得 PARTIAL，**是我预期错了**（v2 检索到 `[10] "Balanced Usage Is Not Expert Specialization"` 已建立该机制）。
+
+**配对重测 34 个 gap（同批单元、同批检索，只换仪器）**：
+
+| | v1 | v2 |
+|---|---:|---:|
+| NONE | 0 | **7** |
+| PARTIAL | 32 | 26 |
+| FULL | 2 | 1 |
+| **T** | **0.0%** | **20.6%** |
+
+内部一致性 34/34；**7 个单元是"相邻工作存在但 delta 未被检验 → NONE"**，正是 v1 结构上无法输出的格子；变化全部是收紧（7 个 `PARTIAL→NONE`、1 个 `FULL→PARTIAL`），**无一个 `NONE→PARTIAL`**。
+
+**必须记录的一个自我纠正**：v2 把我人工判过 5 个单元中的 2 个（`nb-015`、`nb-099`）从 PARTIAL 翻成 NONE，与我只 **3/5** 一致。判 **v2 对、我错**——v2 逐篇点名了反驳证据（如 COMI 在**完全相同的 25%/50% 保留率**上已量化冗余，还主动降置信度到 medium），而我的理由只有一句概括，且是在不重新检索的情况下凭单元文本判断的。
+
+**这证实了我此前的警告**：那份"21/21 一致率"不是可靠性证据——**我当时也在用 v1 的隐含标准**（主题有相邻工作 → PARTIAL）。我的人工抽查被同一套 rubric 锚定了。
+
+**明确不做**：不用 v2 的 20.6% 替换近邻实验的 0.0%。那是换仪器后重测，不是新数据。
+
+**798 个测试全部通过**（原 785 + 13）。
+
+---
+
+## 独立复核与 v2.1（`RUBRIC_V2_INDEPENDENT_CHECK.md` / `RUBRIC_V21_FINAL.md`，2026-11-09）
+
+**第一次真正独立地校验评审器，结果是 kappa = 0.000（3/14 一致，等于随机）。** 但这个结果主要暴露了**我的验证设计有缺陷**，而且拆开后双方各有错。
+
+### 我的两个设计错误
+
+1. **抽样结构性偏差**：我为避污染排除"已看过判定的单元"，而**被排除的恰好包含 v2 全部 7 个 NONE**（它们之所以被查看，正因为它们翻转过）。于是我把仪器表现最好的样本系统性剔除了 → 样本内 0/14 判 NONE 部分是假象。
+2. **证据基础不对等**：我只依据管线提供的 ≤6 条证据，v2 每次自己跑文献检索（引 6–13 篇）。我的"没有证据检验 X"实际是"**管线抽取的证据里没有**"，不是"文献里没有"。**11 个分歧中 4 个（`nb-002/012/045/062`）因此是我错、v2 对**——如 `nb-012`，v2 找到 `[9] "Dense Contexts Are Hard Contexts"` **在固定 12k token 下**直接检验了密度效应。
+
+### v2 的残余问题（已修）
+
+**11 个分歧中 7 个，v2 只引用相邻工作、没有直接检验，却仍判 PARTIAL。** 自动扫描确认 **7/7 都靠"否定部分被削弱"或"检验了部分"来支撑**。以 `nb-065` 为例，v2 自己的笔记写"Search results do **NOT** contain a study that measures this correlation coefficient"，紧接着仍是 PARTIAL。
+
+**v2.1 只加一条规则**：`NO CREDIT FOR WEAKENING AN ABSENCE CLAIM`——若 delta 实质是"A 比 B 好 X"，只有报告了 A vs B 的比较才算覆盖；相邻工作削弱"文献中尚无此比较"这一否定陈述**不构成**部分确立。附操作性自检：**若你正在写"没有检索工作直接测量 X，但有相关工作"，那就是 NONE**。
+
+| | v1 | v2 | **v2.1** |
+|---|---:|---:|---:|
+| G1 正向探针判 NONE | — | 1/2 | **2/2** |
+| G2 反向探针判 FULL | — | 3/3 | **3/3** |
+| `T`（34 单元） | 0.0% | 20.6% | **55.9%** |
+| 与人判一致率（14） | 3/5（被锚定） | 21% | **57%** |
+
+v2→v2.1：12 个 `PARTIAL→NONE`，**无一个反向**；此前标记的 7 个残余兜底单元中 **4 个被修正**。
+
+### 我停在这里，不再调参
+
+`T=55.9%` 偏高，且有 1 例改差（`val-005`，证据确实记录了单闭环零分失效这一必要子命题，我认为 PARTIAL 更对）。**我可以再改一版让一致率更高，但不会**：①我自己的判断有 4/11 是错的，朝它调参是向有已知错误的基准拟合；②这正是我批评 v1 的方式——反复调 rubric 直到它与我一致，只是把锚点从 v1 换成"我"；③55.9% 是好是坏**无法从这 34 个单元判定**，需要新数据而非更好的 rubric。
+
+**`T=55.9%` 只能作为"指标终于有余量"的证据，不能作为质量结论。** 下一步需要真正的外部独立标注（给予同等检索条件）。
+
+**804 个测试全部通过**（原 798 + 6）。
+
+**gap 供给侧候选闸门（默认关闭）**：`GAP_MINING_OPERATIONALIZATION_GATE` 拒绝"测量动词开头 + 多交付物合取 + 无机制词汇"的 `claimed_delta`（26/37 的 delta 是这种未执行测量模板）。在 37 单元上触发 5 次（3 FULL/2 PARTIAL，60% 假开放 vs 10.8% 基线，不漏 NONE），但**这 5 个单元就是推导出该规则的同一批单元**——事后拟合，故默认关闭，开启需 24 主题池的样本外检验。
+
+**工程状态更新**：`767` 个测试全部通过（2026-11-03，原 728 + 新增 39）。
+
+**v7.2 全链路真实探针（2026-10-30，两轮）**：
+- **探针 A**（`df744606`，test-time compute scaling for small LMs）：119 分钟，产出 2 个 `executable_candidate` Idea + 2 份实验计划；v7.2 两道新闸门零误杀。据实测落地优化：审计 Top-1→Top-2、覆盖度增量匹配。
+- **探针 B**（`0ae1a146`，long-context agent memory compression，全部修复加载后）：**67 分钟（−44%）**，产出 1 个 `executable_candidate` + 12 个方向性 Idea，3 个确认型 gap（A 只有 1 个）。逐项验收全部通过；同时暴露并修复两个新问题：① 增量覆盖度的水位线误用 `coverage_records.created_at`（该表 upsert 且不更新时间戳，导致 r6 把 r2 证据重匹一遍，`reused=1804` 与 r2 完全相同）——改用 `phase_runs.completed_at`；② P1 killer 检索缺"未命中"trace（无法区分守卫跳过 vs 检索无果）——已补 `gap_audit_uncertain_killer_search`。完整对照：`backend/eval_results/v72_pipeline_probe_report.md` §8。
 
 ---
 
@@ -207,12 +444,12 @@ candidate ──▶ auditing ──▶ confirmed ──▶ surviving        # �
 
 | 类型 | 发现模式 | 准入契约（通用底线：引用证据须来自 ≥2 篇独立论文） |
 |------|----------|------------------------------------------------------|
-| `boundary_gap` | 方法在特定条件失效 | 需引用 limitation / negative_result 证据 |
+| `boundary_gap` | 方法在特定条件失效 | 需引用 limitation / negative_result 证据；v7.2 起 claimed_delta 以性能动词开头（"achieves >10%..."）且无边界语义的纯性能目标直接拒 `PERFORMANCE_TARGET_DELTA`（pilot 两个人工判真幸存者都是该形状，评审标注 target_only） |
 | `missing_evaluation` | 某关键维度没评测 | 需引用 limitation / negative_result / future_work 证据 |
 | `contradiction` | 两组可信结果冲突 | 需引用冲突双方 ≥2 条证据（"Verified conflict" 单元进 prompt 池） |
 | `untested_assumption` | 多篇论文共享未经验证的假设 | prevalence 门槛：引用须来自 ≥3 篇独立论文（`ASSUMPTION_NEEDS_BROADER_PREVALENCE`） |
 | `mechanism_gap` | 现象存在但原因不明 | 需引用 result / negative_result / comparison / limitation（现象必须被记录） |
-| `scaling_regime` | 某一尺度区间没人研究 | 同上另加 dataset（已测范围必须被记录，未测区间须点名） |
+| `scaling_regime` | 某一尺度区间没人研究 | 同上另加 dataset（已测范围必须被记录，未测区间须点名）；v7.2 起准入附带 claim 级先例检索——对抗查询→外部检索→保守判定，命中已在声称"未测范围"内做过测量的论文即拒 `SCALING_RANGE_ALREADY_MEASURED`（pilot 7 条中 4 条 false-open 的根因修复；检索基础设施故障只记 trace 不拒，与 idea 级 novelty 快检同一 fail-open 契约，`GAP_MINING_PRECEDENT_CHECK_ENABLED` 可关） |
 | `cross_domain_transfer` | 邻域成熟机制未迁移 | 两侧证据齐备：`source_domain_evidence_ids` 与 `target_evidence_ids` 均非空、都在引用集内，且 source→target 映射须显式（`TRANSFER_NEEDS_BOTH_DOMAIN_EVIDENCE`） |
 
 **矛盾不再阻塞挖掘**：v6 及以前，问题挂上 verified contradiction 就整体不可准入（`UNRESOLVED_VERIFIED_CONTRADICTION`），候选自带矛盾证据也被拒（`UNEXPECTED_CONTRADICTING_EVIDENCE`）——最有价值的科研问题形态（"论文 A 说有效、论文 B 说无效，什么变量导致结论翻转？"）在抵达 `generate_interventions` 的 `contradiction_resolver` lens 之前就被上游杀掉了。v7 起矛盾证据带 "Verified conflict" 标注进入 prompt 池，成为 `contradiction` 类 opportunity 的原料；问题级独立论文底线改为 supporting ∪ contradicting 的论文数（1 篇支持 + 1 篇反驳本身就是真实的跨论文冲突）。证据选择也改为按 evidence_type 轮转交错，避免 abundant 的 limitation 证据把 method/result 证据挤出 prompt（assumption / mechanism lens 依赖后者）。
@@ -238,9 +475,11 @@ candidate ──▶ auditing ──▶ confirmed ──▶ surviving        # �
 
 | 模式 | 版本 | 说明 |
 |------|------|------|
-| Budgeted Falsification | `gap-search-budgeted-v16` | 每个昂贵维度硬上限：4 query × 3 源、Top-10 候选、Top-3 近邻、≤2 篇全文（可疑 killer 优先）、killer 检索 ≤3 query、Top-1 gap competition |
+| Budgeted Falsification | `gap-search-budgeted-v16` | 每个昂贵维度硬上限：4 query × 3 源、Top-10 候选、Top-3 近邻、≤2 篇全文（可疑 killer 优先）、killer 检索 ≤3 query、Top-2 gap competition（2026-10-30 由 Top-1 上调：真实探针 df744606 显示 Top-1 把 7-lens fan-out 剪到每轮只审 1 个 gap、21 个准入候选仅 3 个被审且全部 Idea 挂在单一幸存 gap 上，而单次审计仅 ~250s，裁剪省的成本相对 119 分钟全程可忽略） |
 | 渐进式对抗审计 | `gap-search-admission-v15` | 增量重审，只审有新输入的 Gap |
 | 传统模式 | `gap-search-admission-v14` | 保留 v14 参数不变 |
+
+**uncertain 判决的 killer 定向检索**（2026-10-30，探针 df744606）：uncertain/more_search 判决在进入 O2 补检索回环**之前**，先用审计自己生成的 killer 描述 + `killer_query_terms` 做一次定向检索（复用 confirmed 路径的 `_run_killer_search` 机制，含术语扩展与嵌入命中判定）——命中 → 直接 `closed/reject`（`UNCERTAIN_KILLER_FOUND`），省掉整轮 remediation；不命中 → 判决保持 uncertain 照常走 O2。动机：探针的两次 uncertain 审计都写着"direct-hit prior work was not retrieved"，而审计自己已命名了要找的 killer，每个 uncertain 却买到了一轮 ~20 分钟的 O2。confirmed 路径本轮已跑过 killer 检索则不重复（record 带 `skipped` 标记区分"跑过"与"守卫早退"）；`perform_search=False` 的回放模式不触发；检索基础设施故障 fail-open（不算命中）。
 
 **检索准入的三条铁律**（每条都由实测缺陷驱动）：
 
@@ -262,6 +501,7 @@ Gap 能否挖出来，取决于抽取阶段是否供给了准入所需的证据�
 - **supporting 语义单一来源**：`app/agent/evidence_relations.py` 统一定义哪些 `relation_type` 算证实（`supports`、`partially_answers`）、哪些算反证，以及 0.5 的最低相关性门槛（`MIN_RELATION_RELEVANCE`），覆盖度与 Gap 挖掘共用。此前两者定义不一致（覆盖度只认 `supports`，把 `partially_answers` 当背景），而匹配 prompt 恰恰把 `partially_answers` 定义为"部分回答/指出局限"、兜底启发式又把每条 `limitation` 映射到它——实测同一批证据在覆盖度侧算 0.15、在挖掘侧却可准入。
 - **兜底启发式不再把实测对比降级**：LLM 匹配失败时走 `_determine_relation`，`comparison` 曾映射到 `background`，等于把每一次"对命名基线的实测对比"——恰恰是抽取 prompt 称为最强佐证的证据——踢出 supporting。现在映射到 `partially_answers`：与命名基线的对比是对"X 表现如何"的部分回答，不是背景。
 - **覆盖度口径**：覆盖度 = 贡献 supporting 证据的**不同论文数**，不是证据条数。
+- **增量匹配（2026-10-30，探针 df744606）**：覆盖度成本曾随证据池单调上涨（实测 246→398→509→667s）——每轮对全量问题×全量证据重做 LLM 匹配。由于证据行不可变、问题文本在 decompose 后不再变化，(question, evidence) 判定是稳定的：现在只把**上一覆盖快照之后新建的证据**送 LLM，已判定 pair（带 link 的）原样重放。`COVERAGE_INCREMENTAL_MATCHING=false` 可恢复全量重匹配（更换匹配 prompt 语义后需要）。
 - **抽取状态显式落库**：`task_papers.extraction_status`（`full_text` / `abstract_only` / `not_assessed`）+ `extraction_gap_reason`（`pdf_not_retrieved` / `pdf_unavailable` / `pdf_parse_failed`）区分"这篇论文测过、结论为负"与"这篇论文根本没读到"。没有这个区分，`NO_LIMITATION_SIGNAL` 这类拒因无法归因到"论文确实没提局限"还是"我们没读到 conclusion 段"。
 
 ---
@@ -366,6 +606,13 @@ title 由模型按具体机制命名，prompt 禁止 + 代码 strip 双保险杜
 | `AUDIT_NEIGHBOR_EVIDENCE_MAX_PAPERS` | 5 | 近邻全文证据抽取篇数上限 |
 | `MAX_REMEDIATION_ROUNDS_TOTAL` | 3 | O2 定向补检索全局轮数上限 |
 | `MAX_NARROWING_PASSES_TOTAL` | 3 | Gap 收窄总次数上限（单 Gap 上限 2 次） |
+| `GAP_MINING_PRECEDENT_CHECK_ENABLED` | true | v7.2：scaling_regime 准入的 claim 级先例检索开关 |
+| `GAP_MINING_PRECEDENT_CHECK_TOP_K` | 5 | 先例检索每候选送判的论文数上限 |
+| `MAX_GAPS_TO_DEEP_AUDIT` | 2 | budgeted 模式每轮深审 gap 数（2026-10-30 由 1 上调，见第 6 节） |
+| `GAP_STARVATION_DEFERRAL_LIMIT` | 3 | 候选被 deferred 达此次数即转 rejected；0 关闭退休（饥饿加权仍生效） |
+| `IDEA_SCORE_GO_LINE` | 0.70 | Idea 判定 go 的分数线（2026-10-31 由硬编码改为配置；该线只校准于 v3–v7 分布，v7.2 median 0.654） |
+| `IDEA_SCORE_REVISE_LINE` | 0.50 | Idea 判定 revise 的下限；低于此判 reject |
+| `COVERAGE_INCREMENTAL_MATCHING` | true | 覆盖度增量匹配：只 LLM 判定新证据，已判定 pair 重放 |
 | `SEARCH_PREFILTER_MIN_SIMILARITY` | 0.45 | 入库前主题相似度过滤阈值（0 关闭） |
 | `SCORE_CALIBRATION_MIN_BATCH` / `_STRENGTH` | 5 / 0.15 | 评分批内校准最小批量与强度 |
 | `MAX_CONCURRENT_AGENTS` | 2 | 并发任务上限（防 SQLite 写冲突） |
@@ -427,7 +674,9 @@ deep research/
 │   ├── alembic_migrations/
 │   │   └── versions/              # 0000_initial_schema → 0034_task_paper_extraction_status
 │   ├── scripts/
-│   │   └── bootstrap_db.py        # 建库/升级（处理全新库与遗留库，含备份+校验）
+│   │   ├── bootstrap_db.py        # 建库/升级（处理全新库与遗留库，含备份+校验）
+│   │   ├── extraction_audit.py    # 证据供给漏斗只读诊断（extraction_method 全史口径 / 双管线 section 对账 / 拒因）
+│   │   └── killer_search_audit.py # killer 定向检索命中率统计（uncertain 路径执行数 / 命中率 / 跳过原因）
 │   │
 │   ├── app/
 │   │   ├── main.py                # FastAPI 入口 + 路由挂载 + 中断任务恢复
@@ -737,6 +986,9 @@ PDF_PREWARM_TIMEOUT_PADDING_S=60         # 在重试预算之上额外留的余�
 MAX_REMEDIATION_ATTEMPTS=2               # 每个失败原因的定向补检索上限
 MAX_REMEDIATION_ROUNDS_TOTAL=3           # O2 全局定向补检索轮数上限
 MAX_NARROWING_PASSES_TOTAL=3             # 收窄总次数上限
+GAP_MINING_PRECEDENT_CHECK_ENABLED=true  # v7.2: scaling_regime claim 级先例检索
+GAP_MINING_PRECEDENT_CHECK_TOP_K=5       # 先例检索每候选送判论文数上限
+GAP_STARVATION_DEFERRAL_LIMIT=3          # deferred 达此次数转 rejected；0 关闭
 SEARCH_PREFILTER_MIN_SIMILARITY=0.45     # 入库前主题相似度过滤阈值（0 关闭）
 SCORE_CALIBRATION_MIN_BATCH=5
 SCORE_CALIBRATION_STRENGTH=0.15
@@ -820,14 +1072,27 @@ v15_replay_protocol.md      # v14→v15 渐进式审计 paired evaluation 预注
 | 问题 | 结果 |
 |------|------|
 | q1 v7-only 召回 | 35 个候选，**30 个 v6 无对应物**（仅证明搜索空间变宽，本身不证明更好） |
-| q2 边际机会精度 | **PENDING**（需人工盲评 prior-art 覆盖） |
-| q3 边际可信 Idea 产出 | **PENDING** |
+| q2 边际机会精度 | **6.7%（2/30 NONE），PARTIAL 21，FULL 7（23.3%）——LLM 评审两轮（第二轮联网复核 12 行），非独立人工盲评**（见下文来源说明） |
+| q3 边际可信 Idea 产出 | **NOT MET**：2 个 true gap（v7r-015 / v7r-023，均为 `target_only`）没有关联 Idea。第一轮靠 v7r-005（gap `ea4b38e0`，4 个 executable_candidate）达成，复核后改判 PARTIAL |
 | q4 分类型漏斗 | 7 类全部有产出；`scaling_regime` 新增最多（7），`boundary_gap`/`mechanism_gap`/`cross_domain_transfer` 各有 4-5 个但审计未覆盖到 |
 | q5 边际成本 | mining 42 次 LLM 调用 / 1068s；审计 1819s |
 
 跨类型聚簇 30 → 29 簇（压缩比 1.03，cosine ≥0.78 union-find），说明新增量不是同一发现的措辞变体。
 
-**预注册的 GO/NO-GO 门槛**：≥1 个 v7-only 机会被人工判为真 **且** 能产出可信 Idea **且** 新增机会不是以假 gap 为主。6 主题只决定 GO/NO-GO，不做 per-type 删除。**该门槛尚未裁决**——q2/q3 的人工列还空着。
+**预注册的 GO/NO-GO 门槛**：≥1 个 v7-only 机会被人工判为真 **且** 能产出可信 Idea **且** 新增机会不是以假 gap 为主。6 主题只决定 GO/NO-GO，不做 per-type 删除。
+
+**裁决（2026-10-29，第二轮，`eval_results/v7_replay_pilot/adjudication_summary.md`）**：第一轮（无检索 LLM 预填）得出名义 GO（4 true / 18 partial / 8 FULL）。随后对 12 行（4 NONE + 8 FULL）做了联网复核，3 行改判：v7r-005 NONE→PARTIAL（arXiv 2607.28308 *Coherent Overlap in Sparse MoE Routing* 已用干预检验后续专家的贡献）、v7r-019 NONE→PARTIAL（2610.05076 TTT 失败的因果分解）、v7r-021 FULL→PARTIAL。复核后 **2 true / 21 partial / 7 FULL**，[1][2] MET、**[3] NOT MET → NO-GO**。敏感性：即使排除晚于预注册日的 2610.05076，[3] 仍不成立（v7r-019 没有关联 Idea）。偏差：两轮都是同一 LLM 评审，非独立人工、非盲。观察：mechanism_gap 的 Idea 产出集中在 PARTIAL gap（v7r-003/012/005），v7 的价值可能在"收窄残余"上，但需要另行预注册，不能在本 pilot 里事后改口径。
+
+盲评工具链（可复现）：
+
+```bash
+cd backend
+python -m eval.production_e2e.v7_blind_review sheet --pilot-dir eval_results/v7_replay_pilot  # 生成/重建盲评表
+# 人工填 human_verdicts.jsonl（review_id → FULL / PARTIAL / NONE）
+python -m eval.production_e2e.v7_blind_review score --pilot-dir eval_results/v7_replay_pilot  # 聚合 q2/q4 + 三条件（含 idea 关联）
+```
+
+**判定来源（2026-10-29）**：`human_verdicts.jsonl` 的判定由 **LLM 代判**，经用户批准合并。第一轮仅凭模型自身文献知识、未联网检索，原始预判另存于 `human_verdicts.llm_prefill.jsonl`。第一轮计分：NONE 4 / PARTIAL 18 / FULL 8 → 名义 GO（备份见 `human_verdicts.pass1_backup.jsonl`）。**第二轮（同日）**对 4 NONE + 8 FULL 联网复核，notes 前缀改为 `[LLM pass2 web-verified ...; same LLM reviewer, NOT independent human]`，每行写明核对到的 arXiv 编号；计分变为 NONE 2 / PARTIAL 21 / FULL 7 → **NO-GO**（[3] NOT MET；idea 关联由 `v7_blind_review score` 实时查库计算）。解读限制：① 剩下的 2 个 NONE（v7r-015、v7r-023）都是无机制的纯性能目标，后者近乎不可行；② v7r-008、v7r-028 判定前接触过 `mech_override_review.llm_verdicts.jsonl` 的同主题条目（标 `possible_contamination`，均为 PARTIAL，不影响门槛）；③ `scaling_regime` 7 条中 4 条 FULL，是 v7 新增最多、也最容易假开放的类型；④ 18 个未复核的 PARTIAL 若检索，可能有部分升为 FULL，但不影响 [3]；⑤ 第二轮非盲，且复核方向对 GO 不利。此结果**不等同于预注册要求的独立人工盲评**。
 
 **明确不做的事**：不与 v6 的 budgeted-production 终态做 headline 对比（`v6_totals_context` 只作上下文）。full-jury 漏斗 vs 固定预算漏斗不是同口径，混比会得出"v7 产出更多"这种无意义的结论。v7 的生产价值需要单独的固定预算实验。
 
@@ -865,13 +1130,23 @@ v15_replay_protocol.md      # v14→v15 渐进式审计 paired evaluation 预注
 
 ### 已知瓶颈（下一步方向）
 
-1. **limitation 证据仍不足**：`NO_LIMITATION_SIGNAL` 是 Gap 准入的首要拒因。根因不在提示词，而在多数论文没解析出 conclusion 段（PDF 下载/解析失败后走 abstract 兜底）。PDF 预热与分类重试已缓解"拿不到 PDF"，但**section 识别率本身尚未测量**——`extraction_status` 现在能给出 `abstract_only` 占比，这是下一步的入口。
-2. **耗时统计有盲区**：`agent_traces.duration_ms` 恒为 0，且定向补检索内的抽取不建 `phase_runs` 记录。
+1. **limitation 证据供给已实测为健康，历史拒因属 v6 时代**：`NO_LIMITATION_SIGNAL`（395 次）与 `UNRESOLVED_VERIFIED_CONTRADICTION`（382 次）只在 pre-v7 policy 下存在（v7 起限制性要求改为 per-type 准入契约），而库中 `gap_candidates` 绝大多数仍是 v3–v6 产物（v7.1 仅 35 条）。对账版审计（`python scripts/extraction_audit.py`，2026-10-29，`backend/eval_results/extraction_audit_2026-10-29.json`）给出全史口径：证据单元 82.5% 来自 `pdf_fulltext`（24055/29143，覆盖 1792 篇论文），**123/125 个挖过缺口的任务都有 conclusion-section 证据**——抽取层的语料可达性不是瓶颈。两个度量口径的坑已修入脚本：① `task_papers.extraction_status` 只覆盖 0034 迁移之后的任务（历史任务全 NULL，不可作漏斗）；② `paper_chunks.section` 是 RAG 管线的分类器（默认 `unknown`），与 evidence 的 section（抽取管线，默认 `introduction`）是两套体系——曾据 RAG 视角误判"仅 25.5% full-text 论文有 conclusion chunk"，实际 evidence 视角覆盖率 100%。v7 下 limitation 类机会的真实供给情况待 replay 盲评（q2/q3）裁决。
+2. **耗时统计**：阶段级耗时已由 `phase_service.execute_phase` 统一记录（`phase_duration` trace + `phase_runs`）；2026-10-29 起 O2 定向补检索内的抽取/覆盖度也走同一包装。**2026-10-30 起阶段内部也细分了**（`app/services/timing.py` 的 `StageTimings`，写入各 step trace 的 `stage_timings`）：抽取到每篇论文（`slowest_papers_s` + prewarm/download 阶段）、mining 到每个 lens 的 LLM 调用与去重嵌入、audit 到每个 gap、experiments 到 cluster/triage/打分/novelty/多样性闸门。旧的"只有阶段级"黑盒已消除。
 3. **外部检索源在部分出口 IP 上被整体限流**（OpenAlex 对匿名请求、UA 带 mailto、mailto 查询参数三种方式一律 429），审计的近邻只能靠已入库论文补足。
 4. **候选论文相关性**：39% 候选与 claim 零词面重合，属未解限制（详见第 18 节）。
-5. **v7 pilot 的 q2/q3 未裁决**：`v7_only_opportunities.jsonl` 的人工 prior-art 盲评还没做，GO/NO-GO 门槛悬空。这是当前唯一阻塞"v7 是否值得保留"的待办。
+5. **v7 pilot 复核后 NO-GO，准入修复已落地（v7.2，2026-10-30）**：第二轮联网复核后为 2 true / 21 partial / 7 FULL，[3] NOT MET。判定由同一 LLM 评审完成，非独立人工。按预注册规则不加机制、先修准入，两项均已实现并有回归测试（`tests/test_v72_admission_fixes.py`）：① `scaling_regime` 准入附带 claim 级先例检索（`SCALING_RANGE_ALREADY_MEASURED`，4/7 FULL 的根因修复，infra 故障 fail-open）；② `boundary_gap` 拒绝纯性能目标型 claimed_delta（`PERFORMANCE_TARGET_DELTA`，正则只掐性能动词开头且豁免含边界语义的 delta）。`GAP_MINING_POLICY_VERSION` 已 bump 至 `opportunity-ontology-v7.2`。如需推翻 NO-GO，唯一合规路径是独立人工复核 v7r-005；"PARTIAL 残余"价值（mechanism_gap 的 Idea 都挂在 PARTIAL gap 上）需另行预注册。v7.2 的效果验证属于固定预算实验（瓶颈 #7），不在 full-jury replay 口径下做。完整存档：`eval_results/v7_replay_pilot/adjudication_summary.md`。
 6. **机制归因缺失**：production_e2e_v1 只证明 `Full V2 bundle > simple baselines`，没有 V2-no-audit 消融，因此"审计到底贡献了多少"仍未知。按预注册规则，这属于下一轮实验而非当前结论。
 7. **v7 生产价值未测**：full-jury 漏斗与固定预算漏斗不同口径，v7 在真实预算约束下的产出价值需要单独实验。
+
+### 2026-10-30 第四轮修复（探针 B 驱动）
+
+| 项 | 改动 | 验收 |
+|---|---|---|
+| **deferred 候选饥饿** | `_cheap_gap_rank_score` 增加 deferred 轮数加权（+0.03/轮，上限 +0.09）；`gap_starvation_deferral_limit`（默认 3）到期转 `rejected` + `gap_starvation_retire` trace | `tests/test_gap_competition.py` 4 项；下次探针 candidate 占比应 <50% |
+| **阶段内部计时** | 新增 `app/services/timing.py::StageTimings`；接入 extraction（每篇）、mining（每 lens + dedup + 先例检索）、audit（每 gap）、experiments（cluster/triage/scoring/novelty/diversity） | `tests/test_stage_timings.py` 6 项 |
+| **killer 检索命中率** | 新增 `scripts/killer_search_audit.py`（只读）：聚合 uncertain 路径的执行数/命中数/跳过原因/降级数 | 探针 C 实测 2 次执行、**0 命中**；需再跑 2-3 个任务，持续 <10% 则降级为可选开关 |
+| **winner 选择尊重审计 novelty** | `_resolve_gap_competition_winner` 排序键改为 `(clears_novelty_gate, cheap_rank, novelty_confidence)`；trace 增 `novelty_gate_threshold` + 每候选 `clears_novelty_gate` | `tests/test_gap_competition.py` +2（0.9 vs 0.42 场景 / 不越权）；根因见探针 C |
+| **Idea 双轴标注** | `idea_quality_gate` trace 增加 `final_score` / `score_go_line` / `axes`；分数与门禁不一致时打 `GATE_PASS_SCORE_BELOW_LINE` / `GATE_BLOCK_SCORE_ABOVE_LINE` | 消除"`executable_candidate` 却 0.697 分"的读法歧义 |
 
 ### 当前非目标
 

@@ -540,9 +540,12 @@ async def _process_each_idea(db, state, llm, task_id, idea_list, high_papers,
                 logger.info("Idea '%s': applied validation penalty %.2f, final_score=%.3f",
                            item.title[:40], val_penalty, final_score)
 
-            if final_score >= 0.70:
+            # Thresholds come from settings so the v7.2-vs-historical score
+            # shift (see config.idea_score_go_line) is one visible knob.
+            from app.config import settings as _settings
+            if final_score >= _settings.idea_score_go_line:
                 decision = "go"
-            elif final_score >= 0.50:
+            elif final_score >= _settings.idea_score_revise_line:
                 decision = "revise"
             else:
                 decision = "reject"

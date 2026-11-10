@@ -219,6 +219,56 @@ def test_novelty_gate_passes_confirmed_audit_with_solid_confidence():
     assert result["gate_statuses"]["novelty"] == "PASS"
 
 
+def test_novelty_gate_reads_confidence_even_without_remaining_delta():
+    """A confident verdict must not be discarded just because remaining_delta
+    is empty (probe 0e695ea5, 2026-10-31).
+
+    The gate used to require `audit_result == "confirmed" AND remaining_delta`
+    before looking at novelty_confidence at all. An audit at confirmed/0.90
+    with an empty remaining_delta therefore fell through to UNKNOWN, capping
+    every downstream intervention at tier B — the run produced zero executable
+    candidates while its own winning gap was audited at 0.90. remaining_delta
+    is the auditor's prose about what is still open; it is not a precondition
+    for reading the score from the same audit.
+    """
+    from app.agent.steps.generate_interventions import (
+        _compute_confidence_tier, _evaluate_hard_gates)
+
+    gap = SimpleNamespace(provenance_status="complete")
+    contract = SimpleNamespace(allow_model_training=False,
+                              allow_large_benchmark=False, gpu_available=False)
+    audit = SimpleNamespace(
+        audit_result="confirmed", remaining_delta="",
+        novelty_confidence=0.9, neighbor_paper_ids_json="[]")
+
+    result = _evaluate_hard_gates(gap, audit, ["e1", "e2"],
+                                  _candidate("Add evaluation protocol", "low cost"),
+                                  contract)
+
+    assert result["gate_statuses"]["novelty"] == "PASS"
+    assert "remaining_delta" in result["gate_rationale"]["novelty"]
+    # Full-text provenance + all gates PASS => tier A is reachable again.
+    assert _compute_confidence_tier(gap, result["gate_statuses"]) == "A"
+
+
+def test_novelty_gate_still_fails_low_confidence_without_remaining_delta():
+    """Relaxing the delta precondition must not let a weak verdict through."""
+    from app.agent.steps.generate_interventions import _evaluate_hard_gates
+
+    gap = SimpleNamespace(provenance_status="complete")
+    contract = SimpleNamespace(allow_model_training=False,
+                              allow_large_benchmark=False, gpu_available=False)
+    audit = SimpleNamespace(
+        audit_result="confirmed", remaining_delta="",
+        novelty_confidence=0.2, neighbor_paper_ids_json="[]")
+
+    result = _evaluate_hard_gates(gap, audit, ["e1", "e2"],
+                                  _candidate("Add evaluation protocol", "low cost"),
+                                  contract)
+
+    assert result["gate_statuses"]["novelty"] == "FAIL"
+
+
 def test_novelty_gate_keeps_legacy_audit_without_confidence_passing():
     """Legacy audits without a novelty_confidence value must not retro-fail."""
     gap = SimpleNamespace(provenance_status="complete")

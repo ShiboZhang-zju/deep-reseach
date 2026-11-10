@@ -51,7 +51,8 @@ from app.agent.steps import (
     can_remediate,
 )
 from app.agent.steps.analyze_papers import analyze_papers
-from app.agent.steps.mine_gaps import GAP_MINING_POLICY_VERSION, compute_evidence_fingerprint
+from app.agent.steps.mine_gaps import (compute_evidence_fingerprint,
+                                       current_mining_policy_version)
 from app.agent.steps.audit_gaps import GAP_SEARCH_POLICY_VERSION
 from app.agent.steps.generate_interventions import INTERVENTION_GENERATION_POLICY_VERSION
 from app.agent.steps.generate_minimal_experiments import EXPERIMENT_GENERATION_POLICY_VERSION
@@ -945,7 +946,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         # candidates are complementary rather than reworded.
         undetermined_gaps = [g for g in gap_repo.list_gaps_for_contract(
             db, task_id, state.contract_id)
-            if g.mining_policy_version == GAP_MINING_POLICY_VERSION
+            if g.mining_policy_version == current_mining_policy_version()
             and g.status in ("auditing", "audited", "inconclusive")]
         # Top-2 competition follow-up: candidates deferred by an earlier
         # competition round re-enter the audit pool BEFORE fresh mining —
@@ -956,7 +957,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                 and pending_audit_gap_ids is None):
             deferred_gaps = [g for g in gap_repo.list_gaps_for_contract(
                 db, task_id, state.contract_id)
-                if g.mining_policy_version == GAP_MINING_POLICY_VERSION
+                if g.mining_policy_version == current_mining_policy_version()
                 and g.status == "candidate"]
         if ((undetermined_gaps or deferred_gaps)
                 and int(state.remediation_round or 0) > 0
@@ -998,7 +999,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                 "contract_id": state.contract_id,
                 "round": state.current_round,
                 "pipeline_version": state.pipeline_version,
-                "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+                "gap_mining_policy_version": current_mining_policy_version(),
                 "evidence_fingerprint": evidence_fingerprint,
             }, sort_keys=True).encode()).hexdigest()
 
@@ -1059,7 +1060,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             gaps = mining_gaps
             if gaps is None:
                 gaps = [gap for gap in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
-                        if gap.mining_policy_version == GAP_MINING_POLICY_VERSION]
+                        if gap.mining_policy_version == current_mining_policy_version()]
             state = task_repo.get_state(db, task_id)
             if not gaps:
                 # A resumed task can legitimately re-mine to zero NEW candidates
@@ -1072,7 +1073,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
                 # surviving gap sits in the DB.
                 confirmed_survivors = [
                     g for g in gap_repo.list_gaps_for_contract(db, task_id, state.contract_id)
-                    if g.mining_policy_version == GAP_MINING_POLICY_VERSION
+                    if g.mining_policy_version == current_mining_policy_version()
                     and g.status == "surviving"
                 ]
                 if confirmed_survivors:
@@ -1121,7 +1122,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             "gap_claims": {gap.id: (gap.claimed_delta or "") for gap in gaps},
             "round": state.current_round,
             "pipeline_version": state.pipeline_version,
-            "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+            "gap_mining_policy_version": current_mining_policy_version(),
             # The audit's own policy governs its behaviour, so it belongs here for
             # the same reason mining includes its policy: changing the audit rules
             # must invalidate a previously stamped audit run.
@@ -1140,7 +1141,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
         state.surviving_gap_ids = [gap.id for gap in db.query(GapCandidate).filter(
             GapCandidate.task_id == task_id,
             GapCandidate.contract_id == state.contract_id,
-            GapCandidate.mining_policy_version == GAP_MINING_POLICY_VERSION,
+            GapCandidate.mining_policy_version == current_mining_policy_version(),
             GapCandidate.status == "surviving",
         ).all()]
         # Top-2 competition: both funded candidates finished their audits —
@@ -1304,7 +1305,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             "surviving_gap_ids": sorted(state.surviving_gap_ids),
             "contract_id": state.contract_id,
             "pipeline_version": state.pipeline_version,
-            "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+            "gap_mining_policy_version": current_mining_policy_version(),
             # P0-1a (task d6f64087): intervention gate rules (novelty_confidence
             # thresholds) now carry their own version — without it a rule change
             # replayed cached tier-A interventions on resumed tasks forever.
@@ -1341,7 +1342,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
             "intervention_ids": sorted(passed_intervention_ids),
             "contract_id": state.contract_id,
             "pipeline_version": state.pipeline_version,
-            "gap_mining_policy_version": GAP_MINING_POLICY_VERSION,
+            "gap_mining_policy_version": current_mining_policy_version(),
             # The experiment phase's own rules (e.g. rejection-aware feedback
             # retry) belong in its input identity: changing them must
             # invalidate a previously stamped run instead of replaying its
@@ -1441,7 +1442,7 @@ async def _run_opportunity_pipeline(db, state: ResearchState, llm, task_id: str)
 _GAP_COMPETITION_TOP_K = 2
 
 
-def _cheap_gap_rank_score(db, gap) -> float:
+def _cheap_gap_rank_score(db, gap, deferred_rounds: int = 0) -> float:
     """Mechanical 4-dimension cheap rank: Importance 0.30 / Evidence support
     0.25 / Testability 0.25 / Potential differentiation 0.20.
 
@@ -1449,7 +1450,16 @@ def _cheap_gap_rank_score(db, gap) -> float:
     deliberately no new LLM call. 'Potential differentiation' here means
     "looks worth the audit spend", NOT "proven novel": novelty is decided
     only by the full audit that follows (run7 review: D is a gate-keeper
-    heuristic, never a verdict)."""
+    heuristic, never a verdict).
+
+    Starvation relief (probe 0ae1a146, 2026-10-30): the probe left 16 of 20
+    gaps stuck at `candidate` — each competition round re-ranked the same pool
+    and the same losers lost again (11 选 2 twice, 9 deferred then 7). Since
+    the candidate pool is semantically stable across rounds (20 DUPLICATE_GAP
+    rejections in the sibling probe), a good-but-slightly-lower-ranked gap
+    could starve forever. Each previously-deferred round adds a small bonus,
+    capped so it can never outrank a genuinely stronger candidate on the
+    primary dimensions (max +0.09 on a 0..1-ish scale)."""
     from app.db.repositories import gap_repo
 
     sig = float(getattr(gap, "significance_score", None) or 0.5)
@@ -1457,7 +1467,36 @@ def _cheap_gap_rank_score(db, gap) -> float:
     nov = float(getattr(gap, "novelty_score", None) or 0.5)
     evidence_count = len(gap_repo.list_gap_evidence(db, gap.id))
     ev = min(1.0, evidence_count / 8.0)
-    return 0.30 * sig + 0.25 * ev + 0.25 * feas + 0.20 * nov
+    base = 0.30 * sig + 0.25 * ev + 0.25 * feas + 0.20 * nov
+    return base + 0.03 * min(max(deferred_rounds, 0), 3)
+
+
+def _deferred_round_counts(db, task_id: str) -> dict[str, int]:
+    """How many past competition rounds deferred each gap.
+
+    Derived from `gap_competition` traces rather than a column: the deferral
+    history already lives there, and a counter column would need a migration
+    plus backfill for every existing task.
+    """
+    from app.db.models import AgentTrace
+
+    counts: dict[str, int] = {}
+    rows = db.query(AgentTrace.output_json).filter(
+        AgentTrace.task_id == task_id,
+        AgentTrace.step_name == "gap_competition",
+    ).all()
+    for (payload,) in rows:
+        if not payload:
+            continue
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if data.get("stage") != "select_audit_candidates":
+            continue
+        for gid in data.get("deferred_gap_ids") or []:
+            counts[gid] = counts.get(gid, 0) + 1
+    return counts
 
 
 def _apply_gap_competition_selection(db, task_id: str, gaps, audit_gap_ids: list[str],
@@ -1474,23 +1513,48 @@ def _apply_gap_competition_selection(db, task_id: str, gaps, audit_gap_ids: list
     if pending_narrowed or len(audit_gap_ids) <= top_k:
         return audit_gap_ids
     gap_by_id = {g.id: g for g in gaps}
+    deferred_counts = _deferred_round_counts(db, task_id)
     ranked = sorted(
         (g for g in gaps if g.id in set(audit_gap_ids)),
-        key=lambda g: _cheap_gap_rank_score(db, g), reverse=True)
+        key=lambda g: _cheap_gap_rank_score(db, g, deferred_counts.get(g.id, 0)),
+        reverse=True)
     selected = ranked[:top_k]
     selected_ids = {g.id for g in selected}
     deferred = [g for g in ranked[top_k:]]
+
+    # Starvation expiry (probe 0ae1a146): a candidate deferred in this many
+    # competitions is retired instead of accumulating as an auditable-looking
+    # `candidate` forever. Explicit terminal state, so "never audited" stops
+    # being indistinguishable from "waiting for its turn".
+    starved: list[str] = []
+    starvation_limit = max(settings.gap_starvation_deferral_limit, 0)
+    if starvation_limit:
+        for g in deferred:
+            rounds = deferred_counts.get(g.id, 0) + 1  # this round counts
+            if rounds >= starvation_limit:
+                g.status = "rejected"
+                starved.append(g.id)
+
     trimmed = [gid for gid in audit_gap_ids if gid in selected_ids]
     paper_repo.save_trace(db, task_id, "gap_competition", "decision", output_data={
         "stage": "select_audit_candidates",
         "top_k": top_k,
         "budgeted": settings.gap_audit_budgeted,
         "candidates": [{"gap_id": g.id,
-                        "score": round(_cheap_gap_rank_score(db, g), 4)}
+                        "score": round(_cheap_gap_rank_score(
+                            db, g, deferred_counts.get(g.id, 0)), 4),
+                        "deferred_rounds": deferred_counts.get(g.id, 0)}
                        for g in ranked],
         "selected_gap_ids": [g.id for g in selected],
-        "deferred_gap_ids": [g.id for g in deferred],
+        "deferred_gap_ids": [g.id for g in deferred if g.id not in set(starved)],
+        "starved_gap_ids": starved,
     })
+    if starved:
+        logger.info("Task %s: retiring %d candidate(s) deferred >= %d rounds "
+                    "(AUDIT_STARVED)", task_id[:8], len(starved), starvation_limit)
+        paper_repo.save_trace(db, task_id, "gap_starvation_retire", "decision",
+                              output_data={"gap_ids": starved,
+                                           "deferral_limit": starvation_limit})
     logger.info("Task %s: gap competition — auditing top-%d of %d candidates "
                 "(%d deferred for later rounds)",
                 task_id[:8], top_k, len(audit_gap_ids), len(deferred))
@@ -1500,28 +1564,46 @@ def _apply_gap_competition_selection(db, task_id: str, gaps, audit_gap_ids: list
 def _resolve_gap_competition_winner(db, task_id: str, survivor_ids: list[str]) -> list[str]:
     """When several gaps survive their audits, fund only the winner.
 
-    Both top-2 audits completed before this point; the winner is chosen by
-    cheap-rank score with the audit's novelty_confidence as tie-break.
+    Both top-2 audits completed before this point. Two criteria, in order:
+
+    1. **Audited novelty can clear the intervention novelty gate.** A gap whose
+       audit reported novelty_confidence below the WARN threshold can only ever
+       yield tier-B interventions, i.e. `conditional_review` at best — funding
+       it makes the whole run abstain. Probe 1caa24c2 (2026-10-30) lost a
+       boundary gap at novelty 0.90 to a cross-domain gap at 0.42 on cheap-rank
+       0.7567 vs 0.7335, a 0.023 margin; every Idea then capped at tier B and
+       the task ended `abstained/no_minimal_experiment_generated` while the
+       reusable gap sat there as a runner-up. Cheap rank measures "worth the
+       audit spend" — it must not override a fact the audit just established.
+    2. Cheap-rank score, with the same novelty_confidence as tie-break.
+
     Runner-ups become confirmed_runner_up: their confirmed verdict is kept
     (visible for review, reviveable by later rounds) but the opportunity
     pipeline funds only the winner."""
     from app.db.models import GapCandidate
     from app.db.repositories import gap_repo, paper_repo
+    from app.agent.steps.generate_interventions import (
+        _NOVELTY_CONFIDENCE_WARN_BELOW)
 
     if len(survivor_ids) <= 1:
         return survivor_ids
     survivors = db.query(GapCandidate).filter(
         GapCandidate.id.in_(survivor_ids)).all()
 
-    def _sort_key(g):
+    def _novelty_confidence(g) -> float:
         audits = gap_repo.list_gap_audits(db, g.id)
-        nc = 0.0
-        if audits:
-            try:
-                nc = float(audits[-1].novelty_confidence or 0.0)
-            except (TypeError, ValueError):
-                nc = 0.0
-        return (_cheap_gap_rank_score(db, g), nc)
+        if not audits:
+            return 0.0
+        try:
+            return float(audits[-1].novelty_confidence or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _sort_key(g):
+        nc = _novelty_confidence(g)
+        # 1 = can produce tier A, 0 = capped at tier B by the novelty gate.
+        clears_novelty = 1 if nc >= _NOVELTY_CONFIDENCE_WARN_BELOW else 0
+        return (clears_novelty, _cheap_gap_rank_score(db, g), nc)
 
     ranked = sorted(survivors, key=_sort_key, reverse=True)
     winner = ranked[0]
@@ -1533,8 +1615,12 @@ def _resolve_gap_competition_winner(db, task_id: str, survivor_ids: list[str]) -
         "stage": "winner_selection",
         "winner_gap_id": winner.id,
         "runner_up_gap_ids": [ru.id for ru in runner_ups],
+        "novelty_gate_threshold": _NOVELTY_CONFIDENCE_WARN_BELOW,
         "ranking": [{"gap_id": g.id,
-                     "score": round(_cheap_gap_rank_score(db, g), 4)}
+                     "score": round(_cheap_gap_rank_score(db, g), 4),
+                     "novelty_confidence": round(_novelty_confidence(g), 3),
+                     "clears_novelty_gate":
+                         _novelty_confidence(g) >= _NOVELTY_CONFIDENCE_WARN_BELOW}
                     for g in ranked],
     })
     logger.info("Task %s: gap competition winner %s (%d runner-up(s) kept as "
@@ -2341,7 +2427,7 @@ async def _run_ideas_loop(db, state: ResearchState, llm, task_id: str, cluster_l
                     )
                 prev_ideas_feedback = (
                     f"这是第 {idea_round + 1} 次生成创意。之前 {len(old_ideas)} 个创意质量不够高"
-                    f"（均未达到 go 标准 0.70）：\n"
+                    f"（均未达到 go 标准 {settings.idea_score_go_line:.2f}）：\n"
                     + "\n".join(feedback_lines)
                     + "\n\n请基于所有累积论文，生成比之前更有深度、更有创新性的创意。不要重复之前的创意方向。"
                     + "\n\n特别注意：\n"

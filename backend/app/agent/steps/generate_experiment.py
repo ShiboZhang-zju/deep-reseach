@@ -41,9 +41,10 @@ async def generate_experiments(db, state: ResearchState, llm, task_id: str, idea
         )
         final_score = idea_score - 0.08 * scores.risk
 
-        if final_score >= 0.70:
+        from app.config import settings as _settings
+        if final_score >= _settings.idea_score_go_line:
             decision = "go"
-        elif final_score >= 0.50:
+        elif final_score >= _settings.idea_score_revise_line:
             decision = "revise"
         else:
             decision = "reject"

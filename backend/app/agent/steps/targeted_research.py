@@ -17,6 +17,8 @@ Design principles:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 
@@ -31,6 +33,7 @@ from app.agent.steps.search_papers import search_and_save_papers
 from app.agent.steps.score_papers import score_papers
 from app.agent.steps.extract_evidence import extract_evidence_units
 from app.agent.steps.update_coverage import update_coverage_matrix
+from app.services import phase_service
 from app.services.event_service import emit_event
 
 logger = logging.getLogger(__name__)
@@ -318,16 +321,84 @@ async def run_targeted_research_round(
 
     new_evidence_count = 0
     try:
-        papers_found, _deduped, new_paper_ids = await search_and_save_papers(
-            db, state, executions, task_id, round_num
+        # P5 (probe df744606): the remediation round's search+score also gets
+        # a PhaseRun — previously only extract/coverage were wrapped, so the
+        # O2 search cost was invisible in phase_runs. round_num is offset
+        # above max_rounds and unique per remediation round, so the phase name
+        # never collides and the input_version (query-text hash) is fresh each
+        # round — the idempotent-skip branch is defensive only.
+        search_input_version = hashlib.sha256(json.dumps({
+            "round_number": round_num,
+            "queries": sorted(e.query_text for e in executions),
+            "pipeline_version": state.pipeline_version,
+        }, sort_keys=True).encode()).hexdigest()
+
+        async def _rem_search_op(db):
+            found, _deduped, new_ids = await search_and_save_papers(
+                db, state, executions, task_id, round_num)
+            await score_papers(db, state, llm, task_id, round_num)
+            return {"papers_found": found, "new_paper_ids": list(new_ids)}
+
+        search_result = await phase_service.execute_phase(
+            db, task_id, f"remediation_search_round_{round_num}", _rem_search_op,
+            input_version=search_input_version, round_number=round_num,
         )
-        await score_papers(db, state, llm, task_id, round_num)
+        if search_result is None:
+            logger.warning("Task %s: remediation search phase unexpectedly "
+                           "skipped; counting conservatively", task_id[:8])
+            search_result = {"papers_found": 0, "new_paper_ids": []}
+        papers_found = search_result["papers_found"]
+        new_paper_ids = search_result["new_paper_ids"]
 
         if state.pipeline_version >= 2:
             try:
-                ev = await extract_evidence_units(db, state, llm, task_id, round_num)
+                # Observation blind spot fix (README §19 bottleneck #2): the
+                # primary loop wraps extract/coverage in execute_phase (runner.py
+                # _run_search_loop), but this remediation path called them
+                # directly — no phase_runs record, no duration, no idempotence.
+                # round_num is offset above max_rounds so the phase names stay
+                # unique against the primary rounds.
+                from app.db.models import TaskPaper as _TP
+
+                round_paper_ids = [tp.paper_id for tp in db.query(_TP).filter(
+                    _TP.task_id == task_id, _TP.discovered_round == round_num
+                ).all()]
+                ev_input_version = hashlib.sha256(json.dumps({
+                    "round_number": round_num,
+                    "round_paper_ids": sorted(round_paper_ids),
+                    "active_question_ids": sorted(state.active_question_ids),
+                    "pipeline_version": state.pipeline_version,
+                }, sort_keys=True).encode()).hexdigest()
+
+                async def _rem_ev_op(db):
+                    return await extract_evidence_units(db, state, llm, task_id, round_num)
+
+                ev = await phase_service.execute_phase(
+                    db, task_id, f"extract_evidence_round_{round_num}", _rem_ev_op,
+                    input_version=ev_input_version, round_number=round_num,
+                )
                 new_evidence_count = ev if isinstance(ev, int) else 0
-                await update_coverage_matrix(db, state, llm, task_id, round_num)
+
+                from app.db.models import EvidenceUnit as _EU
+                round_evidence = db.query(_EU).filter(
+                    _EU.task_id == task_id,
+                    _EU.paper_id.in_(round_paper_ids),
+                ).all() if round_paper_ids else []
+                cov_input_version = hashlib.sha256(json.dumps({
+                    "round_evidence_ids": sorted(eu.id for eu in round_evidence),
+                    "evidence_hashes": sorted(eu.source_chunk_hash or "" for eu in round_evidence),
+                    "active_question_ids": sorted(state.active_question_ids),
+                    "round_number": round_num,
+                    "pipeline_version": state.pipeline_version,
+                }, sort_keys=True).encode()).hexdigest()
+
+                async def _rem_cov_op(db):
+                    return await update_coverage_matrix(db, state, llm, task_id, round_num)
+
+                await phase_service.execute_phase(
+                    db, task_id, f"update_coverage_round_{round_num}", _rem_cov_op,
+                    input_version=cov_input_version, round_number=round_num,
+                )
             except Exception as ec_err:
                 logger.warning("Task %s: remediation evidence/coverage failed (non-fatal): %s",
                                task_id[:8], ec_err)

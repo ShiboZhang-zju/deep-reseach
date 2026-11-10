@@ -50,7 +50,17 @@ async def lifespan(_app: FastAPI):
         loop = asyncio.get_running_loop()
         loop.set_default_executor(
             ThreadPoolExecutor(max_workers=64, thread_name_prefix="agent_t"))
-        recover_interrupted_tasks()
+        if settings.recover_tasks_on_startup:
+            recover_interrupted_tasks()
+        else:
+            # Multi-service experiments share one DB: recovering here would
+            # reset the OTHER arm's in-flight task (statuses include
+            # `searching`), silently handing an arm's run to the wrong
+            # configuration. Experiment services must start with
+            # RECOVER_TASKS_ON_STARTUP=false.
+            logger.warning(
+                "Startup task recovery DISABLED (RECOVER_TASKS_ON_STARTUP=false)"
+                " — in-flight tasks from other services are left untouched.")
     except Exception as e:
         logger.error("Failed to recover interrupted tasks on startup: %s", e)
     yield
@@ -108,3 +118,37 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/experiment-config")
+def experiment_config():
+    """Report the experiment knobs THIS process actually resolved.
+
+    Two-service experiments (arms on different ports) are only valid if each
+    process really runs its configured arm. Reading the value back from the
+    process is the difference between "we set the env var" and "the arm ran as
+    specified": a mistyped var name, an unloaded .env or a stale process all
+    look identical from the outside, and the resulting run would be silently
+    attributed to the wrong arm.
+
+    Read-only and derived from `settings` (already resolved at import), so it
+    cannot itself change behaviour.
+    """
+    from app.agent.steps.audit_gaps import _audit_budget
+
+    budget = _audit_budget()
+    return {
+        "audit_neighbors_override": int(
+            getattr(settings, "audit_neighbors_override", 0) or 0),
+        "effective_audit_budget": budget,
+        "gap_audit_budgeted": bool(settings.gap_audit_budgeted),
+        "gap_audit_disabled_ablation": bool(
+            settings.gap_audit_disabled_ablation),
+        "gap_audit_progressive": bool(settings.gap_audit_progressive),
+        "gap_mining_legacy_v6_mode": bool(settings.gap_mining_legacy_v6_mode),
+        "gap_relevance_min_neighbor": settings.gap_relevance_min_neighbor,
+        "audit_corpus_recall_enabled": bool(settings.audit_corpus_recall_enabled),
+        "audit_screen_before_cap": bool(settings.audit_screen_before_cap),
+        "embedding_backend": settings.embedding_backend,
+        "embedding_model": settings.embedding_model,
+    }
